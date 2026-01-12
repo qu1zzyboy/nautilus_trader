@@ -34,8 +34,9 @@ use ustr::Ustr;
 use super::{
     error::{BinanceWsError, BinanceWsResult},
     messages::{
-        BinanceFuturesAggTradeMsg, BinanceFuturesBookTickerMsg, BinanceFuturesDepthUpdateMsg,
-        BinanceFuturesKlineMsg, BinanceFuturesMarkPriceMsg, BinanceFuturesTradeMsg,
+        BinanceFuturesAggTradeMsg, BinanceFuturesBookTickerMsg, BinanceFuturesContinuousKlineMsg,
+        BinanceFuturesDepthUpdateMsg, BinanceFuturesKlineMsg, BinanceFuturesMarkPriceMsg,
+        BinanceFuturesTradeMsg,
     },
 };
 use crate::common::enums::{BinanceKlineInterval, BinanceWsEventType};
@@ -419,9 +420,91 @@ pub fn parse_kline(
     Ok(Some(bar))
 }
 
+/// Parses a continuous contract kline message into a Nautilus `Bar`.
+///
+/// This function converts Binance's continuous kline format to Nautilus's internal `Bar` format:
+/// - Converts Binance kline interval to `BarSpecification`
+/// - Creates a `BarType` with the instrument ID and specification
+/// - Parses price and volume strings to `Price` and `Quantity` types
+/// - Creates a `Bar` object with OHLCV data and timestamps
+///
+/// Returns `None` if the kline is not closed yet.
+///
+/// # Errors
+///
+/// Returns an error if parsing fails.
+pub fn parse_continuous_kline(
+    msg: &BinanceFuturesContinuousKlineMsg,
+    instrument: &InstrumentAny,
+) -> BinanceWsResult<Option<Bar>> {
+    // Only emit bars when the kline is closed
+    if !msg.kline.is_closed {
+        return Ok(None);
+    }
+
+    let instrument_id = instrument.id();
+    let price_precision = instrument.price_precision();
+    let size_precision = instrument.size_precision();
+
+    let spec = interval_to_bar_spec(msg.kline.interval);
+    let bar_type = BarType::new(instrument_id, spec, AggregationSource::External);
+
+    let open = msg
+        .kline
+        .open
+        .parse::<f64>()
+        .map_err(|e| BinanceWsError::ParseError(e.to_string()))?;
+    let high = msg
+        .kline
+        .high
+        .parse::<f64>()
+        .map_err(|e| BinanceWsError::ParseError(e.to_string()))?;
+    let low = msg
+        .kline
+        .low
+        .parse::<f64>()
+        .map_err(|e| BinanceWsError::ParseError(e.to_string()))?;
+    let close = msg
+        .kline
+        .close
+        .parse::<f64>()
+        .map_err(|e| BinanceWsError::ParseError(e.to_string()))?;
+    let volume = msg
+        .kline
+        .volume
+        .parse::<f64>()
+        .map_err(|e| BinanceWsError::ParseError(e.to_string()))?;
+
+    // Use the kline close time as the event timestamp
+    let ts_event = UnixNanos::from(msg.kline.close_time as u64 * 1_000_000); // ms to ns
+
+    let bar = Bar::new(
+        bar_type,
+        Price::new(open, price_precision),
+        Price::new(high, price_precision),
+        Price::new(low, price_precision),
+        Price::new(close, price_precision),
+        Quantity::new(volume, size_precision),
+        ts_event,
+        ts_event,
+    );
+
+    Ok(Some(bar))
+}
+
 /// Extracts the symbol from a raw JSON message.
 pub fn extract_symbol(json: &serde_json::Value) -> Option<Ustr> {
     json.get("s").and_then(|v| v.as_str()).map(Ustr::from)
+}
+
+/// Extracts the pair from a continuous kline message.
+pub fn extract_pair(json: &serde_json::Value) -> Option<Ustr> {
+    json.get("ps").and_then(|v| v.as_str()).map(Ustr::from)
+}
+
+/// Extracts the contract type from a continuous kline message.
+pub fn extract_contract_type(json: &serde_json::Value) -> Option<String> {
+    json.get("ct").and_then(|v| v.as_str()).map(String::from)
 }
 
 /// Extracts the event type from a raw JSON message.

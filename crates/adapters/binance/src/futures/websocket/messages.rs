@@ -261,6 +261,79 @@ pub struct BinanceFuturesKlineMsg {
     pub kline: BinanceFuturesKlineData,
 }
 
+/// Continuous contract kline/candlestick stream message.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BinanceFuturesContinuousKlineMsg {
+    /// Event type.
+    #[serde(rename = "e")]
+    pub event_type: String,
+    /// Event time in milliseconds.
+    #[serde(rename = "E")]
+    pub event_time: i64,
+    /// Pair (e.g., "BTCUSDT").
+    #[serde(rename = "ps")]
+    pub pair: Ustr,
+    /// Contract type (e.g., "PERPETUAL", "CURRENT_QUARTER", "NEXT_QUARTER").
+    #[serde(rename = "ct")]
+    pub contract_type: String,
+    /// Kline data (continuous kline doesn't have symbol field in k object).
+    #[serde(rename = "k")]
+    pub kline: BinanceFuturesContinuousKlineData,
+}
+
+/// Kline data within continuous kline message (no symbol field).
+#[derive(Debug, Clone, Deserialize)]
+pub struct BinanceFuturesContinuousKlineData {
+    /// Kline start time.
+    #[serde(rename = "t")]
+    pub start_time: i64,
+    /// Kline close time.
+    #[serde(rename = "T")]
+    pub close_time: i64,
+    /// Kline interval.
+    #[serde(rename = "i")]
+    pub interval: BinanceKlineInterval,
+    /// First trade ID.
+    #[serde(rename = "f")]
+    pub first_trade_id: i64,
+    /// Last trade ID.
+    #[serde(rename = "L")]
+    pub last_trade_id: i64,
+    /// Open price.
+    #[serde(rename = "o")]
+    pub open: String,
+    /// Close price.
+    #[serde(rename = "c")]
+    pub close: String,
+    /// High price.
+    #[serde(rename = "h")]
+    pub high: String,
+    /// Low price.
+    #[serde(rename = "l")]
+    pub low: String,
+    /// Base asset volume.
+    #[serde(rename = "v")]
+    pub volume: String,
+    /// Number of trades.
+    #[serde(rename = "n")]
+    pub num_trades: i64,
+    /// Is this kline closed.
+    #[serde(rename = "x")]
+    pub is_closed: bool,
+    /// Quote asset volume.
+    #[serde(rename = "q")]
+    pub quote_volume: String,
+    /// Taker buy base asset volume.
+    #[serde(rename = "V")]
+    pub taker_buy_volume: String,
+    /// Taker buy quote asset volume.
+    #[serde(rename = "Q")]
+    pub taker_buy_quote_volume: String,
+    /// Ignored field.
+    #[serde(rename = "B", default)]
+    pub ignored: Option<String>,
+}
+
 /// Kline data within kline message.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BinanceFuturesKlineData {

@@ -37,15 +37,16 @@ use ustr::Ustr;
 use super::{
     messages::{
         BinanceFuturesAccountConfigMsg, BinanceFuturesAccountUpdateMsg, BinanceFuturesAggTradeMsg,
-        BinanceFuturesBookTickerMsg, BinanceFuturesDepthUpdateMsg, BinanceFuturesHandlerCommand,
-        BinanceFuturesKlineMsg, BinanceFuturesListenKeyExpiredMsg, BinanceFuturesMarginCallMsg,
-        BinanceFuturesMarkPriceMsg, BinanceFuturesOrderUpdateMsg, BinanceFuturesTradeMsg,
-        BinanceFuturesWsErrorMsg, BinanceFuturesWsErrorResponse, BinanceFuturesWsSubscribeRequest,
+        BinanceFuturesBookTickerMsg, BinanceFuturesContinuousKlineMsg,
+        BinanceFuturesDepthUpdateMsg, BinanceFuturesHandlerCommand, BinanceFuturesKlineMsg,
+        BinanceFuturesListenKeyExpiredMsg, BinanceFuturesMarginCallMsg, BinanceFuturesMarkPriceMsg,
+        BinanceFuturesOrderUpdateMsg, BinanceFuturesTradeMsg, BinanceFuturesWsErrorMsg,
+        BinanceFuturesWsErrorResponse, BinanceFuturesWsSubscribeRequest,
         BinanceFuturesWsSubscribeResponse, NautilusFuturesWsMessage,
     },
     parse::{
-        extract_event_type, extract_symbol, parse_agg_trade, parse_book_ticker, parse_depth_update,
-        parse_kline, parse_mark_price, parse_trade,
+        extract_event_type, extract_pair, extract_symbol, parse_agg_trade, parse_book_ticker,
+        parse_continuous_kline, parse_depth_update, parse_kline, parse_mark_price, parse_trade,
     },
 };
 use crate::common::enums::{BinanceWsEventType, BinanceWsMethod};
@@ -310,7 +311,8 @@ impl BinanceFuturesWsFeedHandler {
         }
 
         // Market data events require symbol and instrument lookup
-        let symbol = extract_symbol(json)?;
+        // Try extract_symbol first, if not found, try extract_pair (for continuous kline)
+        let symbol = extract_symbol(json).or_else(|| extract_pair(json))?;
         let Some(instrument) = self.instruments.get(&symbol) else {
             log::warn!(
                 "No instrument in cache, dropping message: symbol={symbol}, event_type={event_type:?}"
@@ -399,6 +401,34 @@ impl BinanceFuturesWsFeedHandler {
                             log::warn!("Failed to parse kline: {e}");
                         }
                     }
+                }
+            }
+            BinanceWsEventType::ContinuousKline => {
+                if let Ok(msg) =
+                    serde_json::from_value::<BinanceFuturesContinuousKlineMsg>(json.clone())
+                {
+                    log::debug!(
+                        "Parsing continuous kline: pair={}, contract_type={}, interval={:?}, closed={}",
+                        msg.pair,
+                        msg.contract_type,
+                        msg.kline.interval,
+                        msg.kline.is_closed
+                    );
+                    match parse_continuous_kline(&msg, instrument) {
+                        Ok(Some(bar)) => {
+                            log::debug!("Successfully parsed continuous kline bar: {}", bar.bar_type.instrument_id());
+                            return Some(NautilusFuturesWsMessage::Data(vec![Data::Bar(bar)]));
+                        }
+                        Ok(None) => {
+                            // Kline not closed yet, skip (normal for 1s klines)
+                            log::trace!("Continuous kline not closed yet, skipping");
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to parse continuous kline: {e}");
+                        }
+                    }
+                } else {
+                    log::warn!("Failed to deserialize continuous kline message: {json:?}");
                 }
             }
             BinanceWsEventType::ForceOrder
