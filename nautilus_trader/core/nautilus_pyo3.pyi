@@ -1319,6 +1319,9 @@ class OrderSide(Enum):
     BUY = "BUY"
     SELL = "SELL"
 
+    @classmethod
+    def from_str(cls, value: str) -> OrderSide: ...
+
 class OrderStatus(Enum):
     INITIALIZED = "INITIALIZED"
     DENIED = "DENIED"
@@ -6256,6 +6259,12 @@ class BybitHttpClient:
         instrument_id: InstrumentId,
         limit: int | None = None,
     ) -> list[TradeTick]: ...
+    async def request_orderbook_snapshot(
+        self,
+        product_type: BybitProductType,
+        instrument_id: InstrumentId,
+        limit: int | None = None,
+    ) -> OrderBookDeltas: ...
     async def request_bars(
         self,
         product_type: BybitProductType,
@@ -7058,8 +7067,9 @@ class DeribitWebSocketClient:
         instrument_id: InstrumentId,
         resolution: str,
     ) -> None: ...
-    async def buy(
+    async def submit_order(
         self,
+        order_side: OrderSide,
         quantity: Quantity,
         order_type: OrderType,
         client_order_id: ClientOrderId,
@@ -7073,22 +7083,7 @@ class DeribitWebSocketClient:
         trigger_price: Price | None = None,
         trigger: str | None = None,
     ) -> None: ...
-    async def sell(
-        self,
-        quantity: Quantity,
-        order_type: OrderType,
-        client_order_id: ClientOrderId,
-        trader_id: TraderId,
-        strategy_id: StrategyId,
-        instrument_id: InstrumentId,
-        price: Price | None = None,
-        time_in_force: str | None = None,
-        post_only: bool = False,
-        reduce_only: bool = False,
-        trigger_price: Price | None = None,
-        trigger: str | None = None,
-    ) -> None: ...
-    async def edit(
+    async def modify_order(
         self,
         order_id: str,
         quantity: Quantity,
@@ -7098,7 +7093,7 @@ class DeribitWebSocketClient:
         strategy_id: StrategyId,
         instrument_id: InstrumentId,
     ) -> None: ...
-    async def cancel(
+    async def cancel_order(
         self,
         order_id: str,
         client_order_id: ClientOrderId,
@@ -7106,12 +7101,12 @@ class DeribitWebSocketClient:
         strategy_id: StrategyId,
         instrument_id: InstrumentId,
     ) -> None: ...
-    async def cancel_all_by_instrument(
+    async def cancel_all_orders(
         self,
         instrument_id: InstrumentId,
         order_type: str | None = None,
     ) -> None: ...
-    async def get_order_state(
+    async def query_order(
         self,
         order_id: str,
         client_order_id: ClientOrderId,
