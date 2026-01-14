@@ -13,6 +13,7 @@ members = [
   "crates/adapters/dydx",
   "crates/adapters/hyperliquid",
   "crates/adapters/kraken",
+  "crates/adapters/mexc",
   "crates/adapters/okx",
   "crates/adapters/tardis",
   "crates/analysis",

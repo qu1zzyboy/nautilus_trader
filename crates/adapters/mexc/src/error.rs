@@ -17,6 +17,29 @@
 
 use thiserror::Error;
 
+/// The main error type for all MEXC adapter operations.
+#[derive(Debug, Error)]
+pub enum MexcError {
+    /// Invalid order side.
+    #[error("Invalid order side: {0}")]
+    InvalidOrderSide(String),
+    /// Invalid order type.
+    #[error("Invalid order type: {0}")]
+    InvalidOrderType(String),
+    /// Invalid order status.
+    #[error("Invalid order status: {0}")]
+    InvalidOrderStatus(String),
+    /// Invalid time in force.
+    #[error("Invalid time in force: {0}")]
+    InvalidTimeInForce(String),
+    /// Validation error.
+    #[error("Validation error: {0}")]
+    Validation(String),
+    /// Configuration error.
+    #[error("Configuration error: {0}")]
+    Config(String),
+}
+
 /// WebSocket-specific errors for MEXC adapter.
 #[derive(Debug, Error)]
 pub enum MexcWsError {

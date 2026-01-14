@@ -16,6 +16,7 @@
 //! Common types and utilities shared across the MEXC adapter.
 
 pub mod consts;
+pub mod credential;
 pub mod enums;
 pub mod parse;
 

@@ -16,18 +16,55 @@
 //! WebSocket message types for MEXC adapter.
 
 use nautilus_model::data::Data;
-use serde::{Deserialize, Deserializer, Serializer, de};
-#[derive(Debug, Clone, Serialize)]
+use serde::{Deserialize, Serialize};
+
+use super::enums::{MexcWsChannel, MexcWsMessageType};
+
+/// MEXC WebSocket subscription request message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MexcSubscription {
+    /// The operation type (subscribe/unsubscribe).
+    pub method: String,
+    /// The subscription parameters.
+    pub param: MexcSubscriptionParam,
+}
+
+/// MEXC WebSocket subscription parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MexcSubscriptionParam {
+    /// The symbol to subscribe to.
+    pub symbol: String,
+}
+
+/// MEXC WebSocket subscription response message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MexcSubscriptionResponse {
+    /// Response status code (200 for success).
+    #[serde(default)]
+    pub status: Option<u64>,
+    /// Response message.
+    #[serde(default)]
+    pub msg: Option<String>,
+    /// The method that was called.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// The subscription parameters.
+    #[serde(default)]
+    pub param: Option<MexcSubscriptionParam>,
+}
+
 /// Internal WebSocket message type for MEXC.
-pub struct MEXCAuthentication {}
 #[derive(Clone, Debug)]
 pub enum MexcWsMessage {
-    /// Reconnection signal
+    /// Reconnection signal.
     Reconnected,
     /// Subscription confirmation or error.
     Subscription {
+        /// Whether the subscription was successful.
         success: bool,
+        /// The topic that was subscribed/unsubscribed.
         topic: Option<String>,
+        /// Error message if subscription failed.
         error: Option<String>,
     },
     /// Market data message.
@@ -35,10 +72,13 @@ pub enum MexcWsMessage {
 }
 
 /// Nautilus WebSocket message wrapper.
+///
+/// This enum contains fully-parsed Nautilus domain objects ready for consumption
+/// by the Python layer without additional processing.
 #[derive(Clone, Debug)]
 pub enum NautilusWsMessage {
     /// Reconnection signal.
     Reconnected,
-    /// Market data.
+    /// Market data (trades, quotes, bars, order book deltas).
     Data(Vec<Data>),
 }

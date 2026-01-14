@@ -22,20 +22,25 @@ use std::str::FromStr;
 use ahash::AHashMap;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
-    data::{Bar, Data, OrderBookDeltas, QuoteTick, TradeTick},
-    enums::{AggressorSide, BookAction},
+    data::{
+        Bar, BarSpecification, BookOrder, Data, OrderBookDelta, OrderBookDeltas, OrderBookDeltas_API,
+        QuoteTick, TradeTick,
+    },
+    enums::{AggressorSide, BookAction, OrderSide, PriceType},
     identifiers::TradeId,
-    instruments::InstrumentAny,
+    instruments::{Instrument, InstrumentAny},
     types::{Price, Quantity},
 };
+
+// OrderId is a type alias for u64 in data::order
+type OrderId = u64;
 use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use crate::proto::{
     PublicAggreDealsV3Api, PublicAggreDealsV3ApiItem, PublicBookTickerV3Api,
     PublicDealsV3Api, PublicDealsV3ApiItem, PublicIncreaseDepthsV3Api,
-    PublicIncreaseDepthV3ApiItem, PublicLimitDepthsV3Api, PublicLimitDepthV3ApiItem,
-    PublicSpotKlineV3Api, PushDataV3ApiWrapper,
+    PublicLimitDepthsV3Api, PublicSpotKlineV3Api, PushDataV3ApiWrapper,
 };
 
 use super::error::{MexcWsError, MexcWsResult};
@@ -102,7 +107,7 @@ fn parse_public_deals(
         match parse_deal_item(deal, instrument, ts_init) {
             Ok(trade) => trades.push(Data::Trade(trade)),
             Err(e) => {
-                tracing::warn!("Failed to parse deal item: {e}");
+                log::warn!("Failed to parse deal item: {e}");
             }
         }
     }
@@ -167,7 +172,7 @@ fn parse_public_aggre_deals(
         match parse_aggre_deal_item(deal, instrument, ts_init) {
             Ok(trade) => trades.push(Data::Trade(trade)),
             Err(e) => {
-                tracing::warn!("Failed to parse aggregate deal item: {e}");
+                log::warn!("Failed to parse aggregate deal item: {e}");
             }
         }
     }
@@ -227,8 +232,10 @@ fn parse_public_increase_depths(
     let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
 
-    let mut bids = Vec::new();
-    let mut asks = Vec::new();
+    let mut deltas_vec = Vec::new();
+    let ts_event = ts_init;
+    let flags = 0u8;
+    let mut sequence = 0u64;
 
     // Parse bid side
     for bid in &msg.bids {
@@ -242,7 +249,18 @@ fn parse_public_increase_depths(
         let size = Quantity::from_decimal_dp(size_decimal, size_precision)
             .map_err(|e| MexcWsError::ParseError(format!("Failed to create bid Quantity: {e}")))?;
 
-        bids.push((price, size, BookAction::Update));
+        let order = BookOrder::new(OrderSide::Buy, price, size, OrderId::from(sequence));
+        let delta = OrderBookDelta::new(
+            instrument_id,
+            BookAction::Update,
+            order,
+            flags,
+            sequence,
+            ts_event,
+            ts_init,
+        );
+        deltas_vec.push(delta);
+        sequence += 1;
     }
 
     // Parse ask side
@@ -257,22 +275,24 @@ fn parse_public_increase_depths(
         let size = Quantity::from_decimal_dp(size_decimal, size_precision)
             .map_err(|e| MexcWsError::ParseError(format!("Failed to create ask Quantity: {e}")))?;
 
-        asks.push((price, size, BookAction::Update));
+        let order = BookOrder::new(OrderSide::Sell, price, size, OrderId::from(sequence));
+        let delta = OrderBookDelta::new(
+            instrument_id,
+            BookAction::Update,
+            order,
+            flags,
+            sequence,
+            ts_event,
+            ts_init,
+        );
+        deltas_vec.push(delta);
+        sequence += 1;
     }
 
-    // Use current time as event time if not available
-    let ts_event = ts_init;
+    let deltas = OrderBookDeltas::new(instrument_id, deltas_vec);
+    let deltas_api = OrderBookDeltas_API::new(deltas);
 
-    let deltas = OrderBookDeltas::new(
-        instrument_id,
-        BookAction::Update,
-        bids,
-        asks,
-        ts_event,
-        ts_init,
-    );
-
-    Ok(vec![Data::Deltas(deltas)])
+    Ok(vec![Data::Deltas(deltas_api)])
 }
 
 /// Parses public limit depths (full order book snapshot).
@@ -285,8 +305,10 @@ fn parse_public_limit_depths(
     let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
 
-    let mut bids = Vec::new();
-    let mut asks = Vec::new();
+    let mut deltas_vec = Vec::new();
+    let ts_event = ts_init;
+    let flags = 0u8;
+    let mut sequence = 0u64;
 
     // Parse bid side
     for bid in &msg.bids {
@@ -300,7 +322,18 @@ fn parse_public_limit_depths(
         let size = Quantity::from_decimal_dp(size_decimal, size_precision)
             .map_err(|e| MexcWsError::ParseError(format!("Failed to create bid Quantity: {e}")))?;
 
-        bids.push((price, size, BookAction::Add));
+        let order = BookOrder::new(OrderSide::Buy, price, size, OrderId::from(sequence));
+        let delta = OrderBookDelta::new(
+            instrument_id,
+            BookAction::Add,
+            order,
+            flags,
+            sequence,
+            ts_event,
+            ts_init,
+        );
+        deltas_vec.push(delta);
+        sequence += 1;
     }
 
     // Parse ask side
@@ -315,21 +348,24 @@ fn parse_public_limit_depths(
         let size = Quantity::from_decimal_dp(size_decimal, size_precision)
             .map_err(|e| MexcWsError::ParseError(format!("Failed to create ask Quantity: {e}")))?;
 
-        asks.push((price, size, BookAction::Add));
+        let order = BookOrder::new(OrderSide::Sell, price, size, OrderId::from(sequence));
+        let delta = OrderBookDelta::new(
+            instrument_id,
+            BookAction::Add,
+            order,
+            flags,
+            sequence,
+            ts_event,
+            ts_init,
+        );
+        deltas_vec.push(delta);
+        sequence += 1;
     }
 
-    let ts_event = ts_init;
+    let deltas = OrderBookDeltas::new(instrument_id, deltas_vec);
+    let deltas_api = OrderBookDeltas_API::new(deltas);
 
-    let deltas = OrderBookDeltas::new(
-        instrument_id,
-        BookAction::Add,
-        bids,
-        asks,
-        ts_event,
-        ts_init,
-    );
-
-    Ok(vec![Data::Deltas(deltas)])
+    Ok(vec![Data::Deltas(deltas_api)])
 }
 
 /// Parses public book ticker (best bid/ask) messages.
@@ -383,7 +419,7 @@ fn parse_public_spot_kline(
 ) -> MexcWsResult<Vec<Data>> {
     use nautilus_model::{
         data::{BarSpecification, BarType},
-        enums::{AggregationSource, BarAggregation},
+        enums::{AggregationSource, PriceType},
     };
 
     let instrument_id = instrument.id();
@@ -426,20 +462,22 @@ fn parse_public_spot_kline(
 
 /// Parses MEXC kline interval string to BarSpecification.
 fn parse_kline_interval(interval: &str) -> MexcWsResult<BarSpecification> {
-    use nautilus_model::data::BarSpecification;
-    use nautilus_model::enums::BarAggregation;
+    use nautilus_model::{
+        data::BarSpecification,
+        enums::{BarAggregation, PriceType},
+    };
 
     let spec = match interval {
-        "Min1" => BarSpecification::new(BarAggregation::Minute, 1),
-        "Min5" => BarSpecification::new(BarAggregation::Minute, 5),
-        "Min15" => BarSpecification::new(BarAggregation::Minute, 15),
-        "Min30" => BarSpecification::new(BarAggregation::Minute, 30),
-        "Min60" => BarSpecification::new(BarAggregation::Minute, 60),
-        "Hour4" => BarSpecification::new(BarAggregation::Hour, 4),
-        "Hour8" => BarSpecification::new(BarAggregation::Hour, 8),
-        "Day1" => BarSpecification::new(BarAggregation::Day, 1),
-        "Week1" => BarSpecification::new(BarAggregation::Week, 1),
-        "Month1" => BarSpecification::new(BarAggregation::Month, 1),
+        "Min1" => BarSpecification::new(1, BarAggregation::Minute, PriceType::Last),
+        "Min5" => BarSpecification::new(5, BarAggregation::Minute, PriceType::Last),
+        "Min15" => BarSpecification::new(15, BarAggregation::Minute, PriceType::Last),
+        "Min30" => BarSpecification::new(30, BarAggregation::Minute, PriceType::Last),
+        "Min60" => BarSpecification::new(60, BarAggregation::Minute, PriceType::Last),
+        "Hour4" => BarSpecification::new(4, BarAggregation::Hour, PriceType::Last),
+        "Hour8" => BarSpecification::new(8, BarAggregation::Hour, PriceType::Last),
+        "Day1" => BarSpecification::new(1, BarAggregation::Day, PriceType::Last),
+        "Week1" => BarSpecification::new(1, BarAggregation::Week, PriceType::Last),
+        "Month1" => BarSpecification::new(1, BarAggregation::Month, PriceType::Last),
         _ => {
             return Err(MexcWsError::ParseError(format!(
                 "Unsupported kline interval: {interval}"

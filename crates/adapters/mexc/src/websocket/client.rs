@@ -31,17 +31,17 @@ use futures_util::Stream;
 use nautilus_common::live::get_runtime;
 use nautilus_core::{
     consts::NAUTILUS_USER_AGENT,
-    env::{get_env_var, get_or_env_var_opt},
+    env::get_or_env_var_opt,
 };
 use nautilus_model::{
-    identifiers::{AccountId, InstrumentId},
+    identifiers::AccountId,
     instruments::{Instrument, InstrumentAny},
 };
 use nautilus_network::{
     http::USER_AGENT,
     mode::ConnectionMode,
     websocket::{
-        AUTHENTICATION_TIMEOUT_SECS, AuthTracker, PingHandler, SubscriptionState, WebSocketClient,
+        AuthTracker, PingHandler, SubscriptionState, WebSocketClient,
         WebSocketConfig, channel_message_handler,
     },
 };
@@ -198,7 +198,7 @@ impl MexcWebSocketClient {
                 .map(|entry| entry.value().clone())
                 .collect();
             if let Err(e) = cmd_tx.send(HandlerCommand::InitializeInstruments(cached_instruments)) {
-                tracing::error!("Failed to replay instruments to handler: {e}");
+                log::error!("Failed to replay instruments to handler: {e}");
             }
         }
 
@@ -226,27 +226,47 @@ impl MexcWebSocketClient {
                             continue;
                         }
                         log::info!("WebSocket reconnected");
-                        // TODO: Implement reconnection resubscription logic
+
+                        // Resubscribe to all confirmed subscriptions
+                        let topics = subscriptions.all_topics();
+                        if !topics.is_empty() {
+                            log::debug!(
+                                "Resubscribing to confirmed subscriptions: count={}",
+                                topics.len()
+                            );
+
+                            for topic in &topics {
+                                subscriptions.mark_subscribe(topic.as_str());
+                            }
+
+                            // Send resubscribe command
+                            if let Err(e) = cmd_tx_for_reconnect.send(HandlerCommand::Subscribe {
+                                topics: topics.clone(),
+                            }) {
+                                log::error!("Failed to send resubscribe command: {e}");
+                            }
+                        }
+
                         continue;
                     }
                     Some(msg) => {
                         if handler.send(msg).is_err() {
-                            tracing::error!("Failed to send message (receiver dropped)");
+                            log::error!("Failed to send message (receiver dropped)");
                             break;
                         }
                     }
                     None => {
                         if handler.is_stopped() {
-                            tracing::debug!("Stop signal received, ending message processing");
+                            log::debug!("Stop signal received, ending message processing");
                             break;
                         }
-                        tracing::warn!("WebSocket stream ended unexpectedly");
+                        log::warn!("WebSocket stream ended unexpectedly");
                         break;
                     }
                 }
             }
 
-            tracing::debug!("Handler task exiting");
+            log::debug!("Handler task exiting");
         });
 
         self.task_handle = Some(Arc::new(stream_handle));

@@ -25,7 +25,6 @@ use std::sync::{
 use ahash::AHashMap;
 use nautilus_core::{UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_model::{
-    data::Data,
     identifiers::AccountId,
     instruments::{Instrument, InstrumentAny},
 };
@@ -34,12 +33,15 @@ use nautilus_network::{
     retry::{RetryManager, create_websocket_retry_manager},
     websocket::{AuthTracker, SubscriptionState, WebSocketClient},
 };
+use std::str::FromStr;
 use tokio_tungstenite::tungstenite::Message;
 use ustr::Ustr;
 
 use prost::Message as ProstMessage;
+use serde_json;
 
 use super::{
+    enums::MexcWsChannel,
     error::MexcWsError,
     messages::{MexcWsMessage, NautilusWsMessage},
 };
@@ -136,7 +138,6 @@ impl FeedHandler {
 
     /// Processes raw WebSocket messages and returns Nautilus messages.
     pub(super) async fn next(&mut self) -> Option<NautilusWsMessage> {
-        let clock = get_atomic_clock_realtime();
 
         loop {
             tokio::select! {
@@ -154,18 +155,24 @@ impl FeedHandler {
                         }
                         Some(HandlerCommand::Authenticate { payload }) => {
                             if let Err(e) = self.send_with_retry(payload).await {
-                                tracing::error!("Failed to send authentication: {e}");
+                                log::error!("Failed to send authentication: {e}");
                             }
                             continue;
                         }
                         Some(HandlerCommand::Subscribe { topics }) => {
-                            // TODO: Build protobuf subscribe message and send
-                            tracing::debug!("Subscribe command received for topics: {topics:?}");
+                            for topic in topics {
+                                if let Err(e) = self.send_subscribe_message(&topic).await {
+                                    log::error!("Failed to send subscribe message for {topic}: {e}");
+                                }
+                            }
                             continue;
                         }
                         Some(HandlerCommand::Unsubscribe { topics }) => {
-                            // TODO: Build protobuf unsubscribe message and send
-                            tracing::debug!("Unsubscribe command received for topics: {topics:?}");
+                            for topic in topics {
+                                if let Err(e) = self.send_unsubscribe_message(&topic).await {
+                                    log::error!("Failed to send unsubscribe message for {topic}: {e}");
+                                }
+                            }
                             continue;
                         }
                         Some(HandlerCommand::InitializeInstruments(instruments)) => {
@@ -179,7 +186,7 @@ impl FeedHandler {
                             continue;
                         }
                         None => {
-                            tracing::debug!("Command channel closed");
+                            log::debug!("Command channel closed");
                             return None;
                         }
                     }
@@ -189,20 +196,57 @@ impl FeedHandler {
                     let msg = match msg {
                         Some(msg) => msg,
                         None => {
-                            tracing::debug!("WebSocket stream closed");
+                            log::debug!("WebSocket stream closed");
                             return None;
                         }
                     };
 
                     // Handle ping frames directly for minimal latency
                     if let Message::Ping(data) = &msg {
-                        tracing::trace!("Received ping frame with {} bytes", data.len());
+                        log::trace!("Received ping frame with {} bytes", data.len());
                         if let Some(client) = &self.client
                             && let Err(e) = client.send_pong(data.to_vec()).await
                         {
-                            tracing::warn!(error = %e, "Failed to send pong frame");
+                            log::warn!("Failed to send pong frame: {e}");
                         }
                         continue;
+                    }
+
+                    // Handle binary protobuf messages directly
+                    if let Message::Binary(data) = &msg {
+                        let clock = get_atomic_clock_realtime();
+                        let ts_init = clock.get_time_ns();
+                        
+                        match Self::parse_protobuf_message(&data, &self.instruments_cache, ts_init) {
+                            Some(MexcWsMessage::Data(data_vec)) => {
+                                if self.signal.load(Ordering::Relaxed) {
+                                    log::debug!("Stop signal received");
+                                    return None;
+                                }
+                                return Some(NautilusWsMessage::Data(data_vec));
+                            }
+                            Some(MexcWsMessage::Reconnected) => {
+                                return Some(NautilusWsMessage::Reconnected);
+                            }
+                            Some(MexcWsMessage::Subscription { success, topic, error }) => {
+                                if let Some(topic) = topic {
+                                    if success {
+                                        log::info!("Subscription confirmed for topic: {topic}");
+                                        self.subscriptions.confirm_subscribe(&topic);
+                                    } else {
+                                        log::error!("Subscription failed for topic: {topic}");
+                                        self.subscriptions.mark_failure(&topic);
+                                        if let Some(err) = error {
+                                            log::error!("Subscription failed for {topic}: {err}");
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            None => {
+                                continue;
+                            }
+                        }
                     }
 
                     let event = match Self::parse_raw_message(msg) {
@@ -211,7 +255,7 @@ impl FeedHandler {
                     };
 
                     if self.signal.load(Ordering::Relaxed) {
-                        tracing::debug!("Stop signal received");
+                        log::debug!("Stop signal received");
                         return None;
                     }
 
@@ -226,7 +270,7 @@ impl FeedHandler {
                                 } else {
                                     self.subscriptions.mark_failure(&topic);
                                     if let Some(err) = error {
-                                        tracing::error!("Subscription failed for {topic}: {err}");
+                                        log::error!("Subscription failed for {topic}: {err}");
                                     }
                                 }
                             }
@@ -240,7 +284,7 @@ impl FeedHandler {
 
                 _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
                     if self.signal.load(Ordering::Relaxed) {
-                        tracing::debug!("Stop signal received during idle period");
+                        log::debug!("Stop signal received during idle period");
                         return None;
                     }
                     continue;
@@ -256,48 +300,224 @@ impl FeedHandler {
         match msg {
             Message::Text(text) => {
                 if text == RECONNECTED {
-                    tracing::info!("Received WebSocket reconnected signal");
+                    log::info!("Received WebSocket reconnected signal");
                     return Some(MexcWsMessage::Reconnected);
                 }
-                // MEXC may send some text messages (e.g., subscription confirmations)
-                // TODO: Parse text messages if needed
-                tracing::trace!("Received text message: {text}");
+                // MEXC may send text messages for subscription confirmations
+                // Format: {"id": 0, "code": 0, "msg": "success"} for success
+                // Format: {"id": 0, "code": 0, "msg": "Not Subscribed successfully! [topic]. Reason: ..."} for error
+                // Also check for status field format: {"status": 200, "params": ["topic"]}
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                    // Check for code field (MEXC uses code: 0 for success, non-zero for error)
+                    let (success, topic, error) = if let Some(code) = json.get("code").and_then(|c| c.as_i64()) {
+                        // MEXC format: {"id": 0, "code": 0, "msg": "..."}
+                        let success = code == 0 && json.get("msg")
+                            .and_then(|m| m.as_str())
+                            .map(|m| m.contains("success") || !m.contains("Not Subscribed"))
+                            .unwrap_or(false);
+                        
+                        // Extract topic from msg field if available
+                        // Format: "Not Subscribed successfully! [spot@public.limit.depth.v3.api.pb@BTCUSDT@5]. Reason: ..."
+                        let topic = json.get("msg")
+                            .and_then(|m| m.as_str())
+                            .and_then(|msg| {
+                                // Try to extract topic from message like "[topic]"
+                                if let Some(start) = msg.find('[') {
+                                    if let Some(end) = msg[start+1..].find(']') {
+                                        Some(msg[start+1..start+1+end].to_string())
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            })
+                            .or_else(|| {
+                                // Fallback: try params array
+                                json.get("params")
+                                    .and_then(|p| p.as_array())
+                                    .and_then(|arr| arr.first())
+                                    .and_then(|s| s.as_str())
+                                    .map(|s| s.to_string())
+                            });
+                        
+                        let error = if !success {
+                            json.get("msg")
+                                .and_then(|m| m.as_str())
+                                .map(|s| s.to_string())
+                        } else {
+                            None
+                        };
+                        
+                        (success, topic, error)
+                    } else if let Some(status) = json.get("status").and_then(|s| s.as_u64()) {
+                        // Alternative format with status field
+                        let success = status == 200;
+                        let topic = json.get("params")
+                            .and_then(|p| p.as_array())
+                            .and_then(|arr| arr.first())
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string());
+                        let error = if !success {
+                            json.get("msg")
+                                .and_then(|m| m.as_str())
+                                .map(|s| s.to_string())
+                        } else {
+                            None
+                        };
+                        (success, topic, error)
+                    } else {
+                        // Not a subscription response
+                        (false, None, None)
+                    };
+                    
+                    if topic.is_some() || error.is_some() {
+                        return Some(MexcWsMessage::Subscription { success, topic, error });
+                    }
+                }
                 None
             }
-            Message::Binary(data) => {
+            Message::Binary(_data) => {
                 // Key: Parse protobuf binary message
-                Self::parse_protobuf_message(&data)
+                // Note: We need instruments cache and timestamp, but parse_raw_message is static
+                // This will be handled in the next() method instead
+                None
             }
             Message::Ping(_) => {
                 // Handled in select! loop before parse_raw_message
                 None
             }
             Message::Pong(_) => {
-                tracing::trace!("Received pong frame");
+                log::trace!("Received pong frame");
                 None
             }
             Message::Close(_) => {
-                tracing::debug!("Received close message, waiting for reconnection");
+                log::debug!("Received close message, waiting for reconnection");
                 None
             }
             Message::Frame(_) => {
-                tracing::trace!("Received raw frame");
+                log::trace!("Received raw frame");
                 None
             }
         }
     }
 
+    /// Sends a subscribe message for the given topic.
+    ///
+    /// Topic format can be:
+    /// - Full format: "spot@public.limit.depth.v3.api.pb@BTCUSDT@5" (channel@symbol@depth)
+    /// - Simple format: "channel:symbol" (e.g., "spot@public.deals.v3.api:BTC_USDT")
+    async fn send_subscribe_message(&self, topic: &str) -> anyhow::Result<()> {
+        // MEXC subscription message format: {"method": "SUBSCRIPTION", "params": ["channel@symbol@depth"]}
+        // If topic contains '@', assume it's already in the full format
+        let subscribe_msg = if topic.contains('@') && !topic.contains(':') {
+            // Full format: "spot@public.limit.depth.v3.api.pb@BTCUSDT@5"
+            serde_json::json!({
+                "method": "SUBSCRIPTION",
+                "params": [topic]
+            })
+        } else {
+            // Simple format: "channel:symbol" - convert to full format
+            let (channel_str, symbol) = topic
+                .split_once(':')
+                .ok_or_else(|| anyhow::anyhow!("Invalid topic format: {topic}"))?;
+
+            // Validate channel string
+            let _channel = MexcWsChannel::from_str(channel_str)
+                .ok_or_else(|| anyhow::anyhow!("Unknown channel: {channel_str}"))?;
+
+            // Convert to full format: "channel@symbol"
+            let full_topic = format!("{}@{}", channel_str, symbol);
+            serde_json::json!({
+                "method": "SUBSCRIPTION",
+                "params": [full_topic]
+            })
+        };
+
+        let payload = serde_json::to_string(&subscribe_msg)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize subscribe message: {e}"))?;
+
+        if let Some(client) = &self.client {
+            client.send_text(payload, None).await.map_err(|e| {
+                anyhow::anyhow!("Failed to send subscribe message: {e}")
+            })?;
+        } else {
+            return Err(anyhow::anyhow!("WebSocket client not available"));
+        }
+
+        Ok(())
+    }
+
+    /// Sends an unsubscribe message for the given topic.
+    ///
+    /// Topic format can be:
+    /// - Full format: "spot@public.limit.depth.v3.api.pb@BTCUSDT@5" (channel@symbol@depth)
+    /// - Simple format: "channel:symbol" (e.g., "spot@public.deals.v3.api:BTC_USDT")
+    async fn send_unsubscribe_message(&self, topic: &str) -> anyhow::Result<()> {
+        // MEXC unsubscription message format: {"method": "UNSUBSCRIPTION", "params": ["channel@symbol@depth"]}
+        let unsubscribe_msg = if topic.contains('@') && !topic.contains(':') {
+            // Full format: "spot@public.limit.depth.v3.api.pb@BTCUSDT@5"
+            serde_json::json!({
+                "method": "UNSUBSCRIPTION",
+                "params": [topic]
+            })
+        } else {
+            // Simple format: "channel:symbol" - convert to full format
+            let (channel_str, symbol) = topic
+                .split_once(':')
+                .ok_or_else(|| anyhow::anyhow!("Invalid topic format: {topic}"))?;
+
+            // Validate channel string
+            let _channel = MexcWsChannel::from_str(channel_str)
+                .ok_or_else(|| anyhow::anyhow!("Unknown channel: {channel_str}"))?;
+
+            // Convert to full format: "channel@symbol"
+            let full_topic = format!("{}@{}", channel_str, symbol);
+            serde_json::json!({
+                "method": "UNSUBSCRIPTION",
+                "params": [full_topic]
+            })
+        };
+
+        let payload = serde_json::to_string(&unsubscribe_msg)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize unsubscribe message: {e}"))?;
+
+        if let Some(client) = &self.client {
+            client.send_text(payload, None).await.map_err(|e| {
+                anyhow::anyhow!("Failed to send unsubscribe message: {e}")
+            })?;
+        } else {
+            return Err(anyhow::anyhow!("WebSocket client not available"));
+        }
+
+        Ok(())
+    }
+
     /// Parses a protobuf binary message.
-    fn parse_protobuf_message(data: &[u8]) -> Option<MexcWsMessage> {
+    fn parse_protobuf_message(
+        data: &[u8],
+        instruments: &AHashMap<Ustr, InstrumentAny>,
+        ts_init: UnixNanos,
+    ) -> Option<MexcWsMessage> {
         match MexcProtoMessage::decode(data) {
             Ok(proto_msg) => {
-                // TODO: Convert protobuf message to internal message type
-                tracing::trace!("Successfully decoded protobuf message, size: {} bytes", data.len());
-                // Placeholder - implement actual conversion
-                None
+                // Convert protobuf message to Nautilus data types
+                match super::parse::parse_protobuf_wrapper(&proto_msg, instruments, ts_init) {
+                    Ok(data_vec) => {
+                        if data_vec.is_empty() {
+                            None
+                        } else {
+                            Some(MexcWsMessage::Data(data_vec))
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to parse protobuf wrapper: {e}");
+                        None
+                    }
+                }
             }
             Err(e) => {
-                tracing::error!(
+                log::error!(
                     "Failed to decode MEXC protobuf message: {e}, data_len: {}",
                     data.len()
                 );

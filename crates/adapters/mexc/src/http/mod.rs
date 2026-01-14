@@ -13,11 +13,24 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! HTTP client implementation for MEXC REST API.
+//! HTTP REST API client implementation for MEXC.
+//!
+//! This module provides an HTTP client for interacting with the MEXC REST API.
+//! It handles:
+//! - Request signing and authentication.
+//! - Rate limiting and retry logic.
+//! - Request/response models.
+//! - Parsing MEXC data into Nautilus domain models.
+//!
+//! The client supports all major MEXC REST endpoints including:
+//! - Market data (instruments, trades, order books).
+//! - Account data (wallet, positions).
+//! - Order management (place, modify, cancel orders).
+//! - Execution history.
 
 pub mod client;
 pub mod error;
-
-pub use crate::http::client::MexcHttpClient;
-pub use crate::http::error::MexcHttpError;
+pub mod models;
+pub mod parse;
+pub mod query;
 

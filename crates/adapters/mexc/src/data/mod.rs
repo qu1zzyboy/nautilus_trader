@@ -19,7 +19,7 @@
 // This is a placeholder module structure
 
 use async_trait::async_trait;
-use nautilus_data::client::DataClient;
+use nautilus_common::clients::DataClient;
 use nautilus_model::identifiers::ClientId;
 
 /// MEXC data client implementation.

@@ -29,7 +29,8 @@ pub static MEXC_VENUE: LazyLock<Venue> = LazyLock::new(|| Venue::new(Ustr::from(
 pub const MEXC_HTTP_URL: &str = "https://api.mexc.com";
 
 /// MEXC WebSocket API URL.
-pub const MEXC_WS_URL: &str = "wss://wbs.mexc.com/ws";
+/// Updated to new API endpoint as of August 2025.
+pub const MEXC_WS_URL: &str = "wss://wbs-api.mexc.com/ws";
 
 /// MEXC WebSocket topic delimiter.
 pub const MEXC_WS_TOPIC_DELIMITER: char = ':';

@@ -32,19 +32,32 @@ fn main() {
     // Tell Cargo to rerun this build script if any proto files change
     println!("cargo:rerun-if-changed={}", proto_dir.display());
 
+    // Check if proto directory exists
+    if !proto_dir.exists() {
+        println!("cargo:warning=Proto directory not found: {}, skipping protobuf compilation", proto_dir.display());
+        println!("cargo:warning=Using pre-generated proto files from src/proto/mexc_proto.rs");
+        return;
+    }
+
     // Collect all .proto files
-    let proto_files: Vec<PathBuf> = std::fs::read_dir(&proto_dir)
-        .expect("Failed to read proto directory")
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            if path.extension()?.to_str()? == "proto" {
-                Some(path)
-            } else {
-                None
-            }
-        })
-        .collect();
+    let proto_files: Vec<PathBuf> = match std::fs::read_dir(&proto_dir) {
+        Ok(dir) => dir
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let path = entry.path();
+                if path.extension()?.to_str()? == "proto" {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        Err(e) => {
+            println!("cargo:warning=Failed to read proto directory: {e}, skipping protobuf compilation");
+            println!("cargo:warning=Using pre-generated proto files from src/proto/mexc_proto.rs");
+            return;
+        }
+    };
 
     if proto_files.is_empty() {
         println!("cargo:warning=No protobuf files found in {}", proto_dir.display());

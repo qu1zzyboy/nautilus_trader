@@ -5471,6 +5471,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "nautilus-mexc"
+version = "0.53.0"
+dependencies = [
+ "ahash 0.8.12",
+ "anyhow",
+ "arc-swap",
+ "async-stream",
+ "async-trait",
+ "aws-lc-rs",
+ "chrono",
+ "dashmap",
+ "derive_builder",
+ "futures-util",
+ "hex",
+ "indexmap 2.13.0",
+ "log",
+ "nautilus-common",
+ "nautilus-core",
+ "nautilus-data",
+ "nautilus-execution",
+ "nautilus-live",
+ "nautilus-model",
+ "nautilus-network",
+ "nautilus-serialization",
+ "nautilus-testkit",
+ "prost",
+ "prost-build",
+ "rstest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "strum",
+ "thiserror 2.0.17",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "ustr",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "nautilus-model"
 version = "0.53.0"
 dependencies = [
