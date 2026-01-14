@@ -20,7 +20,8 @@ Released on TBD (UTC).
 - Fixed `CVec::empty()` to use dangling pointer instead of null, avoiding undefined behavior in `Vec::from_raw_parts`
 
 ### Fixes
-- Fixed trade execution fills discarded with `liquidity_consumption`
+- Fixed matching engine liquidity consumption using cumulative book quantity
+- Fixed matching engine trade execution fills discarded with `liquidity_consumption`
 - Fixed `ExecAlgorithm` spawn quantity accounting (will now restore quantity from denied/rejected spawned orders)
 - Fixed analyzer epoch timestamp from empty shell positions
 - Fixed backtest clock monotonicity with time alerts (#3384), thanks @draphi
@@ -33,7 +34,9 @@ Released on TBD (UTC).
 - Fixed instrument cache race condition during `LiveNode` (Rust) startup (#3385), thanks @filipmacek
 - Fixed quickstart MACD strategy logic (#3377), thanks for reporting @SisyphusCoin
 - Fixed reconciliation timing (for v2 Rust) - process instruments before reconciliation (#3415), thanks @filipmacek
+- Fixed `request_order_book_snapshot` and add Bybit support (#3416), thanks @dxwil
 - Fixed Binance Spot WebSocket subscription acknowledgment parsing (#3382), thanks @Johnkhk
+- Fixed Binance Futures instrument parsing for margin requirements (#3420), thanks @linimin
 - Fixed Bybit demo trading by using HTTP REST API for order operations (Bybit demo does not support WebSocket Trade API)
 - Fixed `databento_data` to fetch definitions for full date range (#3414)
 - Fixed Deribit auth token refresh race condition (#3402), thanks @filipmacek
@@ -48,6 +51,7 @@ Released on TBD (UTC).
 - Added Polymarket data loader rate limiting
 - Refactored computation of greeks (#3393), thanks @faysou
 - Refactored `TearsheetConfig.charts` to chart objects (removed `chart_args`) (#3398), thanks @KaulSe
+- Refactored Deribit WS client to use standard Nautilus method names (#3418), thanks @filipmacek
 - Refactored Polymarket WebSocket to multi-client pool pattern
 - Improved live timers to use `BTreeMap` for storage (#3392), thanks @faysou
 - Improved checks before writing data in catalog._write_chunk (#3411), thanks @faysou

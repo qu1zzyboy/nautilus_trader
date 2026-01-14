@@ -16,6 +16,10 @@
 //! Example demonstrating live data testing with the Binance Spot SBE adapter.
 //!
 //! Run with: `cargo run --example binance-spot-data-tester --package nautilus-binance`
+//!
+//! Requires environment variables (for SBE data streams):
+//! - BINANCE_ED25519_API_KEY
+//! - BINANCE_ED25519_API_SECRET
 
 use std::num::NonZeroUsize;
 
@@ -44,15 +48,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // InstrumentId::from("ETHUSDT.BINANCE"),
     ];
 
-    // SBE streams require Ed25519 authentication (not HMAC)
-    // Generate Ed25519 keys in your Binance account API settings
     let binance_config = BinanceDataClientConfig {
         product_types: vec![BinanceProductType::Spot],
         environment: BinanceEnvironment::Mainnet,
-        api_key: None,    // HMAC key for HTTP API (optional)
-        api_secret: None, // HMAC secret for HTTP API (optional)
-        ed25519_api_key: std::env::var("BINANCE_ED25519_API_KEY").ok(),
-        ed25519_api_secret: std::env::var("BINANCE_ED25519_API_SECRET").ok(),
+        api_key: None,
+        api_secret: None,
+        ed25519_api_key: None,
+        ed25519_api_secret: None,
         ..Default::default()
     };
 

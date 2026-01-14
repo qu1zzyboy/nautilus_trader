@@ -20,8 +20,10 @@
 //! Requires environment variables:
 //! - BINANCE_API_KEY: Your Binance API key
 //! - BINANCE_API_SECRET: Your Binance API secret
-//! - BINANCE_ED25519_API_KEY: Ed25519 API key (optional, for SBE data streams)
-//! - BINANCE_ED25519_API_SECRET: Ed25519 secret (optional, for SBE data streams)
+//!
+//! Optional environment variables (for SBE data streams):
+//! - BINANCE_ED25519_API_KEY
+//! - BINANCE_ED25519_API_SECRET
 
 use nautilus_binance::{
     common::enums::{BinanceEnvironment, BinanceProductType},
@@ -50,10 +52,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_config = BinanceDataClientConfig {
         product_types: vec![BinanceProductType::Spot],
         environment: BinanceEnvironment::Mainnet,
-        api_key: None,    // Will use 'BINANCE_API_KEY' env var
-        api_secret: None, // Will use 'BINANCE_API_SECRET' env var
-        ed25519_api_key: std::env::var("BINANCE_ED25519_API_KEY").ok(),
-        ed25519_api_secret: std::env::var("BINANCE_ED25519_API_SECRET").ok(),
+        api_key: None,
+        api_secret: None,
+        ed25519_api_key: None,
+        ed25519_api_secret: None,
         ..Default::default()
     };
 
