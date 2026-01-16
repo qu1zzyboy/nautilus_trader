@@ -118,7 +118,16 @@ Once implemented, you can test the adapter:
 // Example test structure
 #[tokio::test]
 async fn test_websocket_connection() {
-    let client = MexcWebSocketClient::new(
+    let mut client = MexcWebSocketClient::new(
+        None, // url
+        None, // api_key
+        None, // api_secret
+        None, // account_id
+        None, // heartbeat
+    ).unwrap();
+    
+    // Connect without listenkey (public data stream)
+    client.connect(None).await.unwrap();
         None,  // Use default URL
         None,  // No auth for public data
         None,

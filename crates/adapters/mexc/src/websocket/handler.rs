@@ -33,7 +33,6 @@ use nautilus_network::{
     retry::{RetryManager, create_websocket_retry_manager},
     websocket::{AuthTracker, SubscriptionState, WebSocketClient},
 };
-use std::str::FromStr;
 use tokio_tungstenite::tungstenite::Message;
 use ustr::Ustr;
 

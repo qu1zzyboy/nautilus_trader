@@ -104,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ws_client.cache_instrument(instrument);
 
     log::info!("Connecting to MEXC WebSocket...");
-    ws_client.connect().await?;
+    ws_client.connect(None).await?; // None = no listenkey (public data stream)
 
     // Give the connection a moment to stabilize
     tokio::time::sleep(Duration::from_millis(500)).await;

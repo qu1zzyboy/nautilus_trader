@@ -67,3 +67,59 @@ impl MexcDataClientConfig {
     }
 }
 
+/// Configuration for the MEXC live execution client.
+#[derive(Clone, Debug)]
+pub struct MexcExecClientConfig {
+    /// Trader ID for the client.
+    pub trader_id: nautilus_model::identifiers::TraderId,
+    /// Account ID for the client.
+    pub account_id: nautilus_model::identifiers::AccountId,
+    /// Optional API key used for authenticated REST/WebSocket requests.
+    pub api_key: Option<String>,
+    /// Optional API secret used for authenticated REST/WebSocket requests.
+    pub api_secret: Option<String>,
+    /// Optional override for the REST base URL.
+    pub base_url_http: Option<String>,
+    /// Optional override for the WebSocket URL.
+    pub base_url_ws: Option<String>,
+    /// Optional HTTP proxy URL for general HTTP client operations.
+    pub http_proxy_url: Option<String>,
+    /// Optional REST timeout in seconds.
+    pub http_timeout_secs: Option<u64>,
+    /// Optional maximum retry attempts for REST requests.
+    pub max_retries: Option<u32>,
+    /// Optional heartbeat interval (seconds) for the WebSocket client.
+    pub heartbeat_interval_secs: Option<u64>,
+}
+
+impl Default for MexcExecClientConfig {
+    fn default() -> Self {
+        Self {
+            trader_id: nautilus_model::identifiers::TraderId::from("TRADER-001"),
+            account_id: nautilus_model::identifiers::AccountId::from("MEXC-001"),
+            api_key: None,
+            api_secret: None,
+            base_url_http: Some(MEXC_HTTP_URL.to_string()),
+            base_url_ws: Some(MEXC_WS_URL.to_string()),
+            http_proxy_url: None,
+            http_timeout_secs: Some(30),
+            max_retries: Some(3),
+            heartbeat_interval_secs: Some(30),
+        }
+    }
+}
+
+impl MexcExecClientConfig {
+    /// Returns the HTTP base URL.
+    #[must_use]
+    pub fn http_base_url(&self) -> &str {
+        self.base_url_http.as_deref().unwrap_or(MEXC_HTTP_URL)
+    }
+
+    /// Returns the WebSocket URL.
+    #[must_use]
+    pub fn ws_url(&self) -> &str {
+        self.base_url_ws.as_deref().unwrap_or(MEXC_WS_URL)
+    }
+}
+

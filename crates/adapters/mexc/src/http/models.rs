@@ -15,8 +15,18 @@
 
 //! Data structures representing MEXC REST API payloads.
 
+use std::str::FromStr;
+
+use nautilus_core::UnixNanos;
+use nautilus_model::{
+    enums::{OrderSide, OrderStatus, OrderType, TimeInForce},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, VenueOrderId},
+    reports::OrderStatusReport,
+    types::Quantity,
+};
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
+use uuid::Uuid;
 
 /// MEXC instrument information.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -88,27 +98,128 @@ pub struct MexcOrderBook {
 #[serde(rename_all = "camelCase")]
 pub struct MexcOrder {
     /// Order ID.
+    #[serde(rename = "orderId")]
     pub order_id: Option<String>,
     /// Client order ID.
+    #[serde(rename = "clientOrderId")]
     pub client_order_id: Option<String>,
     /// Trading symbol.
     pub symbol: Ustr,
     /// Order side (BUY/SELL).
     pub side: String,
     /// Order type (LIMIT/MARKET).
+    #[serde(rename = "type")]
     pub order_type: Option<String>,
     /// Order status.
     pub status: Option<String>,
     /// Order price.
     pub price: Option<String>,
-    /// Order quantity.
+    /// Order quantity (MEXC API returns as "origQty").
+    #[serde(rename = "origQty", default)]
     pub quantity: String,
-    /// Filled quantity.
+    /// Filled quantity (MEXC API returns as "executedQty").
+    #[serde(rename = "executedQty")]
     pub executed_quantity: Option<String>,
-    /// Order creation time.
+    /// Order creation time (MEXC API returns as "transactTime").
+    #[serde(rename = "transactTime")]
     pub create_time: Option<i64>,
     /// Order update time.
     pub update_time: Option<i64>,
+}
+
+impl MexcOrder {
+    /// Converts a MEXC order to a Nautilus OrderStatusReport.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the order data cannot be parsed or converted.
+    pub fn to_order_status_report(
+        &self,
+        account_id: AccountId,
+        instrument_id: InstrumentId,
+        size_precision: u8,
+    ) -> anyhow::Result<OrderStatusReport> {
+        use nautilus_core::time::get_atomic_clock_realtime;
+
+        let ts_now = get_atomic_clock_realtime().get_time_ns();
+        let ts_event = self
+            .update_time
+            .or(self.create_time)
+            .map_or(ts_now, |t| UnixNanos::from((t as u64) * 1_000_000_000));
+
+        let client_order_id = self
+            .client_order_id
+            .as_ref()
+            .map(|id| ClientOrderId::new(id))
+            .or_else(|| {
+                // If no client order ID, use order ID as fallback
+                self.order_id.as_ref().map(|id| ClientOrderId::new(id))
+            });
+
+        let venue_order_id = self
+            .order_id
+            .as_ref()
+            .map(|id| VenueOrderId::new(id.clone()))
+            .ok_or_else(|| anyhow::anyhow!("Order ID is missing"))?;
+
+        let order_side = match self.side.as_str() {
+            "BUY" => OrderSide::Buy,
+            "SELL" => OrderSide::Sell,
+            _ => anyhow::bail!("Invalid order side: {}", self.side),
+        };
+
+        let order_type = match self.order_type.as_deref() {
+            Some("LIMIT") => OrderType::Limit,
+            Some("MARKET") => OrderType::Market,
+            Some("LIMIT_MAKER") => OrderType::Limit,
+            Some("IMMEDIATE_OR_CANCEL") | Some("IOC") => OrderType::Market,
+            Some("FILL_OR_KILL") | Some("FOK") => OrderType::Market,
+            _ => OrderType::Market, // Default to Market
+        };
+
+        let time_in_force = TimeInForce::Gtc; // MEXC defaults to GTC
+
+        let order_status = match self.status.as_deref() {
+            Some("NEW") => OrderStatus::Accepted,
+            Some("PARTIALLY_FILLED") => OrderStatus::PartiallyFilled,
+            Some("FILLED") => OrderStatus::Filled,
+            Some("CANCELED") | Some("PARTIALLY_CANCELED") => OrderStatus::Canceled,
+            Some("REJECTED") => OrderStatus::Rejected,
+            Some("EXPIRED") => OrderStatus::Expired,
+            _ => OrderStatus::Accepted, // Default to Accepted
+        };
+
+        let quantity = Quantity::from_str(&self.quantity)
+            .map_err(|e| anyhow::anyhow!("Failed to parse quantity '{}': {}", self.quantity, e))?;
+
+        let filled_quantity = self
+            .executed_quantity
+            .as_ref()
+            .map(|q| {
+                Quantity::from_str(q).map_err(|e| {
+                    anyhow::anyhow!("Failed to parse executed quantity '{}': {}", q, e)
+                })
+            })
+            .transpose()?
+            .unwrap_or_else(|| Quantity::zero(size_precision));
+
+        Ok(OrderStatusReport::new(
+            account_id,
+            instrument_id,
+            client_order_id,
+            venue_order_id,
+            order_side,
+            order_type,
+            time_in_force,
+            order_status,
+            quantity,
+            filled_quantity,
+            ts_event,
+            ts_event,
+            ts_now,
+            Some(Uuid::new_v4().into()),
+        ))
+    }
 }
 
 /// MEXC account balance.
@@ -176,5 +287,13 @@ pub struct MexcTicker {
     pub volume_24h: Option<String>,
     /// 24h quote volume.
     pub quote_volume_24h: Option<String>,
+}
+
+/// MEXC listen key response for user data stream.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListenKeyResponse {
+    /// The listen key for WebSocket user data stream.
+    pub listen_key: String,
 }
 

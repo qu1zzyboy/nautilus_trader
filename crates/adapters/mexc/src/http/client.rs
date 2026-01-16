@@ -28,6 +28,7 @@ use std::{
     sync::LazyLock,
 };
 
+use chrono::Utc;
 use nautilus_core::consts::NAUTILUS_USER_AGENT;
 use nautilus_network::{
     http::{HttpClient, Method, StatusCode, USER_AGENT},
@@ -41,12 +42,13 @@ use ustr::Ustr;
 use super::{
     error::{MexcErrorResponse, MexcHttpError},
     models::{
-        MexcAccount, MexcInstrument, MexcKline, MexcOrder, MexcOrderBook, MexcTicker, MexcTrade,
+        ListenKeyResponse, MexcAccount, MexcInstrument, MexcKline, MexcOrder, MexcOrderBook,
+        MexcTicker, MexcTrade,
     },
     query::{
         DeleteOrderParams, GetAccountParams, GetDepthParams, GetExchangeInfoParams,
         GetKlinesParams, GetOpenOrdersParams, GetOrderParams, GetTicker24hrParams, GetTradesParams,
-        PostOrderParams,
+        ListenKeyParams, PostOrderParams,
     },
 };
 use crate::{
@@ -104,8 +106,17 @@ pub struct MexcRawHttpClient {
 
 impl Default for MexcRawHttpClient {
     fn default() -> Self {
-        Self::new(None, Some(60), None, None, None, None, None, None, None)
-            .expect("Failed to create default MexcRawHttpClient")
+        Self::new(
+            None,    // base_url
+            Some(60), // timeout_secs
+            None,    // max_retries
+            None,    // retry_delay_ms
+            None,    // retry_delay_max_ms
+            None,    // max_requests_per_second
+            None,    // max_requests_per_minute
+            None,    // proxy_url
+        )
+        .expect("Failed to create default MexcRawHttpClient")
     }
 }
 
@@ -296,8 +307,8 @@ impl MexcRawHttpClient {
         let body_clone = body.clone();
 
         // Serialize params before closure to avoid reference lifetime issues
-        // Query params are used with GET and DELETE methods
-        let params_str = if method == Method::GET || method == Method::DELETE {
+        // Query params are used with GET, DELETE, and PUT methods
+        let params_str = if method == Method::GET || method == Method::DELETE || method == Method::PUT {
             params
                 .map(serde_urlencoded::to_string)
                 .transpose()
@@ -308,20 +319,75 @@ impl MexcRawHttpClient {
             None
         };
 
-        // For authenticated requests, add signature to query string
-        let mut full_endpoint = match params_str {
-            Some(ref query) if !query.is_empty() => format!("{endpoint}?{query}"),
-            _ => endpoint.clone(),
+        // MEXC uses query string for all parameters, even for POST requests
+        // Convert body parameters to query string if present
+        let mut query_params = params_str.as_deref().unwrap_or("").to_string();
+        
+        // If POST request with body, convert body parameters to query string
+        if method == Method::POST {
+            if let Some(ref body_bytes) = body {
+                // MEXC uses form-encoded body (key1=value1&key2=value2)
+                if let Ok(body_str) = std::str::from_utf8(body_bytes) {
+                    if !body_str.is_empty() {
+                        if !query_params.is_empty() {
+                            query_params.push_str(&format!("&{}", body_str));
+                        } else {
+                            query_params = body_str.to_string();
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Build initial endpoint with query params
+        let mut full_endpoint = if !query_params.is_empty() {
+            format!("{endpoint}?{query_params}")
+        } else {
+            endpoint.clone()
         };
 
+        // Initialize final_body as None (MEXC doesn't use body for authenticated requests)
+        let final_body: Option<Vec<u8>> = None;
+
         if authenticate {
-            let query_for_sign = params_str.as_deref().unwrap_or("");
-            let signature = self.sign_request(query_for_sign)?;
+            // MEXC requires timestamp parameter for authenticated requests
+            let timestamp = Utc::now().timestamp_millis();
             
-            if full_endpoint.contains('?') {
-                full_endpoint = format!("{full_endpoint}&signature={signature}");
+            // Build all parameters including timestamp (but not signature)
+            // Convert to Vec<String> of "key=value" format for sorting (like reference code)
+            let mut param_pairs: Vec<String> = if !query_params.is_empty() {
+                query_params.split('&').map(|s| s.to_string()).collect()
             } else {
-                full_endpoint = format!("{full_endpoint}?signature={signature}");
+                Vec::new()
+            };
+            
+            // Add timestamp to parameters
+            param_pairs.push(format!("timestamp={timestamp}"));
+            
+            // Sort all parameters alphabetically (MEXC requirement)
+            // This sorts the entire "key=value" strings, which is equivalent to sorting by key
+            param_pairs.sort();
+            
+            // Join sorted parameters
+            let sorted_query = param_pairs.join("&");
+            
+            // Debug: log the query string used for signing
+            log::info!("MEXC signature query string: {}", sorted_query);
+            
+            let signature = self.sign_request(&sorted_query)?;
+            
+            log::info!("MEXC signature: {}", signature);
+            
+            // Add signature to query string (timestamp is already in sorted_query)
+            // Build final query string: sorted_query + signature (like reference code)
+            let final_query = format!("{}&signature={}", sorted_query, signature);
+            
+            // Update endpoint with final query string
+            // Remove existing query params and replace with final_query
+            if let Some((base, _)) = full_endpoint.split_once('?') {
+                full_endpoint = format!("{}?{}", base, final_query);
+            } else {
+                full_endpoint = format!("{}?{}", full_endpoint, final_query);
             }
         }
 
@@ -330,7 +396,7 @@ impl MexcRawHttpClient {
         let operation = || {
             let url = url.clone();
             let method = method_clone.clone();
-            let body = body_clone.clone();
+            let body = final_body.clone();
 
             async move {
                 let mut headers = Self::default_headers();
@@ -341,6 +407,9 @@ impl MexcRawHttpClient {
                         headers.insert("X-MEXC-APIKEY".to_string(), credential.api_key.to_string());
                     }
                 }
+                
+                // MEXC doesn't require Content-Type header for POST requests
+                // All parameters are in query string, not body
 
                 let rate_keys = Self::rate_limit_keys();
                 let resp = self
@@ -482,11 +551,43 @@ impl MexcRawHttpClient {
     ///
     /// Returns an error if credentials are missing, the request fails, or the API returns an error.
     pub async fn place_order(&self, params: PostOrderParams) -> Result<MexcOrder, MexcHttpError> {
-        // MEXC uses JSON body for POST requests
-        let body = serde_json::to_vec(&params)
-            .map_err(|e| {
-                MexcHttpError::ValidationError(format!("Failed to serialize parameters: {e}"))
-            })?;
+        // MEXC uses query string for POST requests, not body
+        // Convert params to form-encoded format for query string
+        // Build all parameters first, then sort alphabetically (MEXC requirement)
+        let mut form_params: Vec<(String, String)> = vec![
+            ("symbol".to_string(), params.symbol),
+            ("side".to_string(), params.side),
+            ("type".to_string(), params.order_type),
+        ];
+        
+        if let Some(quantity) = params.quantity {
+            form_params.push(("quantity".to_string(), quantity));
+        }
+        if let Some(price) = params.price {
+            form_params.push(("price".to_string(), price));
+        }
+        if let Some(new_client_order_id) = params.new_client_order_id {
+            form_params.push(("newClientOrderId".to_string(), new_client_order_id));
+        }
+        // Note: MEXC API doesn't support timeInForce parameter
+        if let Some(stop_price) = params.stop_price {
+            form_params.push(("stopPrice".to_string(), stop_price));
+        }
+        
+        // Sort parameters alphabetically by key (MEXC requirement)
+        form_params.sort_by(|a, b| a.0.cmp(&b.0));
+        
+        // Convert to form-encoded string for body (will be moved to query string in send_request)
+        let body_str = form_params
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join("&");
+        
+        let body = body_str.as_bytes().to_vec();
+        
+        // send_request will move body params to query string for POST requests
+        // and add timestamp, then sort again before signing
         self.send_request::<_, ()>(Method::POST, "/api/v3/order", None, Some(body), true)
             .await
     }
@@ -528,6 +629,57 @@ impl MexcRawHttpClient {
     ) -> Result<Vec<MexcOrder>, MexcHttpError> {
         self.send_request::<_, _>(Method::GET, "/api/v3/openOrders", params.as_ref(), None, true)
             .await
+    }
+
+    /// Creates a listen key for user data stream.
+    ///
+    /// Listen keys are valid for 60 minutes. Use `keepalive_listen_key` to keep
+    /// the stream alive.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing or the request fails.
+    pub async fn create_listen_key(&self) -> Result<ListenKeyResponse, MexcHttpError> {
+        // MEXC uses POST with API key authentication (no signature required for user data stream)
+        self.send_request(Method::POST, "/api/v3/userDataStream", None::<&()>, None, true)
+            .await
+    }
+
+    /// Keeps alive an existing listen key.
+    ///
+    /// Should be called periodically to keep the user data stream alive.
+    /// Extends the validity of the listen key by 60 minutes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing or the request fails.
+    pub async fn keepalive_listen_key(&self, listen_key: &str) -> Result<(), MexcHttpError> {
+        let params = ListenKeyParams {
+            listen_key: listen_key.to_string(),
+        };
+        // MEXC uses PUT with query parameters and API key authentication
+        // send_request now handles PUT query params correctly
+        let _: serde_json::Value = self
+            .send_request(Method::PUT, "/api/v3/userDataStream", Some(&params), None, true)
+            .await?;
+        Ok(())
+    }
+
+    /// Closes an existing listen key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing or the request fails.
+    pub async fn close_listen_key(&self, listen_key: &str) -> Result<(), MexcHttpError> {
+        let params = ListenKeyParams {
+            listen_key: listen_key.to_string(),
+        };
+        // MEXC uses DELETE with query parameters and API key authentication
+        // DELETE requests use query params, so send_request handles it correctly
+        let _: serde_json::Value = self
+            .send_request(Method::DELETE, "/api/v3/userDataStream", Some(&params), None, true)
+            .await?;
+        Ok(())
     }
 }
 

@@ -63,9 +63,18 @@ prost-build = { version = "0.13.5", default-features = false }
 [dev-dependencies]
 nautilus-testkit = { workspace = true }
 rstest = { workspace = true }
+[[bin]]
+name = "mexc-test-position-subscribe"
+path = "bin/test_position_subscribe.rs"
+doc = false
 
 [[bin]]
-name = "mexc-ws-test"
-path = "bin/ws_test.rs"
+name = "mexc-test-execution-position"
+path = "bin/test_execution_position.rs"
+doc = false
+
+[[bin]]
+name = "mexc-test-submit-order"
+path = "bin/test_submit_order.rs"
 doc = false
 

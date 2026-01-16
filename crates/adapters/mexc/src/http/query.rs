@@ -152,6 +152,14 @@ pub struct GetAccountParams {
     // No parameters required for account info
 }
 
+/// Parameters for PUT/DELETE /api/v3/userDataStream endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListenKeyParams {
+    /// The listen key to extend or close.
+    pub listen_key: String,
+}
+
 impl GetTradesParamsBuilder {
     /// Validates and builds the parameters.
     pub fn build_validated(&self) -> Result<GetTradesParams, crate::http::error::MexcBuildError> {

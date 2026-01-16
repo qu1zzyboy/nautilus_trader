@@ -21,6 +21,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU8, Ordering},
+        RwLock,
     },
     time::Duration,
 };
@@ -61,6 +62,7 @@ use crate::common::consts::{MEXC_WS_TOPIC_DELIMITER, MEXC_WS_URL};
 /// - Binary protobuf message encoding/decoding
 /// - Authentication handshakes are managed by the internal auth tracker
 /// - The subscription state maintains pending and confirmed topics for reconnection replay
+/// - User data streams require a listenkey passed as URL parameter (managed by Execution Client)
 #[derive(Clone, Debug)]
 pub struct MexcWebSocketClient {
     url: String,
@@ -81,6 +83,14 @@ pub struct MexcWebSocketClient {
 
 impl MexcWebSocketClient {
     /// Creates a new [`MexcWebSocketClient`] instance.
+    ///
+    /// # Arguments
+    ///
+    /// * `url` - Optional WebSocket URL override
+    /// * `api_key` - Optional API key (for future use)
+    /// * `api_secret` - Optional API secret (for future use)
+    /// * `account_id` - Optional account ID (defaults to "MEXC-master")
+    /// * `heartbeat` - Optional heartbeat interval in seconds
     ///
     /// # Errors
     ///
@@ -171,10 +181,40 @@ impl MexcWebSocketClient {
 
     /// Connect to the MEXC WebSocket server.
     ///
+    /// **MEXC WebSocket Connection Modes:**
+    ///
+    /// 1. **Public Data Stream** (default): Connect to public market data streams.
+    ///    - No listenkey required
+    ///    - Uses default URL: `wss://wbs-api.mexc.com/ws`
+    ///    - Subscribe to topics after connection using `subscribe()`
+    ///
+    /// 2. **User Data Stream**: Connect to authenticated user data streams.
+    ///    - Requires listenkey to be provided (created and managed by Execution Client)
+    ///    - Listenkey is added to URL as query parameter
+    ///    - URL format: `wss://wbs-api.mexc.com/ws?listenKey=xxx`
+    ///
+    /// **Note:** Unlike Binance (where listenkey is sent as subscription parameter),
+    /// MEXC requires listenkey to be part of the WebSocket URL. The listenkey should
+    /// be created and managed by the Execution Client layer, not the WebSocket Client.
+    ///
+    /// # Arguments
+    ///
+    /// * `listen_key` - Optional listenkey for user data streams. If provided, it will
+    ///   be added to the WebSocket URL as a query parameter.
+    ///
     /// # Errors
     ///
     /// Returns an error if the WebSocket connection fails.
-    pub async fn connect(&mut self) -> Result<(), MexcWsError> {
+    pub async fn connect(&mut self, listen_key: Option<&str>) -> Result<(), MexcWsError> {
+        // If listenkey is provided, add it to URL as query parameter (MEXC-specific behavior)
+        if let Some(key) = listen_key {
+            let separator = if self.url.contains('?') { "&" } else { "?" };
+            self.url = format!("{}{}listenKey={}", self.url, separator, key);
+            log::debug!("WebSocket URL with listenkey: {}", self.url);
+        } else {
+            log::debug!("Connecting to public data stream (no listenkey required)");
+        }
+
         let (client, raw_rx) = self.connect_inner().await?;
 
         self.connection_mode.store(client.connection_mode_atomic());
@@ -337,6 +377,9 @@ impl MexcWebSocketClient {
     }
 
     /// Closes the client.
+    ///
+    /// Note: Listenkey management (creation, keepalive, closing) should be handled
+    /// by the Execution Client layer, not the WebSocket Client.
     pub async fn close(&mut self) -> Result<(), MexcWsError> {
         log::debug!("Starting close process");
 

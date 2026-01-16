@@ -15,11 +15,13 @@
 
 //! Parsing utilities for converting MEXC API responses into Nautilus domain models.
 
+use std::str::FromStr;
+
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{Bar, BarType, TradeTick},
-    enums::{AggregationSource, BarAggregation, PriceType},
-    identifiers::InstrumentId,
+    enums::AggressorSide,
+    identifiers::{InstrumentId, TradeId},
     instruments::InstrumentAny,
 };
 
@@ -58,27 +60,42 @@ pub fn parse_trade(
     instrument_id: InstrumentId,
     ts_init: UnixNanos,
 ) -> anyhow::Result<TradeTick> {
-    let price = trade.price.parse::<f64>()?;
-    let quantity = trade.quantity.parse::<f64>()?;
+    // Parse price and quantity from strings
+    let price = nautilus_model::types::Price::from_str(&trade.price)
+        .map_err(|e| anyhow::anyhow!("Failed to parse price '{}': {}", trade.price, e))?;
+    let quantity = nautilus_model::types::Quantity::from_str(&trade.quantity)
+        .map_err(|e| anyhow::anyhow!("Failed to parse quantity '{}': {}", trade.quantity, e))?;
+    
     let ts_event = trade
         .time
-        .map(|t| UnixNanos::from(t * 1_000_000_000))
+        .map(|t| UnixNanos::from((t as u64) * 1_000_000_000))
         .unwrap_or(ts_init);
 
-    // Determine trade side based on is_buyer_maker
+    // Determine aggressor side based on is_buyer_maker
     // If is_buyer_maker is true, the buyer was the maker (passive), so the seller was the aggressor
     // In Nautilus, we track the aggressor side
     let aggressor_side = trade
         .is_buyer_maker
-        .map(|is_maker| if is_maker { nautilus_model::enums::OrderSide::SELL } else { nautilus_model::enums::OrderSide::BUY })
-        .unwrap_or(nautilus_model::enums::OrderSide::BUY);
+        .map(|is_maker| {
+            if is_maker {
+                AggressorSide::Seller
+            } else {
+                AggressorSide::Buyer
+            }
+        })
+        .unwrap_or(AggressorSide::Buyer);
+
+    let trade_id = TradeId::new_checked(
+        trade.id.as_deref().unwrap_or("").to_string(),
+    )
+    .map_err(|e| anyhow::anyhow!("Invalid trade ID: {}", e))?;
 
     Ok(TradeTick::new(
         instrument_id,
-        nautilus_model::types::Price::from(price),
-        nautilus_model::types::Quantity::from(quantity),
+        price,
+        quantity,
         aggressor_side,
-        trade.id.as_deref().unwrap_or("").to_string(),
+        trade_id,
         ts_event,
         ts_init,
     ))
@@ -91,31 +108,32 @@ pub fn parse_trade(
 /// Returns an error if the kline data cannot be parsed.
 pub fn parse_kline(
     kline: &MexcKline,
-    instrument_id: InstrumentId,
+    _instrument_id: InstrumentId,
     bar_type: BarType,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Bar> {
-    let open = kline.open.parse::<f64>()?;
-    let high = kline.high.parse::<f64>()?;
-    let low = kline.low.parse::<f64>()?;
-    let close = kline.close.parse::<f64>()?;
-    let volume = kline.volume.parse::<f64>()?;
-    let quote_volume = kline
-        .quote_volume
-        .as_ref()
-        .and_then(|v| v.parse::<f64>().ok());
+    // Parse prices and volume from strings
+    let open = nautilus_model::types::Price::from_str(&kline.open)
+        .map_err(|e| anyhow::anyhow!("Failed to parse open price '{}': {}", kline.open, e))?;
+    let high = nautilus_model::types::Price::from_str(&kline.high)
+        .map_err(|e| anyhow::anyhow!("Failed to parse high price '{}': {}", kline.high, e))?;
+    let low = nautilus_model::types::Price::from_str(&kline.low)
+        .map_err(|e| anyhow::anyhow!("Failed to parse low price '{}': {}", kline.low, e))?;
+    let close = nautilus_model::types::Price::from_str(&kline.close)
+        .map_err(|e| anyhow::anyhow!("Failed to parse close price '{}': {}", kline.close, e))?;
+    let volume = nautilus_model::types::Quantity::from_str(&kline.volume)
+        .map_err(|e| anyhow::anyhow!("Failed to parse volume '{}': {}", kline.volume, e))?;
 
-    let ts_event = UnixNanos::from(kline.open_time * 1_000_000);
-    let ts_init = ts_init;
+    // Convert milliseconds to nanoseconds
+    let ts_event = UnixNanos::from((kline.open_time as u64) * 1_000_000);
 
     Ok(Bar::new(
         bar_type,
-        nautilus_model::types::Price::from(open),
-        nautilus_model::types::Price::from(high),
-        nautilus_model::types::Price::from(low),
-        nautilus_model::types::Price::from(close),
-        nautilus_model::types::Quantity::from(volume),
-        quote_volume.map(nautilus_model::types::Money::from),
+        open,
+        high,
+        low,
+        close,
+        volume,
         ts_event,
         ts_init,
     ))
