@@ -16,7 +16,6 @@
 //! Live execution client implementation for the MEXC adapter.
 
 use std::{
-    future::Future,
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -31,11 +30,12 @@ use nautilus_common::{
     clients::ExecutionClient,
     live::{runner::get_exec_event_sender, runtime::get_runtime},
     messages::{
-        ExecutionEvent, ExecutionReport as NautilusExecutionReport,
+        ExecutionEvent,
         execution::{
             BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
             GenerateOrderStatusReport, GenerateOrderStatusReports,
-            GeneratePositionStatusReports, ModifyOrder, QueryAccount, QueryOrder,
+            GenerateOrderStatusReportsBuilder, GeneratePositionStatusReports,
+            GeneratePositionStatusReportsBuilder, ModifyOrder, QueryAccount, QueryOrder,
             SubmitOrder, SubmitOrderList,
         },
     },
@@ -47,9 +47,10 @@ use nautilus_core::{
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{AccountType, OmsType, OrderSide, OrderType, TimeInForce},
+    enums::{AccountType, LiquiditySide, OmsType, OrderSide, OrderType},
     events::{
-        OrderCancelRejected, OrderEventAny, OrderModifyRejected, OrderRejected, OrderSubmitted,
+        AccountState, OrderAccepted, OrderCanceled, OrderCancelRejected, OrderEventAny,
+        OrderFilled, OrderModifyRejected, OrderRejected, OrderSubmitted,
     },
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId, Venue,
@@ -58,17 +59,18 @@ use nautilus_model::{
     instruments::Instrument,
     orders::Order,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-    types::{Price, Quantity},
+    types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::super::{
+    common::enums::MexcOrderStatus,
     config::MexcExecClientConfig,
     http::client::MexcRawHttpClient,
     websocket::{
         client::MexcWebSocketClient,
-        messages::NautilusWsMessage,
+        messages::{MexcExecWsMessage, NautilusWsMessage},
     },
 };
 use crate::common::consts::MEXC_VENUE;
@@ -159,14 +161,61 @@ impl MexcExecutionClient {
 
     /// Handles WebSocket messages from the user data stream.
     fn handle_ws_message(
-        _message: NautilusWsMessage,
-        _exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
-        _account_id: AccountId,
-        _account_type: AccountType,
-        _clock: &'static AtomicTime,
+        message: NautilusWsMessage,
+        exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+        trader_id: TraderId,
+        account_id: AccountId,
+        account_type: AccountType,
+        clock: &'static AtomicTime,
     ) {
-        // TODO: Implement message handling for order updates, account updates, etc.
-        // This will parse MEXC WebSocket messages and convert them to Nautilus events
+        match message {
+            NautilusWsMessage::Exec(exec_msg) => {
+                // Wrap in catch_unwind to prevent panics from crashing the WebSocket task
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    Self::handle_exec_message(
+                        exec_msg,
+                        exec_sender,
+                        trader_id,
+                        account_id,
+                        account_type,
+                        clock,
+                    );
+                }));
+                
+                if let Err(e) = result {
+                    log::error!("Panic in handle_exec_message: {:?}", e);
+                    // Don't let the panic crash the WebSocket connection
+                }
+            }
+            NautilusWsMessage::Data(_) => {
+                // Data messages are for the data client, ignore here
+            }
+            NautilusWsMessage::Reconnected => {
+                log::warn!("User data stream WebSocket reconnected - this may indicate a connection issue");
+            }
+        }
+    }
+
+    /// Handles execution messages from the user data stream.
+    fn handle_exec_message(
+        message: MexcExecWsMessage,
+        exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+        trader_id: TraderId,
+        account_id: AccountId,
+        account_type: AccountType,
+        clock: &'static AtomicTime,
+    ) {
+        match message {
+            MexcExecWsMessage::OrderUpdate { msg, symbol } => {
+                Self::handle_order_update(&msg, symbol.as_deref(), exec_sender, trader_id, account_id, clock);
+            }
+            MexcExecWsMessage::DealUpdate { msg, symbol } => {
+                Self::handle_deal_update(&msg, symbol.as_deref(), exec_sender, trader_id, account_id, clock);
+            }
+            MexcExecWsMessage::AccountUpdate(update) => {
+                Self::handle_account_update(&update, exec_sender, account_id, account_type, clock);
+            }
+        }
     }
 
     async fn await_account_registered(&self, timeout_secs: f64) -> anyhow::Result<()> {
@@ -222,6 +271,306 @@ impl MexcExecutionClient {
         instrument_id.symbol.inner().to_string()
     }
 
+    /// Converts MEXC order status (i32) to MexcOrderStatus.
+    fn parse_order_status(status: i32) -> MexcOrderStatus {
+        // MEXC order status values (from API documentation):
+        // 1 = NEW, 2 = FILLED, 3 = PARTIALLY_FILLED, 4 = CANCELED,
+        // 5 = PARTIALLY_CANCELED, 6 = REJECTED, 7 = EXPIRED
+        match status {
+            1 => MexcOrderStatus::New,
+            2 => MexcOrderStatus::Filled,
+            3 => MexcOrderStatus::PartiallyFilled,
+            4 => MexcOrderStatus::Canceled,
+            5 => MexcOrderStatus::PartiallyCanceled,
+            6 => MexcOrderStatus::Rejected,
+            7 => MexcOrderStatus::Expired,
+            _ => {
+                log::warn!("Unknown MEXC order status: {status}, defaulting to New");
+                MexcOrderStatus::New
+            }
+        }
+    }
+
+    /// Converts MEXC trade type (i32) to OrderSide.
+    /// MEXC trade_type: 1 = buy, 2 = sell
+    fn parse_trade_type(trade_type: i32) -> OrderSide {
+        match trade_type {
+            1 => OrderSide::Buy,
+            2 => OrderSide::Sell,
+            _ => {
+                log::warn!("Unknown MEXC trade type: {trade_type}, defaulting to Buy");
+                OrderSide::Buy
+            }
+        }
+    }
+
+    /// Handles ORDER_UPDATE events from the user data stream.
+    fn handle_order_update(
+        msg: &crate::proto::PrivateOrdersV3Api,
+        symbol: Option<&str>,
+        exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+        trader_id: TraderId,
+        account_id: AccountId,
+        clock: &'static AtomicTime,
+    ) {
+
+        // Parse order status
+        let mexc_status = Self::parse_order_status(msg.status);
+        let status: nautilus_model::enums::OrderStatus = mexc_status.into();
+
+        // Convert timestamps (MEXC uses milliseconds)
+        let ts_event = UnixNanos::from((msg.create_time * 1_000_000) as u64);
+        let ts_init = clock.get_time_ns();
+
+        // Parse instrument ID from symbol (prefer wrapper symbol, fallback to message fields)
+        let symbol = symbol
+            .or_else(|| msg.market.as_deref())
+            .or_else(|| msg.symbol_id.as_deref())
+            .unwrap_or("UNKNOWN");
+        
+        // Try to get instrument from cache, or use default precision
+        let _price_precision = 8_u8; // Default precision
+        let _size_precision = 8_u8; // Default precision
+        let instrument_id = InstrumentId::from(format!("{}.MEXC", symbol).as_str());
+
+        // Handle empty client_id - use order id as fallback
+        let client_order_id = if msg.client_id.is_empty() {
+            log::debug!("Empty client_id in order update, using order id as fallback: {}", msg.id);
+            ClientOrderId::new(&msg.id)
+        } else {
+            ClientOrderId::new(&msg.client_id)
+        };
+        let venue_order_id = VenueOrderId::new(msg.id.clone());
+
+        // For external orders we don't have strategy_id, use EXTERNAL
+        let strategy_id = StrategyId::new("EXTERNAL");
+
+        // Parse quantities and prices
+        let _quantity: f64 = msg.quantity.parse().unwrap_or(0.0);
+        let _price: f64 = msg.price.parse().unwrap_or(0.0);
+        let remain_quantity: f64 = msg.remain_quantity.parse().unwrap_or(0.0);
+
+        match status {
+            nautilus_model::enums::OrderStatus::Accepted => {
+                // Send OrderAccepted event even for external orders (not in cache)
+                // Execution engine will log a warning but won't crash
+                // This matches Binance's behavior
+                let event = OrderAccepted::new(
+                    trader_id,
+                    strategy_id,
+                    instrument_id,
+                    client_order_id,
+                    venue_order_id,
+                    account_id,
+                    UUID4::new(),
+                    ts_event,
+                    ts_init,
+                    false,
+                );
+
+                if let Err(e) =
+                    exec_sender.send(ExecutionEvent::Order(OrderEventAny::Accepted(event)))
+                {
+                    log::warn!("Failed to send OrderAccepted event: {e}");
+                }
+            }
+            nautilus_model::enums::OrderStatus::Canceled => {
+                // Send OrderCanceled event even for external orders (not in cache)
+                // Execution engine will log a warning but won't crash
+                let event = OrderCanceled::new(
+                    trader_id,
+                    strategy_id,
+                    instrument_id,
+                    client_order_id,
+                    UUID4::new(),
+                    ts_event,
+                    ts_init,
+                    false,
+                    Some(venue_order_id),
+                    Some(account_id),
+                );
+
+                if let Err(e) =
+                    exec_sender.send(ExecutionEvent::Order(OrderEventAny::Canceled(event)))
+                {
+                    log::warn!("Failed to send OrderCanceled event: {e}");
+                }
+            }
+            nautilus_model::enums::OrderStatus::Rejected => {
+                let event = OrderRejected::new(
+                    trader_id,
+                    strategy_id,
+                    instrument_id,
+                    client_order_id,
+                    account_id,
+                    "Order rejected by exchange".into(),
+                    UUID4::new(),
+                    ts_event,
+                    ts_init,
+                    false,
+                    false,
+                );
+
+                if let Err(e) =
+                    exec_sender.send(ExecutionEvent::Order(OrderEventAny::Rejected(event)))
+                {
+                    log::warn!("Failed to send OrderRejected event: {e}");
+                }
+            }
+            nautilus_model::enums::OrderStatus::Expired => {
+                let event = OrderCanceled::new(
+                    trader_id,
+                    strategy_id,
+                    instrument_id,
+                    client_order_id,
+                    UUID4::new(),
+                    ts_event,
+                    ts_init,
+                    false,
+                    Some(venue_order_id),
+                    Some(account_id),
+                );
+
+                if let Err(e) =
+                    exec_sender.send(ExecutionEvent::Order(OrderEventAny::Canceled(event)))
+                {
+                    log::warn!("Failed to send OrderCanceled (expired) event: {e}");
+                }
+            }
+            _ => {
+                // Partially filled or other status - will be handled by deal updates
+                log::debug!(
+                    "Order status update: client_order_id={}, status={:?}, remain_quantity={}",
+                    client_order_id,
+                    status,
+                    remain_quantity
+                );
+            }
+        }
+    }
+
+    /// Handles DEAL_UPDATE (trade fill) events from the user data stream.
+    fn handle_deal_update(
+        msg: &crate::proto::PrivateDealsV3Api,
+        symbol: Option<&str>,
+        exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+        trader_id: TraderId,
+        account_id: AccountId,
+        clock: &'static AtomicTime,
+    ) {
+        // Convert timestamps (MEXC uses milliseconds)
+        let ts_event = UnixNanos::from((msg.time * 1_000_000) as u64);
+        let ts_init = clock.get_time_ns();
+
+        // Parse instrument ID from symbol (use wrapper symbol, fallback to UNKNOWN)
+        let symbol = symbol.unwrap_or("UNKNOWN");
+        let instrument_id = InstrumentId::from(format!("{}.MEXC", symbol).as_str());
+
+        // Handle empty client_order_id - use order_id as fallback
+        let client_order_id = if msg.client_order_id.is_empty() {
+            log::warn!("Empty client_order_id in deal update, using order_id as fallback: {}", msg.order_id);
+            ClientOrderId::new(&msg.order_id)
+        } else {
+            ClientOrderId::new(&msg.client_order_id)
+        };
+        let venue_order_id = VenueOrderId::new(msg.order_id.clone());
+
+        // For external orders we don't have strategy_id, use EXTERNAL
+        let strategy_id = StrategyId::new("EXTERNAL");
+
+        // Parse quantities and prices
+        let quantity: f64 = msg.quantity.parse().unwrap_or(0.0);
+        let price: f64 = msg.price.parse().unwrap_or(0.0);
+        let commission: f64 = msg.fee_amount.parse().unwrap_or(0.0);
+
+        // Use default precision since we don't have cache access
+        let (price_precision, size_precision) = (8_u8, 8_u8);
+
+        let commission_currency = Currency::from(msg.fee_currency.as_str());
+
+        let liquidity_side = if msg.is_maker {
+            LiquiditySide::Maker
+        } else {
+            LiquiditySide::Taker
+        };
+
+        let order_side = Self::parse_trade_type(msg.trade_type);
+
+        let event = OrderFilled::new(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            venue_order_id,
+            account_id,
+            TradeId::new(&msg.trade_id),
+            order_side,
+            OrderType::Limit, // MEXC doesn't specify order type in deal message
+            Quantity::new(quantity, size_precision),
+            Price::new(price, price_precision),
+            commission_currency,
+            liquidity_side,
+            UUID4::new(),
+            ts_event,
+            ts_init,
+            false,
+            None,
+            Some(Money::new(commission, commission_currency)),
+        );
+
+        if let Err(e) = exec_sender.send(ExecutionEvent::Order(OrderEventAny::Filled(event))) {
+            log::warn!("Failed to send OrderFilled event: {e}");
+        }
+    }
+
+    /// Handles ACCOUNT_UPDATE events from the user data stream.
+    fn handle_account_update(
+        msg: &crate::proto::PrivateAccountV3Api,
+        exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+        account_id: AccountId,
+        account_type: AccountType,
+        clock: &'static AtomicTime,
+    ) {
+        // Convert timestamps (MEXC uses milliseconds)
+        let ts_event = UnixNanos::from((msg.time * 1_000_000) as u64);
+
+        // Parse balance amounts
+        // MEXC balance_amount is the available balance, frozen_amount is the locked balance
+        // Total = available + frozen
+        let available: f64 = msg.balance_amount.parse().unwrap_or(0.0);
+        let frozen: f64 = msg.frozen_amount.parse().unwrap_or(0.0);
+        let total = available + frozen;
+
+        if total == 0.0 && frozen == 0.0 {
+            // Skip zero balances
+            return;
+        }
+
+        let currency = Currency::from(msg.vcoin_name.as_str());
+
+        let balances = vec![AccountBalance::new(
+            Money::new(total, currency),
+            Money::new(frozen.max(0.0), currency),
+            Money::new(available.max(0.0), currency),
+        )];
+
+        let account_state = AccountState::new(
+            account_id,
+            account_type,
+            balances,
+            Vec::new(), // margins (not applicable for spot)
+            true,       // reported
+            UUID4::new(),
+            ts_event,
+            clock.get_time_ns(),
+            None, // base currency
+        );
+
+        if let Err(e) = exec_sender.send(ExecutionEvent::Account(account_state)) {
+            log::warn!("Failed to send account state update: {e}");
+        }
+    }
+
     /// Internal method to submit an order.
     fn submit_order_internal(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
         use crate::common::enums::{MexcOrderType, MexcSide, MexcTimeInForce};
@@ -246,10 +595,10 @@ impl MexcExecutionClient {
         // Convert to MEXC types
         let mexc_side = MexcSide::try_from_order_side(order_side)?;
         let mexc_order_type = MexcOrderType::try_from_order_type(order_type)?;
-        let mexc_tif = MexcTimeInForce::try_from_time_in_force(time_in_force)?;
+        let _mexc_tif = MexcTimeInForce::try_from_time_in_force(time_in_force)?;
 
         let symbol = Self::format_mexc_symbol(&instrument_id);
-        let (_, size_precision) = self.get_instrument_precision(instrument_id);
+        let _size_precision = self.get_instrument_precision(instrument_id).1;
 
         // Build order parameters
         // MEXC requires uppercase strings: BUY/SELL, MARKET/LIMIT
@@ -266,7 +615,7 @@ impl MexcExecutionClient {
             crate::common::enums::MexcOrderType::FillOrKill => "FILL_OR_KILL",
         };
         
-        let mut params = PostOrderParams {
+        let params = PostOrderParams {
             symbol,
             side: side_str.to_string(),
             order_type: order_type_str.to_string(),
@@ -452,9 +801,26 @@ impl ExecutionClient for MexcExecutionClient {
                 })?;
             log::info!("MEXC WebSocket connected");
 
+            // Subscribe to private execution messages (orders, deals, account updates)
+            // MEXC requires explicit subscription to private channels
+            let private_topics = vec![
+                "spot@private.orders.v3.api.pb".to_string(),
+                "spot@private.deals.v3.api.pb".to_string(),
+                "spot@private.account.v3.api.pb".to_string(),
+            ];
+            
+            log::info!("Subscribing to private execution channels: {:?}", private_topics);
+            if let Err(e) = ws_client.subscribe(private_topics).await {
+                log::warn!("Failed to subscribe to private execution channels: {e}");
+                // Don't fail connection if subscription fails, as messages might still come through
+            } else {
+                log::info!("Successfully subscribed to private execution channels");
+            }
+
             // Start WebSocket message processing loop
             let stream = ws_client.stream();
             let exec_sender = self.exec_sender.clone();
+            let trader_id = self.core.trader_id;
             let account_id = self.core.account_id;
             let account_type = self.core.account_type;
             let clock = self.clock;
@@ -468,6 +834,7 @@ impl ExecutionClient for MexcExecutionClient {
                             Self::handle_ws_message(
                                 message,
                                 &exec_sender,
+                                trader_id,
                                 account_id,
                                 account_type,
                                 clock,
@@ -579,7 +946,8 @@ impl ExecutionClient for MexcExecutionClient {
         let order = self.core.get_order(&cmd.client_order_id)?;
 
         if order.is_closed() {
-            let client_order_id = order.client_order_id();
+            let _order = order;
+            let client_order_id = _order.client_order_id();
             log::warn!("Cannot submit closed order {client_order_id}");
             return Ok(());
         }
@@ -627,7 +995,7 @@ impl ExecutionClient for MexcExecutionClient {
             cache.order(&cmd.client_order_id).cloned()
         };
 
-        let Some(order) = order else {
+        let Some(_order) = order else {
             log::warn!(
                 "Cannot modify order {}: not found in cache",
                 cmd.client_order_id
@@ -732,18 +1100,85 @@ impl ExecutionClient for MexcExecutionClient {
 
     async fn generate_order_status_report(
         &self,
-        _cmd: &GenerateOrderStatusReport,
+        cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
-        // TODO: Implement order status report generation
-        Ok(None)
+        let Some(instrument_id) = cmd.instrument_id else {
+            log::warn!("generate_order_status_report requires instrument_id: {cmd:?}");
+            return Ok(None);
+        };
+
+        use crate::http::query::GetOrderParams;
+
+        let symbol = Self::format_mexc_symbol(&instrument_id);
+        let mut params = GetOrderParams::default();
+        params.symbol = symbol;
+
+        if let Some(venue_order_id) = &cmd.venue_order_id {
+            params.order_id = Some(venue_order_id.to_string());
+        }
+        if let Some(client_order_id) = &cmd.client_order_id {
+            params.orig_client_order_id = Some(client_order_id.to_string());
+        }
+
+        let order = self.http_client.get_order(params).await?;
+        let (price_precision, size_precision) = self.get_instrument_precision(instrument_id);
+        let report = order.to_order_status_report(self.core.account_id, instrument_id, price_precision, size_precision)?;
+
+        Ok(Some(report))
     }
 
     async fn generate_order_status_reports(
         &self,
-        _cmd: &GenerateOrderStatusReports,
+        cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        // TODO: Implement batch order status reports
-        Ok(Vec::new())
+        use crate::http::query::GetOpenOrdersParams;
+
+        let mut reports = Vec::new();
+
+        if cmd.open_only {
+            // Get all open orders (or for specific symbol if provided)
+            let symbol = cmd.instrument_id.map(|id| Self::format_mexc_symbol(&id));
+            let params = if let Some(s) = symbol {
+                Some(GetOpenOrdersParams { symbol: Some(s) })
+            } else {
+                Some(GetOpenOrdersParams { symbol: None })
+            };
+
+            let orders = self.http_client.get_open_orders(params).await?;
+
+            for order in orders {
+                // Try to find instrument from cache or use provided instrument_id
+                let instrument_id = if let Some(cmd_instrument_id) = cmd.instrument_id {
+                    cmd_instrument_id
+                } else {
+                    // Try to find instrument from cache by symbol
+                    let cache = self.core.cache().borrow();
+                    cache
+                        .instruments(&self.venue(), None)
+                        .into_iter()
+                        .find(|i| i.symbol().as_str() == order.symbol.as_str())
+                        .map(|i| i.id())
+                        .unwrap_or_else(|| {
+                            // Fallback: construct instrument ID from symbol
+                            InstrumentId::from(format!("{}.MEXC", order.symbol).as_str())
+                        })
+                };
+
+                let (price_precision, size_precision) = self.get_instrument_precision(instrument_id);
+                match order.to_order_status_report(self.core.account_id, instrument_id, price_precision, size_precision) {
+                    Ok(report) => reports.push(report),
+                    Err(e) => {
+                        log::warn!("Failed to convert MEXC order to status report: {e}");
+                    }
+                }
+            }
+        } else {
+            // For historical orders, MEXC doesn't have a direct API endpoint
+            // We can only query open orders, so return empty for now
+            log::debug!("MEXC doesn't support querying historical orders via API");
+        }
+
+        Ok(reports)
     }
 
     async fn generate_fill_reports(
@@ -758,16 +1193,58 @@ impl ExecutionClient for MexcExecutionClient {
         &self,
         _cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        // TODO: Implement position status reports
+        // MEXC Spot trading doesn't have positions in the traditional sense
+        // Returns empty for spot (could be extended for margin positions if needed)
         Ok(Vec::new())
     }
 
     async fn generate_mass_status(
         &self,
-        _lookback_mins: Option<u64>,
+        lookback_mins: Option<u64>,
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
-        // TODO: Implement mass status generation
-        Ok(None)
+        log::info!("Generating ExecutionMassStatus (lookback_mins={lookback_mins:?})");
+
+        let ts_now = self.clock.get_time_ns();
+
+        let start = lookback_mins.map(|mins| {
+            let lookback_ns = mins * 60 * 1_000_000_000;
+            UnixNanos::from(ts_now.as_u64().saturating_sub(lookback_ns))
+        });
+
+        // Use open_only=true to get all open orders across instruments
+        let order_cmd = GenerateOrderStatusReportsBuilder::default()
+            .ts_init(ts_now)
+            .open_only(true)
+            .start(start)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let position_cmd = GeneratePositionStatusReportsBuilder::default()
+            .ts_init(ts_now)
+            .start(start)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let (order_reports, position_reports) = tokio::try_join!(
+            self.generate_order_status_reports(&order_cmd),
+            self.generate_position_status_reports(&position_cmd),
+        )?;
+
+        log::info!("Received {} OrderStatusReports", order_reports.len());
+        log::info!("Received {} PositionReports", position_reports.len());
+
+        let mut mass_status = ExecutionMassStatus::new(
+            self.core.client_id,
+            self.core.account_id,
+            self.venue(),
+            ts_now,
+            None,
+        );
+
+        mass_status.add_order_reports(order_reports);
+        mass_status.add_position_reports(position_reports);
+
+        Ok(Some(mass_status))
     }
 }
 

@@ -202,7 +202,6 @@ impl FeedHandler {
 
                     // Handle ping frames directly for minimal latency
                     if let Message::Ping(data) = &msg {
-                        log::trace!("Received ping frame with {} bytes", data.len());
                         if let Some(client) = &self.client
                             && let Err(e) = client.send_pong(data.to_vec()).await
                         {
@@ -223,6 +222,13 @@ impl FeedHandler {
                                     return None;
                                 }
                                 return Some(NautilusWsMessage::Data(data_vec));
+                            }
+                            Some(MexcWsMessage::Exec(exec_msg)) => {
+                                if self.signal.load(Ordering::Relaxed) {
+                                    log::debug!("Stop signal received");
+                                    return None;
+                                }
+                                return Some(NautilusWsMessage::Exec(exec_msg));
                             }
                             Some(MexcWsMessage::Reconnected) => {
                                 return Some(NautilusWsMessage::Reconnected);
@@ -278,6 +284,9 @@ impl FeedHandler {
                         MexcWsMessage::Data(data) => {
                             return Some(NautilusWsMessage::Data(data));
                         }
+                        MexcWsMessage::Exec(exec_msg) => {
+                            return Some(NautilusWsMessage::Exec(exec_msg));
+                        }
                     }
                 }
 
@@ -310,10 +319,19 @@ impl FeedHandler {
                     // Check for code field (MEXC uses code: 0 for success, non-zero for error)
                     let (success, topic, error) = if let Some(code) = json.get("code").and_then(|c| c.as_i64()) {
                         // MEXC format: {"id": 0, "code": 0, "msg": "..."}
-                        let success = code == 0 && json.get("msg")
+                        // Important: Even if code is 0, check the message content
+                        // "Not Subscribed successfully!" means failure, not success
+                        let msg_str = json.get("msg")
                             .and_then(|m| m.as_str())
-                            .map(|m| m.contains("success") || !m.contains("Not Subscribed"))
-                            .unwrap_or(false);
+                            .unwrap_or("");
+                        
+                        // Check if message indicates failure
+                        let is_failure = msg_str.contains("Not Subscribed") || 
+                                        msg_str.contains("Blocked") ||
+                                        msg_str.contains("Reason");
+                        
+                        // Success only if code is 0 AND message doesn't indicate failure
+                        let success = code == 0 && !is_failure;
                         
                         // Extract topic from msg field if available
                         // Format: "Not Subscribed successfully! [spot@public.limit.depth.v3.api.pb@BTCUSDT@5]. Reason: ..."
@@ -500,6 +518,16 @@ impl FeedHandler {
     ) -> Option<MexcWsMessage> {
         match MexcProtoMessage::decode(data) {
             Ok(proto_msg) => {
+                // First try to parse as execution message (private messages)
+                match super::parse::parse_protobuf_wrapper_for_exec(&proto_msg) {
+                    Ok(exec_msg) => {
+                        return Some(MexcWsMessage::Exec(exec_msg));
+                    }
+                    Err(_) => {
+                        // Not an execution message, try parsing as data message
+                    }
+                }
+
                 // Convert protobuf message to Nautilus data types
                 match super::parse::parse_protobuf_wrapper(&proto_msg, instruments, ts_init) {
                     Ok(data_vec) => {
@@ -516,7 +544,7 @@ impl FeedHandler {
                 }
             }
             Err(e) => {
-                log::error!(
+                log::warn!(
                     "Failed to decode MEXC protobuf message: {e}, data_len: {}",
                     data.len()
                 );

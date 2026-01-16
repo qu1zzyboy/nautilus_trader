@@ -18,8 +18,6 @@
 use nautilus_model::data::Data;
 use serde::{Deserialize, Serialize};
 
-use super::enums::{MexcWsChannel, MexcWsMessageType};
-
 /// MEXC WebSocket subscription request message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MexcSubscription {
@@ -69,6 +67,25 @@ pub enum MexcWsMessage {
     },
     /// Market data message.
     Data(Vec<Data>),
+    /// Execution message (order updates, account updates, etc.).
+    Exec(MexcExecWsMessage),
+}
+
+/// Execution-related WebSocket messages for MEXC.
+#[derive(Clone, Debug)]
+pub enum MexcExecWsMessage {
+    /// Order update message.
+    OrderUpdate {
+        msg: crate::proto::PrivateOrdersV3Api,
+        symbol: Option<String>,
+    },
+    /// Trade/deal update message.
+    DealUpdate {
+        msg: crate::proto::PrivateDealsV3Api,
+        symbol: Option<String>,
+    },
+    /// Account update message.
+    AccountUpdate(crate::proto::PrivateAccountV3Api),
 }
 
 /// Nautilus WebSocket message wrapper.
@@ -81,4 +98,6 @@ pub enum NautilusWsMessage {
     Reconnected,
     /// Market data (trades, quotes, bars, order book deltas).
     Data(Vec<Data>),
+    /// Execution messages (order updates, account updates, etc.).
+    Exec(MexcExecWsMessage),
 }

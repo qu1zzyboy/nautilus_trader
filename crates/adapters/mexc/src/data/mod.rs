@@ -30,9 +30,29 @@ pub use client::MexcDataClient;
 
 /// Formats a MEXC stream name for the given instrument and channel.
 ///
-/// MEXC stream format: "channel@symbol" (e.g., "spot@public.deals.v3.api@BTCUSDT")
+/// MEXC stream format for protobuf channels: "channel.pb@interval@symbol"
+/// Examples:
+/// - "spot@public.aggre.bookTicker.v3.api.pb@100ms@BTCUSDT"
+/// - "spot@public.aggre.depth.v3.api.pb@100ms@BTCUSDT"
+/// - "spot@public.aggre.deals.v3.api.pb@100ms@BTCUSDT"
+/// - "spot@public.bookTicker.batch.v3.api.pb@BTCUSDT"
 fn format_mexc_stream(channel: &str, symbol: &str) -> String {
-    format!("{}@{}", channel, symbol)
+    // For protobuf channels, add .pb suffix and interval if needed
+    if channel.contains("bookTicker") {
+        // Use batch version for bookTicker (no interval needed)
+        if channel.contains("batch") {
+            format!("{}.pb@{}", channel, symbol)
+        } else {
+            // Use aggre version with interval
+            format!("{}.pb@100ms@{}", channel, symbol)
+        }
+    } else if channel.contains("aggre") {
+        // Aggregated channels need interval
+        format!("{}.pb@100ms@{}", channel, symbol)
+    } else {
+        // Fallback: simple format
+        format!("{}@{}", channel, symbol)
+    }
 }
 
 /// Formats a symbol from InstrumentId for MEXC API.

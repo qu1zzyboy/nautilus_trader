@@ -158,6 +158,9 @@ impl MexcDataClient {
             NautilusWsMessage::Reconnected => {
                 log::info!("WebSocket reconnected");
             }
+            NautilusWsMessage::Exec(_) => {
+                // Execution messages are handled by the execution client, ignore here
+            }
         }
     }
 
@@ -377,14 +380,15 @@ impl DataClient for MexcDataClient {
         let ws = self.ws_client.clone();
         let symbol = format_mexc_symbol(&instrument_id);
 
-        // MEXC uses incremental depth for order book updates
-        let stream = format_mexc_stream(MexcWsChannel::PublicIncreaseDepths.as_str(), &symbol);
+        // MEXC uses aggregated depth for order book updates (protobuf format)
+        // Format: "spot@public.aggre.depth.v3.api.pb@100ms@BTCUSDT"
+        let stream = format!("spot@public.aggre.depth.v3.api.pb@100ms@{}", symbol);
 
         self.spawn_ws(
             async move {
                 ws.subscribe(vec![stream])
                     .await
-                    .context("book deltas subscription")
+                    .map_err(|e| anyhow::anyhow!("book deltas subscription: {e}"))
             },
             "order book subscription",
         );
@@ -396,14 +400,15 @@ impl DataClient for MexcDataClient {
         let ws = self.ws_client.clone();
         let symbol = format_mexc_symbol(&instrument_id);
 
-        // MEXC uses bookTicker for best bid/ask
-        let stream = format_mexc_stream(MexcWsChannel::PublicBookTicker.as_str(), &symbol);
+        // MEXC uses batch bookTicker for best bid/ask (protobuf format)
+        // Format: "spot@public.bookTicker.batch.v3.api.pb@BTCUSDT"
+        let stream = format!("spot@public.bookTicker.batch.v3.api.pb@{}", symbol);
 
         self.spawn_ws(
             async move {
                 ws.subscribe(vec![stream])
                     .await
-                    .context("quotes subscription")
+                    .map_err(|e| anyhow::anyhow!("quotes subscription: {e}"))
             },
             "quote subscription",
         );
@@ -415,14 +420,15 @@ impl DataClient for MexcDataClient {
         let ws = self.ws_client.clone();
         let symbol = format_mexc_symbol(&instrument_id);
 
-        // MEXC uses deals channel for trades
-        let stream = format_mexc_stream(MexcWsChannel::PublicDeals.as_str(), &symbol);
+        // MEXC uses aggregated deals for trades (protobuf format)
+        // Format: "spot@public.aggre.deals.v3.api.pb@100ms@BTCUSDT"
+        let stream = format!("spot@public.aggre.deals.v3.api.pb@100ms@{}", symbol);
 
         self.spawn_ws(
             async move {
                 ws.subscribe(vec![stream])
                     .await
-                    .context("trades subscription")
+                    .map_err(|e| anyhow::anyhow!("trades subscription: {e}"))
             },
             "trade subscription",
         );
@@ -459,7 +465,8 @@ impl DataClient for MexcDataClient {
         let ws = self.ws_client.clone();
         let symbol = format_mexc_symbol(&instrument_id);
 
-        let stream = format_mexc_stream(MexcWsChannel::PublicIncreaseDepths.as_str(), &symbol);
+        // Use same format as subscription
+        let stream = format!("spot@public.aggre.depth.v3.api.pb@100ms@{}", symbol);
 
         self.spawn_ws(
             async move {
@@ -477,7 +484,8 @@ impl DataClient for MexcDataClient {
         let ws = self.ws_client.clone();
         let symbol = format_mexc_symbol(&instrument_id);
 
-        let stream = format_mexc_stream(MexcWsChannel::PublicBookTicker.as_str(), &symbol);
+        // Use same format as subscription
+        let stream = format!("spot@public.bookTicker.batch.v3.api.pb@{}", symbol);
 
         self.spawn_ws(
             async move {
@@ -495,7 +503,8 @@ impl DataClient for MexcDataClient {
         let ws = self.ws_client.clone();
         let symbol = format_mexc_symbol(&instrument_id);
 
-        let stream = format_mexc_stream(MexcWsChannel::PublicDeals.as_str(), &symbol);
+        // Use same format as subscription
+        let stream = format!("spot@public.aggre.deals.v3.api.pb@100ms@{}", symbol);
 
         self.spawn_ws(
             async move {

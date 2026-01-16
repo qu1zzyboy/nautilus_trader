@@ -23,10 +23,10 @@ use ahash::AHashMap;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{
-        Bar, BarSpecification, BookOrder, Data, OrderBookDelta, OrderBookDeltas, OrderBookDeltas_API,
+        Bar, BookOrder, Data, OrderBookDelta, OrderBookDeltas, OrderBookDeltas_API,
         QuoteTick, TradeTick,
     },
-    enums::{AggressorSide, BookAction, OrderSide, PriceType},
+    enums::{AggressorSide, BookAction, OrderSide},
     identifiers::TradeId,
     instruments::{Instrument, InstrumentAny},
     types::{Price, Quantity},
@@ -38,8 +38,9 @@ use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use crate::proto::{
-    PublicAggreDealsV3Api, PublicAggreDealsV3ApiItem, PublicBookTickerV3Api,
-    PublicDealsV3Api, PublicDealsV3ApiItem, PublicIncreaseDepthsV3Api,
+    PublicAggreBookTickerV3Api, PublicAggreDealsV3Api, PublicAggreDealsV3ApiItem,
+    PublicAggreDepthsV3Api, PublicAggreDepthV3ApiItem, PublicBookTickerBatchV3Api,
+    PublicBookTickerV3Api, PublicDealsV3Api, PublicDealsV3ApiItem, PublicIncreaseDepthsV3Api,
     PublicLimitDepthsV3Api, PublicSpotKlineV3Api, PushDataV3ApiWrapper,
 };
 
@@ -87,6 +88,15 @@ pub fn parse_protobuf_wrapper(
         }
         crate::proto::push_data_v3_api_wrapper::Body::PublicSpotKline(msg) => {
             parse_public_spot_kline(msg, instrument, ts_init)
+        }
+        crate::proto::push_data_v3_api_wrapper::Body::PublicAggreDepths(msg) => {
+            parse_public_aggre_depths(msg, instrument, ts_init)
+        }
+        crate::proto::push_data_v3_api_wrapper::Body::PublicBookTickerBatch(msg) => {
+            parse_public_book_ticker_batch(msg, instrument, ts_init)
+        }
+        crate::proto::push_data_v3_api_wrapper::Body::PublicAggreBookTicker(msg) => {
+            parse_public_aggre_book_ticker(msg, instrument, ts_init)
         }
         _ => {
             // Other message types not yet implemented
@@ -249,10 +259,25 @@ fn parse_public_increase_depths(
         let size = Quantity::from_decimal_dp(size_decimal, size_precision)
             .map_err(|e| MexcWsError::ParseError(format!("Failed to create bid Quantity: {e}")))?;
 
-        let order = BookOrder::new(OrderSide::Buy, price, size, OrderId::from(sequence));
+        // Determine action: Delete if size is zero, Update otherwise
+        let action = if size.is_zero() {
+            BookAction::Delete
+        } else {
+            BookAction::Update
+        };
+
+        // For Delete action, use zero quantity (allowed for Delete)
+        // For Update action, use the actual size
+        let order_size = if size.is_zero() {
+            Quantity::from(0)
+        } else {
+            size
+        };
+
+        let order = BookOrder::new(OrderSide::Buy, price, order_size, OrderId::from(sequence));
         let delta = OrderBookDelta::new(
             instrument_id,
-            BookAction::Update,
+            action,
             order,
             flags,
             sequence,
@@ -275,10 +300,25 @@ fn parse_public_increase_depths(
         let size = Quantity::from_decimal_dp(size_decimal, size_precision)
             .map_err(|e| MexcWsError::ParseError(format!("Failed to create ask Quantity: {e}")))?;
 
-        let order = BookOrder::new(OrderSide::Sell, price, size, OrderId::from(sequence));
+        // Determine action: Delete if size is zero, Update otherwise
+        let action = if size.is_zero() {
+            BookAction::Delete
+        } else {
+            BookAction::Update
+        };
+
+        // For Delete action, use zero quantity (allowed for Delete)
+        // For Update action, use the actual size
+        let order_size = if size.is_zero() {
+            Quantity::from(0)
+        } else {
+            size
+        };
+
+        let order = BookOrder::new(OrderSide::Sell, price, order_size, OrderId::from(sequence));
         let delta = OrderBookDelta::new(
             instrument_id,
-            BookAction::Update,
+            action,
             order,
             flags,
             sequence,
@@ -460,8 +500,183 @@ fn parse_public_spot_kline(
     Ok(vec![Data::Bar(bar)])
 }
 
+/// Parses public aggregate depths (aggregated order book updates).
+fn parse_public_aggre_depths(
+    msg: &PublicAggreDepthsV3Api,
+    instrument: &InstrumentAny,
+    ts_init: UnixNanos,
+) -> MexcWsResult<Vec<Data>> {
+    let instrument_id = instrument.id();
+    let price_precision = instrument.price_precision();
+    let size_precision = instrument.size_precision();
+
+    let mut deltas_vec = Vec::new();
+    let ts_event = ts_init;
+    let flags = 0u8;
+    
+    // Use to_version as sequence number (parse as u64)
+    let sequence = msg.to_version
+        .parse::<u64>()
+        .map_err(|e| MexcWsError::ParseError(format!("Failed to parse to_version as sequence: {e}")))?;
+    
+    let mut order_id = 0u64;
+
+    // Parse bid side
+    for bid in &msg.bids {
+        let price_decimal = Decimal::from_str(&bid.price)
+            .map_err(|e| MexcWsError::ParseError(format!("Failed to parse bid price: {e}")))?;
+        let size_decimal = Decimal::from_str(&bid.quantity)
+            .map_err(|e| MexcWsError::ParseError(format!("Failed to parse bid quantity: {e}")))?;
+
+        let price = Price::from_decimal_dp(price_decimal, price_precision)
+            .map_err(|e| MexcWsError::ParseError(format!("Failed to create bid Price: {e}")))?;
+        let size = Quantity::from_decimal_dp(size_decimal, size_precision)
+            .map_err(|e| MexcWsError::ParseError(format!("Failed to create bid Quantity: {e}")))?;
+
+        // Determine action: Delete if size is zero, Update otherwise
+        let action = if size.is_zero() {
+            BookAction::Delete
+        } else {
+            BookAction::Update
+        };
+
+        // For Delete action, use zero quantity (allowed for Delete)
+        // For Update action, use the actual size
+        let order_size = if size.is_zero() {
+            Quantity::from(0)
+        } else {
+            size
+        };
+
+        let order = BookOrder::new(OrderSide::Buy, price, order_size, OrderId::from(order_id));
+        let delta = OrderBookDelta::new(
+            instrument_id,
+            action,
+            order,
+            flags,
+            sequence,
+            ts_event,
+            ts_init,
+        );
+        deltas_vec.push(delta);
+        order_id += 1;
+    }
+
+    // Parse ask side
+    for ask in &msg.asks {
+        let price_decimal = Decimal::from_str(&ask.price)
+            .map_err(|e| MexcWsError::ParseError(format!("Failed to parse ask price: {e}")))?;
+        let size_decimal = Decimal::from_str(&ask.quantity)
+            .map_err(|e| MexcWsError::ParseError(format!("Failed to parse ask quantity: {e}")))?;
+
+        let price = Price::from_decimal_dp(price_decimal, price_precision)
+            .map_err(|e| MexcWsError::ParseError(format!("Failed to create ask Price: {e}")))?;
+        let size = Quantity::from_decimal_dp(size_decimal, size_precision)
+            .map_err(|e| MexcWsError::ParseError(format!("Failed to create ask Quantity: {e}")))?;
+
+        // Determine action: Delete if size is zero, Update otherwise
+        let action = if size.is_zero() {
+            BookAction::Delete
+        } else {
+            BookAction::Update
+        };
+
+        // For Delete action, use zero quantity (allowed for Delete)
+        // For Update action, use the actual size
+        let order_size = if size.is_zero() {
+            Quantity::from(0)
+        } else {
+            size
+        };
+
+        let order = BookOrder::new(OrderSide::Sell, price, order_size, OrderId::from(order_id));
+        let delta = OrderBookDelta::new(
+            instrument_id,
+            action,
+            order,
+            flags,
+            sequence,
+            ts_event,
+            ts_init,
+        );
+        deltas_vec.push(delta);
+        order_id += 1;
+    }
+
+    let deltas = OrderBookDeltas::new(instrument_id, deltas_vec);
+    let deltas_api = OrderBookDeltas_API::new(deltas);
+
+    Ok(vec![Data::Deltas(deltas_api)])
+}
+
+/// Parses public book ticker batch messages.
+fn parse_public_book_ticker_batch(
+    msg: &PublicBookTickerBatchV3Api,
+    instrument: &InstrumentAny,
+    ts_init: UnixNanos,
+) -> MexcWsResult<Vec<Data>> {
+    let mut quotes = Vec::new();
+
+    // Parse each book ticker in the batch
+    for ticker in &msg.items {
+        match parse_public_book_ticker(ticker, instrument, ts_init) {
+            Ok(mut data) => quotes.append(&mut data),
+            Err(e) => {
+                log::warn!("Failed to parse book ticker in batch: {e}");
+            }
+        }
+    }
+
+    Ok(quotes)
+}
+
+/// Parses public aggregate book ticker messages.
+fn parse_public_aggre_book_ticker(
+    msg: &PublicAggreBookTickerV3Api,
+    instrument: &InstrumentAny,
+    ts_init: UnixNanos,
+) -> MexcWsResult<Vec<Data>> {
+    // PublicAggreBookTickerV3Api has the same structure as PublicBookTickerV3Api
+    // So we can reuse the same parsing logic
+    let instrument_id = instrument.id();
+    let price_precision = instrument.price_precision();
+    let size_precision = instrument.size_precision();
+
+    let bid_price_decimal = Decimal::from_str(&msg.bid_price)
+        .map_err(|e| MexcWsError::ParseError(format!("Failed to parse bid price: {e}")))?;
+    let bid_size_decimal = Decimal::from_str(&msg.bid_quantity)
+        .map_err(|e| MexcWsError::ParseError(format!("Failed to parse bid quantity: {e}")))?;
+
+    let ask_price_decimal = Decimal::from_str(&msg.ask_price)
+        .map_err(|e| MexcWsError::ParseError(format!("Failed to parse ask price: {e}")))?;
+    let ask_size_decimal = Decimal::from_str(&msg.ask_quantity)
+        .map_err(|e| MexcWsError::ParseError(format!("Failed to parse ask quantity: {e}")))?;
+
+    let bid_price = Price::from_decimal_dp(bid_price_decimal, price_precision)
+        .map_err(|e| MexcWsError::ParseError(format!("Failed to create bid Price: {e}")))?;
+    let bid_size = Quantity::from_decimal_dp(bid_size_decimal, size_precision)
+        .map_err(|e| MexcWsError::ParseError(format!("Failed to create bid Quantity: {e}")))?;
+
+    let ask_price = Price::from_decimal_dp(ask_price_decimal, price_precision)
+        .map_err(|e| MexcWsError::ParseError(format!("Failed to create ask Price: {e}")))?;
+    let ask_size = Quantity::from_decimal_dp(ask_size_decimal, size_precision)
+        .map_err(|e| MexcWsError::ParseError(format!("Failed to create ask Quantity: {e}")))?;
+
+    let quote = QuoteTick::new(
+        instrument_id,
+        bid_price,
+        ask_price,
+        bid_size,
+        ask_size,
+        ts_init,
+        ts_init,
+    );
+
+    Ok(vec![Data::Quote(quote)])
+}
+
 /// Parses MEXC kline interval string to BarSpecification.
-fn parse_kline_interval(interval: &str) -> MexcWsResult<BarSpecification> {
+fn parse_kline_interval(interval: &str) -> MexcWsResult<nautilus_model::data::BarSpecification> {
     use nautilus_model::{
         data::BarSpecification,
         enums::{BarAggregation, PriceType},
@@ -486,4 +701,44 @@ fn parse_kline_interval(interval: &str) -> MexcWsResult<BarSpecification> {
     };
 
     Ok(spec)
+}
+
+/// Parses a MEXC protobuf wrapper message for execution events.
+///
+/// This function handles private messages (orders, deals, account updates)
+/// that should be routed to the execution client.
+///
+/// # Errors
+///
+/// Returns an error if parsing fails or required fields are missing.
+pub fn parse_protobuf_wrapper_for_exec(
+    wrapper: &PushDataV3ApiWrapper,
+) -> MexcWsResult<super::messages::MexcExecWsMessage> {
+    let body = wrapper
+        .body
+        .as_ref()
+        .ok_or_else(|| MexcWsError::MissingField("body".to_string()))?;
+
+    let symbol = wrapper.symbol.clone();
+
+    match body {
+        crate::proto::push_data_v3_api_wrapper::Body::PrivateOrders(msg) => {
+            Ok(super::messages::MexcExecWsMessage::OrderUpdate {
+                msg: msg.clone(),
+                symbol,
+            })
+        }
+        crate::proto::push_data_v3_api_wrapper::Body::PrivateDeals(msg) => {
+            Ok(super::messages::MexcExecWsMessage::DealUpdate {
+                msg: msg.clone(),
+                symbol,
+            })
+        }
+        crate::proto::push_data_v3_api_wrapper::Body::PrivateAccount(msg) => {
+            Ok(super::messages::MexcExecWsMessage::AccountUpdate(msg.clone()))
+        }
+        _ => Err(MexcWsError::ParseError(
+            "Not an execution message".to_string(),
+        )),
+    }
 }

@@ -22,7 +22,7 @@ use nautilus_model::{
     enums::{OrderSide, OrderStatus, OrderType, TimeInForce},
     identifiers::{AccountId, ClientOrderId, InstrumentId, VenueOrderId},
     reports::OrderStatusReport,
-    types::Quantity,
+    types::{Price, Quantity},
 };
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
@@ -145,6 +145,7 @@ impl MexcOrder {
         &self,
         account_id: AccountId,
         instrument_id: InstrumentId,
+        price_precision: u8,
         size_precision: u8,
     ) -> anyhow::Result<OrderStatusReport> {
         use nautilus_core::time::get_atomic_clock_realtime;
@@ -158,10 +159,14 @@ impl MexcOrder {
         let client_order_id = self
             .client_order_id
             .as_ref()
+            .filter(|id| !id.is_empty())
             .map(|id| ClientOrderId::new(id))
             .or_else(|| {
                 // If no client order ID, use order ID as fallback
-                self.order_id.as_ref().map(|id| ClientOrderId::new(id))
+                self.order_id
+                    .as_ref()
+                    .filter(|id| !id.is_empty())
+                    .map(|id| ClientOrderId::new(id))
             });
 
         let venue_order_id = self
@@ -211,7 +216,16 @@ impl MexcOrder {
             .transpose()?
             .unwrap_or_else(|| Quantity::zero(size_precision));
 
-        Ok(OrderStatusReport::new(
+        // Parse price if available (required for Limit orders)
+        let price = self
+            .price
+            .as_ref()
+            .filter(|p| !p.is_empty())
+            .and_then(|p| p.parse::<f64>().ok())
+            .map(|px| Price::new(px, price_precision));
+
+        // Build report with price if available
+        let mut report = OrderStatusReport::new(
             account_id,
             instrument_id,
             client_order_id,
@@ -226,7 +240,17 @@ impl MexcOrder {
             ts_event,
             ts_now,
             Some(Uuid::new_v4().into()),
-        ))
+        );
+
+        // Set price if available (required for Limit orders during reconciliation)
+        if let Some(p) = price {
+            report = report.with_price(p);
+        }
+
+        // Note: avg_px is not available from MEXC order query API
+        // It can be calculated from filled quantity and amount if needed in the future
+
+        Ok(report)
     }
 }
 
