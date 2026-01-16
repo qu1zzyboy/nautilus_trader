@@ -42,7 +42,7 @@ use ustr::Ustr;
 use super::{
     error::{MexcErrorResponse, MexcHttpError},
     models::{
-        ListenKeyResponse, MexcAccount, MexcInstrument, MexcKline, MexcOrder, MexcOrderBook,
+        ListenKeyResponse, MexcAccount, MexcExchangeInfo, MexcInstrument, MexcKline, MexcOrder, MexcOrderBook,
         MexcTicker, MexcTrade,
     },
     query::{
@@ -476,8 +476,10 @@ impl MexcRawHttpClient {
         &self,
         params: Option<GetExchangeInfoParams>,
     ) -> Result<Vec<MexcInstrument>, MexcHttpError> {
-        self.send_request::<_, _>(Method::GET, "/api/v3/exchangeInfo", params.as_ref(), None, false)
-            .await
+        let response: MexcExchangeInfo = self
+            .send_request::<_, _>(Method::GET, "/api/v3/exchangeInfo", params.as_ref(), None, false)
+            .await?;
+        Ok(response.symbols)
     }
 
     /// Get recent trades.

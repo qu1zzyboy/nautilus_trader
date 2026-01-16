@@ -38,11 +38,11 @@ use super::{
     messages::{
         BinanceFuturesAccountConfigMsg, BinanceFuturesAccountUpdateMsg, BinanceFuturesAggTradeMsg,
 
-        BinanceFuturesBookTickerMsg, BinanceFuturesDepthUpdateMsg, BinanceFuturesHandlerCommand,
-        BinanceFuturesKlineMsg, BinanceFuturesListenKeyExpiredMsg, BinanceFuturesMarginCallMsg,
-        BinanceFuturesMarkPriceMsg, BinanceFuturesOrderUpdateMsg, BinanceFuturesTradeMsg,
-        BinanceFuturesWsErrorMsg, BinanceFuturesWsErrorResponse, BinanceFuturesWsMessage,
-        BinanceFuturesWsSubscribeRequest, BinanceFuturesWsSubscribeResponse,
+        BinanceFuturesBookTickerMsg, BinanceFuturesContinuousKlineMsg, BinanceFuturesDepthUpdateMsg,
+        BinanceFuturesHandlerCommand, BinanceFuturesKlineMsg, BinanceFuturesListenKeyExpiredMsg,
+        BinanceFuturesMarginCallMsg, BinanceFuturesMarkPriceMsg, BinanceFuturesOrderUpdateMsg,
+        BinanceFuturesTradeMsg, BinanceFuturesWsErrorMsg, BinanceFuturesWsErrorResponse,
+        BinanceFuturesWsMessage, BinanceFuturesWsSubscribeRequest, BinanceFuturesWsSubscribeResponse,
         NautilusFuturesDataWsMessage, NautilusFuturesExecWsMessage,
     },
     parse::{
@@ -430,7 +430,9 @@ impl BinanceFuturesWsFeedHandler {
                     match parse_continuous_kline(&msg, instrument) {
                         Ok(Some(bar)) => {
                             log::debug!("Successfully parsed continuous kline bar: {}", bar.bar_type.instrument_id());
-                            return Some(NautilusFuturesWsMessage::Data(vec![Data::Bar(bar)]));
+                            return Some(BinanceFuturesWsMessage::Data(
+                                NautilusFuturesDataWsMessage::Data(vec![Data::Bar(bar)]),
+                            ));
                         }
                         Ok(None) => {
                             // Kline not closed yet, skip (normal for 1s klines)

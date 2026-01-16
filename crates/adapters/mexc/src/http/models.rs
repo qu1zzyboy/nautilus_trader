@@ -28,6 +28,14 @@ use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 use uuid::Uuid;
 
+/// MEXC exchange info response wrapper.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MexcExchangeInfo {
+    /// List of trading symbols.
+    pub symbols: Vec<MexcInstrument>,
+}
+
 /// MEXC instrument information.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]

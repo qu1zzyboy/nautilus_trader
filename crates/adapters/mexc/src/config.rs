@@ -15,6 +15,10 @@
 
 //! Configuration types for the MEXC adapter clients.
 
+use std::any::Any;
+
+use nautilus_system::factories::ClientConfig;
+
 use crate::common::consts::{MEXC_HTTP_URL, MEXC_WS_URL};
 
 /// Configuration for the MEXC live data client.
@@ -50,6 +54,12 @@ impl Default for MexcDataClientConfig {
             max_retries: Some(3),
             heartbeat_interval_secs: Some(30),
         }
+    }
+}
+
+impl ClientConfig for MexcDataClientConfig {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -106,6 +116,12 @@ impl Default for MexcExecClientConfig {
             max_retries: Some(3),
             heartbeat_interval_secs: Some(30),
         }
+    }
+}
+
+impl ClientConfig for MexcExecClientConfig {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

@@ -423,4 +423,24 @@ impl MexcWebSocketClient {
             MexcWsError::SubscriptionError(format!("Failed to send subscribe command: {e}"))
         })
     }
+
+    /// Unsubscribe from the specified topics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WebSocket is not connected or if sending the unsubscription message fails.
+    pub async fn unsubscribe(&self, topics: Vec<String>) -> Result<(), MexcWsError> {
+        log::debug!("Unsubscribing from topics: {topics:?}");
+
+        for topic in &topics {
+            self.subscriptions.mark_unsubscribe(topic.as_str());
+            self.tracked_subscriptions.remove(topic);
+        }
+
+        let cmd = HandlerCommand::Unsubscribe { topics };
+
+        self.cmd_tx.read().await.send(cmd).map_err(|e| {
+            MexcWsError::SubscriptionError(format!("Failed to send unsubscribe command: {e}"))
+        })
+    }
 }
