@@ -5509,7 +5509,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "strum",
- "thiserror 2.0.17",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
