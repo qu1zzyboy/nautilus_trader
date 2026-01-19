@@ -330,11 +330,24 @@ impl MexcWebSocketClient {
             // Handler responds to pings internally via select! loop
         });
 
+        // MEXC requires application-level heartbeat: {"method": "PING"}
+        // According to MEXC docs:
+        // - Client must actively send ping to keep connection alive
+        // - If no valid subscription, server disconnects after 30 seconds
+        // - If subscription successful but no data flow, server disconnects after 1 minute
+        // - Client can send ping to keep connection alive
+        // The server responds with: {"id": 0, "code": 0, "msg": "PONG"}
+        let heartbeat_msg = if self.heartbeat.is_some() {
+            Some(r#"{"method": "PING"}"#.to_string())
+        } else {
+            None
+        };
+
         let config = WebSocketConfig {
             url: self.url.clone(),
             headers: vec![(USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string())],
             heartbeat: self.heartbeat,
-            heartbeat_msg: None,
+            heartbeat_msg,
             reconnect_timeout_ms: Some(5_000),
             reconnect_delay_initial_ms: None,
             reconnect_delay_max_ms: None,

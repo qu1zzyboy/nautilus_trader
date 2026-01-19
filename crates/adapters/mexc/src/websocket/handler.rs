@@ -315,7 +315,16 @@ impl FeedHandler {
                 // Format: {"id": 0, "code": 0, "msg": "success"} for success
                 // Format: {"id": 0, "code": 0, "msg": "Not Subscribed successfully! [topic]. Reason: ..."} for error
                 // Also check for status field format: {"status": 200, "params": ["topic"]}
+                // Also check for PONG response: {"id": 0, "code": 0, "msg": "PONG"}
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                    // Check for PONG response from heartbeat (application-level ping/pong)
+                    if let Some(msg) = json.get("msg").and_then(|m| m.as_str()) {
+                        if msg == "PONG" {
+                            log::debug!("Received PONG response from MEXC server (format 1)");
+                            return None; // PONG is just a keepalive, no need to process further
+                        }
+                    }
+                    
                     // Check for code field (MEXC uses code: 0 for success, non-zero for error)
                     let (success, topic, error) = if let Some(code) = json.get("code").and_then(|c| c.as_i64()) {
                         // MEXC format: {"id": 0, "code": 0, "msg": "..."}
