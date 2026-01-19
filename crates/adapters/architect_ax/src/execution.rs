@@ -43,12 +43,14 @@ use nautilus_core::{MUTEX_POISONED, UUID4, UnixNanos, time::get_atomic_clock_rea
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
     accounts::AccountAny,
-    enums::OmsType,
+    enums::{OmsType, OrderSide, OrderType},
     events::{AccountState, OrderCancelRejected, OrderEventAny, OrderRejected, OrderSubmitted},
-    identifiers::{AccountId, ClientId, Venue},
+    identifiers::{
+        AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
+    },
     orders::Order,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, MarginBalance},
+    types::{AccountBalance, MarginBalance, Price},
 };
 use tokio::task::JoinHandle;
 use totp_rs::{Algorithm, Secret, TOTP};
@@ -57,7 +59,7 @@ use crate::{
     common::consts::AX_VENUE,
     config::AxExecClientConfig,
     http::client::AxHttpClient,
-    websocket::{AxOrdersWsMessage, orders::AxOrdersWebSocketClient},
+    websocket::{AxOrdersWsMessage, NautilusExecWsMessage, orders::AxOrdersWebSocketClient},
 };
 
 /// Live execution client for the AX Exchange.
@@ -191,6 +193,50 @@ impl AxExecutionClient {
         runtime.block_on(self.refresh_account_state())
     }
 
+    /// Calculates an aggressive limit price for market order simulation.
+    ///
+    /// Uses the best bid/ask from cached quote data with a conservative price band
+    /// buffer to ensure the order fills immediately while staying within AX price bounds.
+    fn calculate_market_order_price(
+        &self,
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+    ) -> anyhow::Result<Option<Price>> {
+        // Use 3% band (conservative, as AX typically allows ~5%)
+        const PRICE_BAND_PCT: f64 = 0.03;
+
+        let cache = self.core.cache();
+        let cache_guard = cache.borrow();
+
+        let quote = cache_guard.quote(&instrument_id).ok_or_else(|| {
+            anyhow::anyhow!("Market order simulation requires cached quote for {instrument_id}")
+        })?;
+
+        let aggressive_price = match order_side {
+            OrderSide::Buy => {
+                // For BUY: use ask price + buffer to ensure fill
+                let ask = quote.ask_price.as_f64();
+                let price_value = ask * (1.0 + PRICE_BAND_PCT);
+                Price::new(price_value, quote.ask_price.precision)
+            }
+            OrderSide::Sell => {
+                // For SELL: use bid price - buffer to ensure fill
+                let bid = quote.bid_price.as_f64();
+                let price_value = bid * (1.0 - PRICE_BAND_PCT);
+                Price::new(price_value, quote.bid_price.precision)
+            }
+            _ => {
+                anyhow::bail!("Invalid order side for market simulation: {order_side:?}");
+            }
+        };
+
+        log::debug!(
+            "Market order simulation: {order_side:?} {instrument_id} aggressive_price={aggressive_price}"
+        );
+
+        Ok(Some(aggressive_price))
+    }
+
     fn submit_order_impl(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
         let order = self.core.get_order(&cmd.client_order_id)?;
         let ws_orders = self.ws_orders.clone();
@@ -205,10 +251,16 @@ impl AxExecutionClient {
         let order_side = order.order_side();
         let order_type = order.order_type();
         let quantity = order.quantity();
-        let price = order.price();
         let trigger_price = order.trigger_price();
         let time_in_force = order.time_in_force();
         let is_post_only = order.is_post_only();
+
+        // For market orders, calculate aggressive price from cached quote
+        let price = if order_type == OrderType::Market {
+            self.calculate_market_order_price(instrument_id, order_side)?
+        } else {
+            order.price()
+        };
 
         self.spawn_task("submit_order", async move {
             let result = ws_orders
@@ -324,7 +376,7 @@ impl AxExecutionClient {
         let runtime = get_runtime();
         let handle = runtime.spawn(async move {
             if let Err(e) = fut.await {
-                log::warn!("{description} failed: {e:?}");
+                log::warn!("{description} failed: {e}");
             }
         });
 
@@ -556,6 +608,18 @@ impl ExecutionClient for AxExecutionClient {
             let client_order_id = order.client_order_id();
             log::warn!("Cannot submit closed order {client_order_id}");
             return Ok(());
+        }
+
+        // For market orders, validate quote is cached before emitting OrderSubmitted
+        if order.order_type() == OrderType::Market {
+            let cache = self.core.cache();
+            let cache_guard = cache.borrow();
+            let instrument_id = order.instrument_id();
+            if cache_guard.quote(&instrument_id).is_none() {
+                anyhow::bail!(
+                    "Market order requires cached quote for {instrument_id} (quote not yet received)"
+                );
+            }
         }
 
         let event = OrderSubmitted::new(
@@ -796,6 +860,23 @@ impl ExecutionClient for AxExecutionClient {
 
         Ok(Some(mass_status))
     }
+
+    fn register_external_order(
+        &self,
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+        instrument_id: InstrumentId,
+        strategy_id: StrategyId,
+        ts_init: UnixNanos,
+    ) {
+        self.ws_orders.register_external_order(
+            client_order_id,
+            venue_order_id,
+            instrument_id,
+            strategy_id,
+            ts_init,
+        );
+    }
 }
 
 fn dispatch_ws_message(
@@ -803,45 +884,47 @@ fn dispatch_ws_message(
     sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
 ) {
     match message {
-        AxOrdersWsMessage::OrderAcceptedEvent(event) => {
-            log::debug!(
-                "Order accepted: {} {}",
-                event.client_order_id,
-                event.venue_order_id
-            );
-            send_order_event(sender, OrderEventAny::Accepted(event));
-        }
-        AxOrdersWsMessage::OrderFilledEvent(event) => {
-            log::debug!(
-                "Order filled: {} {} @ {}",
-                event.client_order_id,
-                event.last_qty,
-                event.last_px
-            );
-            send_order_event(sender, OrderEventAny::Filled(*event));
-        }
-        AxOrdersWsMessage::OrderCanceledEvent(event) => {
-            log::debug!("Order canceled: {}", event.client_order_id);
-            send_order_event(sender, OrderEventAny::Canceled(event));
-        }
-        AxOrdersWsMessage::OrderExpiredEvent(event) => {
-            log::debug!("Order expired: {}", event.client_order_id);
-            send_order_event(sender, OrderEventAny::Expired(event));
-        }
-        AxOrdersWsMessage::OrderRejected(event) => {
-            log::warn!("Order rejected: {}", event.client_order_id);
-            send_order_event(sender, OrderEventAny::Rejected(event));
-        }
-        AxOrdersWsMessage::OrderCancelRejected(event) => {
-            log::warn!("Cancel rejected: {}", event.client_order_id);
-            send_order_event(sender, OrderEventAny::CancelRejected(event));
-        }
-        AxOrdersWsMessage::OrderStatusReports(reports) => {
-            log::debug!("Order status reports: {}", reports.len());
-        }
-        AxOrdersWsMessage::FillReports(reports) => {
-            log::debug!("Fill reports: {}", reports.len());
-        }
+        AxOrdersWsMessage::Nautilus(message) => match message {
+            NautilusExecWsMessage::OrderAccepted(event) => {
+                log::debug!(
+                    "Order accepted: {} {}",
+                    event.client_order_id,
+                    event.venue_order_id
+                );
+                send_order_event(sender, OrderEventAny::Accepted(event));
+            }
+            NautilusExecWsMessage::OrderFilled(event) => {
+                log::debug!(
+                    "Order filled: {} {} @ {}",
+                    event.client_order_id,
+                    event.last_qty,
+                    event.last_px
+                );
+                send_order_event(sender, OrderEventAny::Filled(*event));
+            }
+            NautilusExecWsMessage::OrderCanceled(event) => {
+                log::debug!("Order canceled: {}", event.client_order_id);
+                send_order_event(sender, OrderEventAny::Canceled(event));
+            }
+            NautilusExecWsMessage::OrderExpired(event) => {
+                log::debug!("Order expired: {}", event.client_order_id);
+                send_order_event(sender, OrderEventAny::Expired(event));
+            }
+            NautilusExecWsMessage::OrderRejected(event) => {
+                log::warn!("Order rejected: {}", event.client_order_id);
+                send_order_event(sender, OrderEventAny::Rejected(event));
+            }
+            NautilusExecWsMessage::OrderCancelRejected(event) => {
+                log::warn!("Cancel rejected: {}", event.client_order_id);
+                send_order_event(sender, OrderEventAny::CancelRejected(event));
+            }
+            NautilusExecWsMessage::OrderStatusReports(reports) => {
+                log::debug!("Order status reports: {}", reports.len());
+            }
+            NautilusExecWsMessage::FillReports(reports) => {
+                log::debug!("Fill reports: {}", reports.len());
+            }
+        },
         AxOrdersWsMessage::PlaceOrderResponse(resp) => {
             log::debug!(
                 "Place order response: rid={} oid={}",

@@ -26,22 +26,20 @@ use crate::msgbus::get_message_bus;
 
 pub const CLOSE_TOPIC: &str = "CLOSE";
 
-////////////////////////////////////////////////////////////////////////////////
-// Built-in endpoint constants
-////////////////////////////////////////////////////////////////////////////////
-// These are static endpoint addresses.
-// They use OnceLock for thread-safe lazy initialization without instance state.
-
 static DATA_QUEUE_EXECUTE_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static DATA_EXECUTE_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
-static DATA_PROCESS_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
+static DATA_PROCESS_ANY_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
+static DATA_PROCESS_DATA_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
+#[cfg(feature = "defi")]
+static DATA_PROCESS_DEFI_DATA_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static DATA_RESPONSE_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static EXEC_EXECUTE_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static EXEC_PROCESS_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static EXEC_RECONCILE_REPORT_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static RISK_EXECUTE_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static RISK_PROCESS_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
-static PORTFOLIO_UPDATE_ACCOUNT_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
+static ORDER_EMULATOR_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
+static PORTFOLIO_ACCOUNT_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 
 macro_rules! define_switchboard {
     ($(
@@ -90,7 +88,21 @@ macro_rules! define_switchboard {
             #[inline]
             #[must_use]
             pub fn data_engine_process() -> MStr<Endpoint> {
-                *DATA_PROCESS_ENDPOINT.get_or_init(|| "DataEngine.process".into())
+                *DATA_PROCESS_ANY_ENDPOINT.get_or_init(|| "DataEngine.process".into())
+            }
+
+            #[inline]
+            #[must_use]
+            pub fn data_engine_process_data() -> MStr<Endpoint> {
+                *DATA_PROCESS_DATA_ENDPOINT.get_or_init(|| "DataEngine.process_data".into())
+            }
+
+            #[cfg(feature = "defi")]
+            #[inline]
+            #[must_use]
+            pub fn data_engine_process_defi_data() -> MStr<Endpoint> {
+                *DATA_PROCESS_DEFI_DATA_ENDPOINT
+                    .get_or_init(|| "DataEngine.process_defi_data".into())
             }
 
             #[inline]
@@ -131,8 +143,14 @@ macro_rules! define_switchboard {
 
             #[inline]
             #[must_use]
+            pub fn order_emulator_execute() -> MStr<Endpoint> {
+                *ORDER_EMULATOR_ENDPOINT.get_or_init(|| "OrderEmulator.execute".into())
+            }
+
+            #[inline]
+            #[must_use]
             pub fn portfolio_update_account() -> MStr<Endpoint> {
-                *PORTFOLIO_UPDATE_ACCOUNT_ENDPOINT.get_or_init(|| "Portfolio.update_account".into())
+                *PORTFOLIO_ACCOUNT_ENDPOINT.get_or_init(|| "Portfolio.update_account".into())
             }
 
             // Dynamic topics

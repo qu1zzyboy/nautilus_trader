@@ -15,8 +15,6 @@
 
 //! Data structures for Deribit WebSocket JSON-RPC messages.
 
-use std::fmt::Display;
-
 use nautilus_model::{
     data::{Data, FundingRateUpdate, OrderBookDeltas},
     events::{
@@ -31,7 +29,10 @@ use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
 use super::enums::{DeribitBookAction, DeribitBookMsgType, DeribitHeartbeatType};
-pub use crate::common::rpc::{DeribitJsonRpcError, DeribitJsonRpcRequest, DeribitJsonRpcResponse};
+pub use crate::common::{
+    enums::DeribitInstrumentState,
+    rpc::{DeribitJsonRpcError, DeribitJsonRpcRequest, DeribitJsonRpcResponse},
+};
 use crate::websocket::error::DeribitWsError;
 
 /// JSON-RPC subscription notification from Deribit.
@@ -272,53 +273,6 @@ pub struct DeribitQuoteMsg {
     pub best_ask_amount: f64,
 }
 
-/// Instrument lifecycle state from Deribit.
-///
-/// Represents the current state of an instrument in its lifecycle.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    Serialize,
-    Deserialize,
-    strum::AsRefStr,
-    strum::EnumIter,
-    strum::EnumString,
-)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.deribit")
-)]
-pub enum DeribitInstrumentState {
-    /// Instrument has been created but not yet active.
-    Created,
-    /// Instrument is active and trading.
-    Started,
-    /// Instrument has been settled (options/futures at expiry).
-    Settled,
-    /// Instrument is closed for trading.
-    Closed,
-    /// Instrument has been terminated.
-    Terminated,
-}
-
-impl Display for DeribitInstrumentState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Created => write!(f, "created"),
-            Self::Started => write!(f, "started"),
-            Self::Settled => write!(f, "settled"),
-            Self::Closed => write!(f, "closed"),
-            Self::Terminated => write!(f, "terminated"),
-        }
-    }
-}
-
 /// Instrument state notification from `instrument.state.{kind}.{currency}` channel.
 ///
 /// Notifications are sent when an instrument's lifecycle state changes.
@@ -351,7 +305,18 @@ pub struct DeribitPerpetualMsg {
 /// Chart/OHLC bar data from chart.trades.{instrument}.{resolution} channel.
 ///
 /// Sent via the `chart.trades.{instrument_name}.{resolution}` channel.
-/// Example: `{"tick":1767199200000,"open":87699.5,"high":87699.5,"low":87699.5,"close":87699.5,"volume":1.1403e-4,"cost":10.0}`
+/// Status of a chart/candle bar from Deribit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeribitChartStatus {
+    /// Bar is closed/confirmed.
+    #[default]
+    Ok,
+    /// Bar is still in progress (imputed/partial data).
+    Imputed,
+}
+
+/// Example: `{"tick":1767199200000,"open":87699.5,"high":87699.5,"low":87699.5,"close":87699.5,"volume":1.1403e-4,"cost":10.0,"status":"ok"}`
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeribitChartMsg {
     /// Bar timestamp in milliseconds since Unix epoch.
@@ -368,6 +333,9 @@ pub struct DeribitChartMsg {
     pub volume: f64,
     /// Volume in USD.
     pub cost: f64,
+    /// Bar status: `Ok` for closed bar, `Imputed` for in-progress bar.
+    #[serde(default)]
+    pub status: DeribitChartStatus,
 }
 
 /// Order parameters for private/buy and private/sell requests.
@@ -396,9 +364,14 @@ pub struct DeribitOrderParams {
     /// Time in force: "good_til_cancelled", "good_til_date", "fill_or_kill", "immediate_or_cancel".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_in_force: Option<String>,
-    /// Post-only flag (rejected if would take liquidity).
+    /// Post-only flag. If true and order would take liquidity, price is adjusted
+    /// to be just below the spread (unless reject_post_only is true).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub post_only: Option<bool>,
+    /// If true with post_only, order is rejected instead of price being adjusted.
+    /// Only valid when post_only is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reject_post_only: Option<bool>,
     /// Reduce-only flag (only reduces position).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reduce_only: Option<bool>,
@@ -462,9 +435,14 @@ pub struct DeribitEditParams {
         with = "rust_decimal::serde::float_option"
     )]
     pub trigger_price: Option<Decimal>,
-    /// Post-only flag.
+    /// Post-only flag. If true and order would take liquidity, price is adjusted
+    /// to be just below the spread (unless reject_post_only is true).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub post_only: Option<bool>,
+    /// If true with post_only, order is rejected instead of price being adjusted.
+    /// Only valid when post_only is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reject_post_only: Option<bool>,
     /// Reduce-only flag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reduce_only: Option<bool>,
@@ -780,17 +758,10 @@ pub fn parse_raw_message(text: &str) -> Result<DeribitWsMessage, DeribitWsError>
     }
 
     // Check for JSON-RPC response (has "id" field)
+    // IMPORTANT: Both success and error responses should be returned as Response
+    // so the handler can correlate them with pending requests using the ID.
+    // This allows proper cleanup of pending_requests and emission of rejection events.
     if value.get("id").is_some() {
-        // Check for error response
-        if value.get("error").is_some() {
-            let response: DeribitJsonRpcResponse<serde_json::Value> =
-                serde_json::from_value(value.clone())
-                    .map_err(|e| DeribitWsError::Json(e.to_string()))?;
-            if let Some(err) = response.error {
-                return Ok(DeribitWsMessage::Error(err));
-            }
-        }
-        // Success response
         let response: DeribitJsonRpcResponse<serde_json::Value> =
             serde_json::from_value(value).map_err(|e| DeribitWsError::Json(e.to_string()))?;
         return Ok(DeribitWsMessage::Response(response));
@@ -853,6 +824,8 @@ mod tests {
 
     #[rstest]
     fn test_parse_error_response() {
+        // Error responses with an ID are returned as Response (not Error)
+        // so the handler can correlate them with pending requests
         let json = r#"{
             "jsonrpc": "2.0",
             "id": 1,
@@ -863,7 +836,15 @@ mod tests {
         }"#;
 
         let msg = parse_raw_message(json).unwrap();
-        assert!(matches!(msg, DeribitWsMessage::Error(_)));
+        match msg {
+            DeribitWsMessage::Response(resp) => {
+                assert!(resp.error.is_some());
+                let error = resp.error.unwrap();
+                assert_eq!(error.code, 10028);
+                assert_eq!(error.message, "too_many_requests");
+            }
+            _ => panic!("Expected Response with error, got {msg:?}"),
+        }
     }
 
     #[rstest]

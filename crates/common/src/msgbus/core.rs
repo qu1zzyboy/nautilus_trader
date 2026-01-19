@@ -92,31 +92,34 @@ use std::{
 };
 
 use ahash::{AHashMap, AHashSet};
-use handler::ShareableMessageHandler;
 use indexmap::IndexMap;
-use matching::is_matching_backtracking;
 use nautilus_core::{UUID4, correctness::FAILED};
 use nautilus_model::{
     data::{
-        Bar, FundingRateUpdate, GreeksData, IndexPriceUpdate, InstrumentClose, MarkPriceUpdate,
+        Bar, Data, FundingRateUpdate, GreeksData, IndexPriceUpdate, MarkPriceUpdate,
         OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
     },
     events::{AccountState, OrderEventAny, PositionEvent},
     identifiers::TraderId,
-    instruments::InstrumentAny,
     orderbook::OrderBook,
     orders::OrderAny,
     position::Position,
 };
-use switchboard::MessagingSwitchboard;
+use smallvec::SmallVec;
 use ustr::Ustr;
 
 use super::{
-    handler, matching,
+    ShareableMessageHandler,
+    matching::is_matching_backtracking,
     mstr::{Endpoint, MStr, Pattern, Topic},
-    set_message_bus, switchboard,
-    typed_endpoints::EndpointMap,
+    set_message_bus,
+    switchboard::MessagingSwitchboard,
+    typed_endpoints::{EndpointMap, IntoEndpointMap},
     typed_router::TopicRouter,
+};
+use crate::messages::{
+    data::{DataCommand, DataResponse},
+    execution::{ExecutionReport, TradingCommand},
 };
 
 /// Represents a subscription to a particular topic.
@@ -226,12 +229,10 @@ pub struct MessageBus {
     pub(crate) router_bars: TopicRouter<Bar>,
     pub(crate) router_deltas: TopicRouter<OrderBookDeltas>,
     pub(crate) router_depth10: TopicRouter<OrderBookDepth10>,
-    pub(crate) router_instruments: TopicRouter<InstrumentAny>,
+    pub(crate) router_book_snapshots: TopicRouter<OrderBook>,
     pub(crate) router_mark_prices: TopicRouter<MarkPriceUpdate>,
     pub(crate) router_index_prices: TopicRouter<IndexPriceUpdate>,
     pub(crate) router_funding_rates: TopicRouter<FundingRateUpdate>,
-    pub(crate) router_instrument_close: TopicRouter<InstrumentClose>,
-    pub(crate) router_book_snapshots: TopicRouter<OrderBook>,
     pub(crate) router_order_events: TopicRouter<OrderEventAny>,
     pub(crate) router_position_events: TopicRouter<PositionEvent>,
     pub(crate) router_account_state: TopicRouter<AccountState>,
@@ -250,11 +251,18 @@ pub struct MessageBus {
     pub(crate) router_defi_collects: TopicRouter<nautilus_model::defi::PoolFeeCollect>, // nautilus-import-ok
     #[cfg(feature = "defi")]
     pub(crate) router_defi_flash: TopicRouter<nautilus_model::defi::PoolFlash>, // nautilus-import-ok
+    #[cfg(feature = "defi")]
+    pub(crate) endpoints_defi_data: IntoEndpointMap<nautilus_model::defi::DefiData>, // nautilus-import-ok
     pub(crate) endpoints_quotes: EndpointMap<QuoteTick>,
     pub(crate) endpoints_trades: EndpointMap<TradeTick>,
     pub(crate) endpoints_bars: EndpointMap<Bar>,
-    pub(crate) endpoints_order_events: EndpointMap<OrderEventAny>,
     pub(crate) endpoints_account_state: EndpointMap<AccountState>,
+    pub(crate) endpoints_trading_commands: IntoEndpointMap<TradingCommand>,
+    pub(crate) endpoints_data_commands: IntoEndpointMap<DataCommand>,
+    pub(crate) endpoints_data_responses: IntoEndpointMap<DataResponse>,
+    pub(crate) endpoints_exec_reports: IntoEndpointMap<ExecutionReport>,
+    pub(crate) endpoints_order_events: IntoEndpointMap<OrderEventAny>,
+    pub(crate) endpoints_data: IntoEndpointMap<Data>,
     routers_typed: AHashMap<TypeId, Box<dyn Any>>,
     endpoints_typed: AHashMap<TypeId, Box<dyn Any>>,
 }
@@ -290,12 +298,10 @@ impl MessageBus {
             router_bars: TopicRouter::new(),
             router_deltas: TopicRouter::new(),
             router_depth10: TopicRouter::new(),
-            router_instruments: TopicRouter::new(),
+            router_book_snapshots: TopicRouter::new(),
             router_mark_prices: TopicRouter::new(),
             router_index_prices: TopicRouter::new(),
             router_funding_rates: TopicRouter::new(),
-            router_instrument_close: TopicRouter::new(),
-            router_book_snapshots: TopicRouter::new(),
             router_order_events: TopicRouter::new(),
             router_position_events: TopicRouter::new(),
             router_account_state: TopicRouter::new(),
@@ -314,11 +320,18 @@ impl MessageBus {
             router_defi_collects: TopicRouter::new(),
             #[cfg(feature = "defi")]
             router_defi_flash: TopicRouter::new(),
+            #[cfg(feature = "defi")]
+            endpoints_defi_data: IntoEndpointMap::new(),
             endpoints_quotes: EndpointMap::new(),
             endpoints_trades: EndpointMap::new(),
             endpoints_bars: EndpointMap::new(),
-            endpoints_order_events: EndpointMap::new(),
             endpoints_account_state: EndpointMap::new(),
+            endpoints_trading_commands: IntoEndpointMap::new(),
+            endpoints_data_commands: IntoEndpointMap::new(),
+            endpoints_data_responses: IntoEndpointMap::new(),
+            endpoints_exec_reports: IntoEndpointMap::new(),
+            endpoints_order_events: IntoEndpointMap::new(),
+            endpoints_data: IntoEndpointMap::new(),
             routers_typed: AHashMap::new(),
             endpoints_typed: AHashMap::new(),
         }
@@ -492,6 +505,28 @@ impl MessageBus {
         })
     }
 
+    /// Fills a buffer with handlers matching a topic.
+    pub(crate) fn fill_matching_any_handlers(
+        &mut self,
+        topic: MStr<Topic>,
+        buf: &mut SmallVec<[ShareableMessageHandler; 64]>,
+    ) {
+        if let Some(subs) = self.topics.get(&topic) {
+            for sub in subs {
+                buf.push(sub.handler.clone());
+            }
+        } else {
+            let mut matches = self.find_topic_matches(topic);
+            matches.sort();
+
+            for sub in &matches {
+                buf.push(sub.handler.clone());
+            }
+
+            self.topics.insert(topic, matches);
+        }
+    }
+
     /// Registers a response handler for a specific correlation ID.
     ///
     /// # Errors
@@ -520,8 +555,7 @@ mod tests {
 
     use super::*;
     use crate::msgbus::{
-        self, get_message_bus,
-        handler::ShareableMessageHandler,
+        self, ShareableMessageHandler, get_message_bus,
         matching::is_matching_backtracking,
         stubs::{
             check_handler_was_called, get_call_check_shareable_handler, get_stub_shareable_handler,

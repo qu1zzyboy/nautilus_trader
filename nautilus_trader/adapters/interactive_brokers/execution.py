@@ -15,10 +15,12 @@
 
 import asyncio
 import json
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any
 
-from ibapi.commission_report import CommissionReport
+import pandas as pd
+from ibapi.commission_and_fees_report import CommissionAndFeesReport
 from ibapi.const import UNSET_DECIMAL
 from ibapi.const import UNSET_DOUBLE
 from ibapi.execution import Execution
@@ -36,7 +38,6 @@ from ibapi.tag_value import TagValue
 
 from nautilus_trader.adapters.interactive_brokers.client import InteractiveBrokersClient
 from nautilus_trader.adapters.interactive_brokers.client.common import IBPosition
-from nautilus_trader.adapters.interactive_brokers.common import IB_VENUE
 from nautilus_trader.adapters.interactive_brokers.common import IBContract
 from nautilus_trader.adapters.interactive_brokers.common import IBOrderTags
 from nautilus_trader.adapters.interactive_brokers.config import InteractiveBrokersExecClientConfig
@@ -74,8 +75,10 @@ from nautilus_trader.execution.messages import GenerateOrderStatusReport
 from nautilus_trader.execution.messages import GenerateOrderStatusReports
 from nautilus_trader.execution.messages import GeneratePositionStatusReports
 from nautilus_trader.execution.messages import ModifyOrder
+from nautilus_trader.execution.messages import QueryAccount
 from nautilus_trader.execution.messages import SubmitOrder
 from nautilus_trader.execution.messages import SubmitOrderList
+from nautilus_trader.execution.reports import ExecutionMassStatus
 from nautilus_trader.execution.reports import FillReport
 from nautilus_trader.execution.reports import OrderStatusReport
 from nautilus_trader.execution.reports import PositionStatusReport
@@ -192,10 +195,14 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
         connection_timeout: int = 300,
         track_option_exercise_from_position_update: bool = False,
     ) -> None:
+        # Derive client_id from account_id issuer if name not provided
+        # This ensures client_id matches account_id issuer as required by ExecutionClient
+        client_id_str = name or account_id.get_issuer()
+
         super().__init__(
             loop=loop,
-            client_id=ClientId(name or f"{IB_VENUE.value}"),
-            venue=IB_VENUE,
+            client_id=ClientId(client_id_str),
+            venue=None,  # Multi-venue broker - route by account_id instead
             oms_type=OmsType.NETTING,
             instrument_provider=instrument_provider,
             account_type=AccountType.MARGIN,
@@ -597,7 +604,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
         self,
         execution: Execution,
         contract: IBContract,
-        commission_report: CommissionReport,
+        commission_report: CommissionAndFeesReport,
         instrument,
         ts_init: int,
     ) -> FillReport:
@@ -630,7 +637,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
 
         # Create commission
         commission = Money(
-            commission_report.commission,
+            commission_report.commissionAndFees,
             Currency.from_str(commission_report.currency),
         )
 
@@ -732,6 +739,112 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
             report.append(position_status)
 
         return report
+
+    async def generate_mass_status(
+        self,
+        lookback_mins: int | None = None,
+    ) -> ExecutionMassStatus | None:
+        """
+        Generate an `ExecutionMassStatus` report.
+
+        Overrides base implementation to derive venue from reports since IB is multi-venue.
+
+        Parameters
+        ----------
+        lookback_mins : int, optional
+            The maximum lookback for querying closed orders, trades and positions.
+
+        Returns
+        -------
+        ExecutionMassStatus or ``None``
+
+        """
+        self._log.info("Generating ExecutionMassStatus...")
+
+        self.reconciliation_active = True
+
+        since: pd.Timestamp | None = None
+        if lookback_mins is not None:
+            since = self._clock.utc_now() - timedelta(minutes=lookback_mins)
+
+        order_status_command = GenerateOrderStatusReports(
+            instrument_id=None,
+            start=since,
+            end=None,
+            open_only=False,
+            command_id=UUID4(),
+            ts_init=self._clock.timestamp_ns(),
+        )
+        fill_reports_command = GenerateFillReports(
+            instrument_id=None,
+            venue_order_id=None,
+            start=since,
+            end=None,
+            command_id=UUID4(),
+            ts_init=self._clock.timestamp_ns(),
+        )
+        position_status_command = GeneratePositionStatusReports(
+            instrument_id=None,
+            start=since,
+            end=None,
+            command_id=UUID4(),
+            ts_init=self._clock.timestamp_ns(),
+        )
+
+        try:
+            reports = await asyncio.gather(
+                self.generate_order_status_reports(order_status_command),
+                self.generate_fill_reports(fill_reports_command),
+                self.generate_position_status_reports(position_status_command),
+            )
+
+            order_reports = reports[0]
+            fill_reports = reports[1]
+            position_reports = reports[2]
+
+            # Pass None for venue (multi-venue broker) - will be derived from account_id in to_pyo3()
+            mass_status = ExecutionMassStatus(
+                client_id=self.id,
+                account_id=self.account_id,
+                venue=None,
+                report_id=UUID4(),
+                ts_init=self._clock.timestamp_ns(),
+            )
+
+            mass_status.add_order_reports(reports=order_reports)
+            mass_status.add_fill_reports(reports=fill_reports)
+            mass_status.add_position_reports(reports=position_reports)
+
+            return mass_status
+        except Exception as e:
+            self._log.exception("Cannot reconcile execution state", e)
+            return None
+        finally:
+            self.reconciliation_active = False
+
+    async def _query_account(self, _command: QueryAccount) -> None:
+        # This method triggers a fresh request for account summary information,
+        # which will update the account balances and margins when received.
+        self._log.debug("Querying account state")
+
+        # Clear the account summary cache to force a fresh update
+        self._account_summary.clear()
+        self._account_summary_loaded.clear()
+
+        # Request fresh account summary data
+        self._client.subscribe_account_summary()
+
+        # Wait for the account summary to be loaded with timeout to prevent deadlock
+        try:
+            await asyncio.wait_for(
+                self._account_summary_loaded.wait(),
+                timeout=self._connection_timeout,
+            )
+        except TimeoutError:
+            self._log.error(
+                f"Timeout waiting for account summary after {self._connection_timeout}s",
+            )
+            raise
 
     async def _submit_order(self, command: SubmitOrder) -> None:
         PyCondition.type(command, SubmitOrder, "command")
@@ -1200,7 +1313,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
                 # Store all available fields to Cache (for now until permanent solution)
                 self._cache.add(
                     f"accountSummary:{self.account_id.get_id()}",
-                    json.dumps(self._account_summary).encode("utf-8"),
+                    json.dumps(self._account_summary, default=str).encode("utf-8"),
                 )
 
         self._account_summary_loaded.set()
@@ -1284,7 +1397,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
             self._handle_order_event(
                 status=OrderStatus.REJECTED,
                 order=nautilus_order,
-                reason=json.dumps({"whatIf": order_state.__dict__}),
+                reason=json.dumps({"whatIf": order_state.__dict__}, default=str),
             )
         elif order_state.status in [
             "PreSubmitted",
@@ -1412,7 +1525,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
         self,
         order_ref: str,
         execution: Execution,
-        commission_report: CommissionReport,
+        commission_report: CommissionAndFeesReport,
         contract: IBContract,
     ) -> None:
         if not execution.orderRef:
@@ -1480,7 +1593,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
             last_px=Price(converted_execution_price, precision=instrument.price_precision),
             quote_currency=instrument.quote_currency,
             commission=Money(
-                commission_report.commission,
+                commission_report.commissionAndFees,
                 Currency.from_str(commission_report.currency),
             ),
             liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
@@ -1520,7 +1633,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
         nautilus_order: Order,
         execution: Execution,
         contract: IBContract,
-        commission_report: CommissionReport,
+        commission_report: CommissionAndFeesReport,
     ) -> None:
         """
         Handle spread execution by translating leg fills to combo progress and
@@ -1567,7 +1680,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
         nautilus_order: Order,
         execution: Execution,
         contract: IBContract,
-        commission_report: CommissionReport,
+        commission_report: CommissionAndFeesReport,
     ) -> None:
         """
         Generate combo fill from leg fill for order management.
@@ -1609,7 +1722,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
 
             # Combo commission scaled to the number of legs of the combo
             combo_commission = (
-                commission_report.commission
+                commission_report.commissionAndFees
                 * generic_spread_id_n_legs(nautilus_order.instrument_id)
                 / abs(ratio)
             )
@@ -1651,7 +1764,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
         nautilus_order: Order,
         execution: Execution,
         contract: IBContract,
-        commission_report: CommissionReport,
+        commission_report: CommissionAndFeesReport,
     ) -> None:
         """
         Generate individual leg fill for portfolio updates.
@@ -1699,10 +1812,10 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
 
             quantity = Quantity(execution.shares, precision=leg_instrument.size_precision)
 
-            order_side = order_side = OrderSide[ORDER_SIDE_TO_ORDER_ACTION[execution.side]]
+            order_side = OrderSide[ORDER_SIDE_TO_ORDER_ACTION[execution.side]]
 
             commission = Money(
-                commission_report.commission,
+                commission_report.commissionAndFees,
                 Currency.from_str(commission_report.currency),
             )
 

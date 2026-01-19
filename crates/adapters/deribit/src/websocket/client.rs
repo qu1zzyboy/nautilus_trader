@@ -21,9 +21,8 @@
 
 use std::{
     fmt::Debug,
-    num::NonZeroU32,
     sync::{
-        Arc, LazyLock,
+        Arc,
         atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Duration,
@@ -45,7 +44,6 @@ use nautilus_model::{
 use nautilus_network::{
     http::USER_AGENT,
     mode::ConnectionMode,
-    ratelimiter::quota::Quota,
     websocket::{
         AuthTracker, PingHandler, SubscriptionState, WebSocketClient, WebSocketConfig,
         channel_message_handler,
@@ -65,13 +63,12 @@ use super::{
     },
 };
 use crate::common::{
-    consts::{DERIBIT_TESTNET_WS_URL, DERIBIT_WS_URL},
+    consts::{
+        DERIBIT_TESTNET_WS_URL, DERIBIT_WS_ORDER_KEY, DERIBIT_WS_ORDER_QUOTA,
+        DERIBIT_WS_SUBSCRIPTION_KEY, DERIBIT_WS_SUBSCRIPTION_QUOTA, DERIBIT_WS_URL,
+    },
     credential::Credential,
 };
-
-/// Default Deribit WebSocket subscription rate limit: 20 requests per second.
-pub static DERIBIT_WS_SUBSCRIPTION_QUOTA: LazyLock<Quota> =
-    LazyLock::new(|| Quota::per_second(NonZeroU32::new(20).unwrap()));
 
 /// Authentication timeout in seconds.
 const AUTHENTICATION_TIMEOUT_SECS: u64 = 30;
@@ -99,6 +96,7 @@ pub struct DeribitWebSocketClient {
     instruments_cache: Arc<DashMap<Ustr, InstrumentAny>>,
     cancellation_token: CancellationToken,
     account_id: Option<AccountId>,
+    bars_timestamp_on_close: bool,
 }
 
 impl Debug for DeribitWebSocketClient {
@@ -200,6 +198,7 @@ impl DeribitWebSocketClient {
             instruments_cache: Arc::new(DashMap::new()),
             cancellation_token: CancellationToken::new(),
             account_id: None,
+            bars_timestamp_on_close: true,
         })
     }
 
@@ -390,7 +389,13 @@ impl DeribitWebSocketClient {
         };
 
         // Configure rate limits
-        let keyed_quotas = vec![("subscription".to_string(), *DERIBIT_WS_SUBSCRIPTION_QUOTA)];
+        let keyed_quotas = vec![
+            (
+                DERIBIT_WS_SUBSCRIPTION_KEY.to_string(),
+                *DERIBIT_WS_SUBSCRIPTION_QUOTA,
+            ),
+            (DERIBIT_WS_ORDER_KEY.to_string(), *DERIBIT_WS_ORDER_QUOTA),
+        ];
 
         // Connect the WebSocket
         let ws_client = WebSocketClient::connect(
@@ -399,7 +404,7 @@ impl DeribitWebSocketClient {
             Some(ping_handler),
             None, // post_reconnection
             keyed_quotas,
-            Some(*DERIBIT_WS_SUBSCRIPTION_QUOTA), // Default quota
+            Some(*DERIBIT_WS_SUBSCRIPTION_QUOTA), // Default quota for non-order operations
         )
         .await?;
 
@@ -424,6 +429,7 @@ impl DeribitWebSocketClient {
             self.auth_tracker.clone(),
             self.subscriptions_state.clone(),
             self.account_id,
+            self.bars_timestamp_on_close,
         );
 
         // Send client to handler
@@ -626,11 +632,7 @@ impl DeribitWebSocketClient {
         // Determine scope
         let scope = session_name.map(|name| format!("session:{name}"));
 
-        log::info!(
-            "Authenticating WebSocket with API key: {}, scope: {}",
-            credential.api_key_masked(),
-            scope.as_deref().unwrap_or("connection (default)")
-        );
+        log::info!("Authenticating WebSocket...");
 
         let rx = self.auth_tracker.begin();
 
@@ -690,9 +692,12 @@ impl DeribitWebSocketClient {
         self.account_id = Some(account_id);
     }
 
-    // ------------------------------------------------------------------------------------------------
-    // Subscription Methods
-    // ------------------------------------------------------------------------------------------------
+    /// Sets whether bar timestamps should use the close time.
+    ///
+    /// When `true` (default), bar `ts_event` is set to the bar's close time.
+    pub fn set_bars_timestamp_on_close(&mut self, value: bool) {
+        self.bars_timestamp_on_close = value;
+    }
 
     async fn send_subscribe(&self, channels: Vec<String>) -> DeribitWsResult<()> {
         let mut channels_to_subscribe = Vec::new();
@@ -1092,6 +1097,60 @@ impl DeribitWebSocketClient {
         Ok(())
     }
 
+    /// Subscribes to user order updates for all instruments.
+    ///
+    /// Requires authentication. Subscribes to `user.orders.any.any.raw` channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if client is not authenticated or subscription fails.
+    pub async fn subscribe_user_orders(&self) -> DeribitWsResult<()> {
+        if !self.is_authenticated() {
+            return Err(DeribitWsError::Authentication(
+                "User orders subscription requires authentication".to_string(),
+            ));
+        }
+        self.send_subscribe(vec!["user.orders.any.any.raw".to_string()])
+            .await
+    }
+
+    /// Unsubscribes from user order updates for all instruments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if unsubscription fails.
+    pub async fn unsubscribe_user_orders(&self) -> DeribitWsResult<()> {
+        self.send_unsubscribe(vec!["user.orders.any.any.raw".to_string()])
+            .await
+    }
+
+    /// Subscribes to user trade/fill updates for all instruments.
+    ///
+    /// Requires authentication. Subscribes to `user.trades.any.any.raw` channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if client is not authenticated or subscription fails.
+    pub async fn subscribe_user_trades(&self) -> DeribitWsResult<()> {
+        if !self.is_authenticated() {
+            return Err(DeribitWsError::Authentication(
+                "User trades subscription requires authentication".to_string(),
+            ));
+        }
+        self.send_subscribe(vec!["user.trades.any.any.raw".to_string()])
+            .await
+    }
+
+    /// Unsubscribes from user trade/fill updates for all instruments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if unsubscription fails.
+    pub async fn unsubscribe_user_trades(&self) -> DeribitWsResult<()> {
+        self.send_unsubscribe(vec!["user.trades.any.any.raw".to_string()])
+            .await
+    }
+
     /// Subscribes to multiple channels at once.
     ///
     /// # Errors
@@ -1209,6 +1268,7 @@ impl DeribitWebSocketClient {
             amount: quantity.as_decimal(),
             price: Some(price.as_decimal()),
             post_only: None,
+            reject_post_only: None,
             reduce_only: None,
             trigger_price: None,
         };

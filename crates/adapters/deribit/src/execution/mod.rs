@@ -239,6 +239,11 @@ impl DeribitExecutionClient {
             } else {
                 None
             },
+            reject_post_only: if order.is_post_only() {
+                Some(true)
+            } else {
+                None
+            },
             reduce_only: if order.is_reduce_only() {
                 Some(true)
             } else {
@@ -537,6 +542,18 @@ impl ExecutionClient for DeribitExecutionClient {
             .map_err(|e| anyhow::anyhow!("failed to authenticate WebSocket session: {e}"))?;
 
         log::info!("WebSocket client authenticated for execution");
+
+        // Subscribe to user order and trade updates for all instruments
+        self.ws_client
+            .subscribe_user_orders()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to subscribe to user orders: {e}"))?;
+        self.ws_client
+            .subscribe_user_trades()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to subscribe to user trades: {e}"))?;
+
+        log::info!("Subscribed to user order and trade updates");
 
         // Spawn stream handler to dispatch WebSocket messages to the execution engine
         let stream = self.ws_client.stream();

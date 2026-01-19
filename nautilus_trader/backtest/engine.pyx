@@ -3876,6 +3876,22 @@ cdef class OrderMatchingEngine:
                     f"did not match instrument.size_precision={self._size_prec}",
                 )
 
+        # Reset consumption tracking on snapshot (F_SNAPSHOT = 32) or CLEAR action
+        if self._liquidity_consumption and (
+            (delta._mem.flags & 32) or delta._mem.action == BookAction.CLEAR
+        ):
+            self._bid_consumption.clear()
+            self._ask_consumption.clear()
+
+        # Clear consumption tracking on UPDATE or DELETE (level changed or removed)
+        if self._liquidity_consumption and (
+            delta._mem.action == BookAction.UPDATE or delta._mem.action == BookAction.DELETE
+        ):
+            if delta._mem.order.side == OrderSide.SELL:
+                self._ask_consumption.pop(delta._mem.order.price.raw, None)
+            elif delta._mem.order.side == OrderSide.BUY:
+                self._bid_consumption.pop(delta._mem.order.price.raw, None)
+
         self._book.apply_delta(delta)
 
         self.iterate(delta.ts_init)
@@ -3903,6 +3919,7 @@ cdef class OrderMatchingEngine:
             self._log.debug(f"Processing {deltas!r}")
 
         # Validate precisions for ADD and UPDATE actions
+        cdef bint has_snapshot_or_clear = False
         cdef OrderBookDelta delta
         for delta in deltas.deltas:
             if delta._mem.action == BookAction.ADD or delta._mem.action == BookAction.UPDATE:
@@ -3916,6 +3933,22 @@ cdef class OrderMatchingEngine:
                         f"invalid delta size precision={delta._mem.order.size.precision} "
                         f"did not match instrument.size_precision={self._size_prec}",
                     )
+            if (delta._mem.flags & 32) or delta._mem.action == BookAction.CLEAR:
+                has_snapshot_or_clear = True
+
+            # Clear consumption tracking on UPDATE or DELETE (level changed or removed)
+            if self._liquidity_consumption and (
+                delta._mem.action == BookAction.UPDATE or delta._mem.action == BookAction.DELETE
+            ):
+                if delta._mem.order.side == OrderSide.SELL:
+                    self._ask_consumption.pop(delta._mem.order.price.raw, None)
+                elif delta._mem.order.side == OrderSide.BUY:
+                    self._bid_consumption.pop(delta._mem.order.price.raw, None)
+
+        # Reset consumption tracking on snapshot (F_SNAPSHOT = 32) or CLEAR action
+        if self._liquidity_consumption and has_snapshot_or_clear:
+            self._bid_consumption.clear()
+            self._ask_consumption.clear()
 
         self._book.apply_deltas(deltas)
 
@@ -3972,6 +4005,11 @@ cdef class OrderMatchingEngine:
                     f"invalid depth ask size precision={order._mem.size.precision} "
                     f"did not match instrument.size_precision={self._size_prec}",
                 )
+
+        # Reset consumption tracking on snapshot (F_SNAPSHOT = 32)
+        if self._liquidity_consumption and (depth._mem.flags & 32):
+            self._bid_consumption.clear()
+            self._ask_consumption.clear()
 
         self._book.apply_depth(depth)
 
@@ -5172,7 +5210,7 @@ cdef class OrderMatchingEngine:
         self._has_targets = False
 
         # Instrument expiration
-        if (self._instrument_has_expiration and timestamp_ns >= self.instrument.expiration_ns) or self._instrument_close is not None:
+        if (self._instrument_has_expiration and timestamp_ns > self.instrument.expiration_ns) or self._instrument_close is not None:
             self._log.info(f"{self.instrument.id} reached expiration")
 
             # Cancel all open orders
@@ -5185,7 +5223,7 @@ cdef class OrderMatchingEngine:
                     trader_id=position.trader_id,
                     strategy_id=position.strategy_id,
                     instrument_id=position.instrument_id,
-                    client_order_id=ClientOrderId(str(uuid.uuid4())),
+                    client_order_id=ClientOrderId(f"EXPIRATION-LEG-{uuid.uuid4()}"),
                     order_side=Order.closing_side_c(position.side),
                     quantity=position.quantity,
                     init_id=UUID4(),
@@ -5283,6 +5321,7 @@ cdef class OrderMatchingEngine:
             return fills
 
         cdef dict[PriceRaw, tuple[QuantityRaw, QuantityRaw]] consumption
+
         if order_side == OrderSide.BUY:
             consumption = self._ask_consumption
         elif order_side == OrderSide.SELL:
@@ -5296,15 +5335,22 @@ cdef class OrderMatchingEngine:
         cdef:
             Price price
             Quantity qty
-            PriceRaw price_raw
-            double book_size_f64
-            QuantityRaw book_size_raw
+            Quantity level_size
             tuple level_state
+            PriceRaw price_raw
+            PriceRaw p_raw
+            QuantityRaw qty_raw
+            QuantityRaw q_raw
+            QuantityRaw level_size_raw
             QuantityRaw original_size
             QuantityRaw consumed
             QuantityRaw available
             QuantityRaw adjusted_qty_raw
+            QuantityRaw fill_total
             Quantity adjusted_qty
+
+        # Aggregated fill quantities per price (computed on-demand for missing levels)
+        cdef dict[PriceRaw, QuantityRaw] fill_totals = None
 
         for fill in fills:
             if max_qty_raw > 0 and remaining_qty == 0:
@@ -5315,22 +5361,60 @@ cdef class OrderMatchingEngine:
             price_raw = price._mem.raw
 
             level_size = self._book.get_quantity_at_level(price, order_side, self._size_prec)
+            level_size_raw = level_size._mem.raw
 
             level_state = consumption.get(price_raw)
+
+            # Handle race condition where level no longer exists in book (returns 0)
+            if level_size_raw == 0:
+                # Level was deleted/modified between fill determination and consumption.
+                # Use aggregated fill total for this price (handles L3 books with multiple
+                # fills at same price). If prior state exists, use max of prior original_size
+                # and fill total to ensure all fills can be processed.
+
+                if fill_totals is None:
+                    fill_totals = {}
+                    for f in fills:
+                        p_raw = (<Price>f[0])._mem.raw
+                        q_raw = (<Quantity>f[1])._mem.raw
+                        if p_raw in fill_totals:
+                            fill_totals[p_raw] += q_raw
+                        else:
+                            fill_totals[p_raw] = q_raw
+
+                fill_total = fill_totals.get(price_raw, qty._mem.raw)
+
+                if level_state is not None:
+                    level_size_raw = max(level_state[0], fill_total)
+                    self._log.debug(
+                        f"Liquidity consumption: level {price} not found in book, "
+                        f"using max of prior size {level_state[0]} and fill total {fill_total}",
+                    )
+                else:
+                    level_size_raw = fill_total
+                    self._log.debug(
+                        f"Liquidity consumption: level {price} not found in book, "
+                        f"using aggregated fill total {fill_total} as fallback",
+                    )
+
             if level_state is None:
-                original_size = level_size._mem.raw
+                original_size = level_size_raw
                 consumed = 0
             else:
                 original_size = level_state[0]
                 consumed = level_state[1]
 
             # Reset consumption when book size changes (fresh data)
-            if original_size != level_size._mem.raw:
-                original_size = level_size._mem.raw
+            if original_size != level_size_raw:
+                original_size = level_size_raw
                 consumed = 0
 
             available = original_size - consumed if original_size > consumed else 0
             if available == 0:
+                self._log.debug(
+                    f"Liquidity consumed: skipping level {price} "
+                    f"(original_size={original_size}, consumed={consumed}, level_size_raw={level_size_raw})",
+                )
                 continue
 
             adjusted_qty_raw = min(qty._mem.raw, available)
@@ -5925,7 +6009,7 @@ cdef class OrderMatchingEngine:
             return
 
         # Generate leg fills for spread orders after normal combo fill processing
-        if instrument.is_spread() and len(instrument.legs()) > 1:
+        if instrument.is_spread():
             self._generate_spread_leg_fills(order, fills, liquidity_side)
 
     cdef void _generate_spread_leg_fills(

@@ -60,11 +60,16 @@ use nautilus_common::{
         UnsubscribeBookDeltas, UnsubscribeBookDepth10, UnsubscribeBookSnapshots,
         UnsubscribeCommand,
     },
-    msgbus::{self, MStr, Topic, TypedHandler, switchboard},
+    msgbus::{
+        self, MStr, Topic, TypedHandler, TypedIntoHandler,
+        handler::ShareableMessageHandler,
+        switchboard::{self, MessagingSwitchboard},
+    },
+    runner::get_data_cmd_sender,
     timer::{TimeEvent, TimeEventCallback},
 };
 use nautilus_core::{
-    UUID4,
+    UUID4, WeakCell,
     correctness::{
         FAILED, check_key_in_map, check_key_not_in_map, check_predicate_false, check_predicate_true,
     },
@@ -223,6 +228,74 @@ impl DataEngine {
             #[cfg(feature = "defi")]
             pool_event_buffers: AHashMap::new(),
         }
+    }
+
+    /// Registers all message bus handlers for the data engine.
+    pub fn register_msgbus_handlers(engine: Rc<RefCell<Self>>) {
+        let weak = WeakCell::from(Rc::downgrade(&engine));
+
+        let weak1 = weak.clone();
+        msgbus::register_data_command_endpoint(
+            MessagingSwitchboard::data_engine_execute(),
+            TypedIntoHandler::from(move |cmd: DataCommand| {
+                if let Some(rc) = weak1.upgrade() {
+                    rc.borrow_mut().execute(cmd);
+                }
+            }),
+        );
+
+        msgbus::register_data_command_endpoint(
+            MessagingSwitchboard::data_engine_queue_execute(),
+            TypedIntoHandler::from(move |cmd: DataCommand| {
+                get_data_cmd_sender().clone().execute(cmd);
+            }),
+        );
+
+        // Register process handler (polymorphic - uses Any)
+        let weak2 = weak.clone();
+        msgbus::register_any(
+            MessagingSwitchboard::data_engine_process(),
+            ShareableMessageHandler::from_any(move |data: &dyn Any| {
+                if let Some(rc) = weak2.upgrade() {
+                    rc.borrow_mut().process(data);
+                }
+            }),
+        );
+
+        // Register process_data handler (typed - takes ownership)
+        let weak3 = weak.clone();
+        msgbus::register_data_endpoint(
+            MessagingSwitchboard::data_engine_process_data(),
+            TypedIntoHandler::from(move |data: Data| {
+                if let Some(rc) = weak3.upgrade() {
+                    rc.borrow_mut().process_data(data);
+                }
+            }),
+        );
+
+        // Register process_defi_data handler (typed - takes ownership)
+        #[cfg(feature = "defi")]
+        {
+            let weak4 = weak.clone();
+            msgbus::register_defi_data_endpoint(
+                MessagingSwitchboard::data_engine_process_defi_data(),
+                TypedIntoHandler::from(move |data: DefiData| {
+                    if let Some(rc) = weak4.upgrade() {
+                        rc.borrow_mut().process_defi_data(data);
+                    }
+                }),
+            );
+        }
+
+        let weak5 = weak;
+        msgbus::register_data_response_endpoint(
+            MessagingSwitchboard::data_engine_response(),
+            TypedIntoHandler::from(move |resp: DataResponse| {
+                if let Some(rc) = weak5.upgrade() {
+                    rc.borrow_mut().response(resp);
+                }
+            }),
+        );
     }
 
     /// Returns a read-only reference to the engines clock.
@@ -603,8 +676,8 @@ impl DataEngine {
     /// Executes a `DataCommand` by delegating to subscribe, unsubscribe, or request handlers.
     ///
     /// Errors during execution are logged.
-    pub fn execute(&mut self, cmd: &DataCommand) {
-        if let Err(e) = match cmd {
+    pub fn execute(&mut self, cmd: DataCommand) {
+        if let Err(e) = match &cmd {
             DataCommand::Subscribe(c) => self.execute_subscribe(c),
             DataCommand::Unsubscribe(c) => self.execute_unsubscribe(c),
             DataCommand::Request(c) => self.execute_request(c),
@@ -745,18 +818,7 @@ impl DataEngine {
     ///
     /// Currently supports `InstrumentAny` and `FundingRateUpdate`; unrecognized types are logged as errors.
     pub fn process(&mut self, data: &dyn Any) {
-        // TODO: Eventually these could be added to the `Data` enum? process here for now
-        if let Some(data) = data.downcast_ref::<Data>() {
-            self.process_data(data.clone()); // TODO: Optimize (not necessary if we change handler)
-            return;
-        }
-
-        #[cfg(feature = "defi")]
-        if let Some(data) = data.downcast_ref::<DefiData>() {
-            self.process_defi_data(data.clone()); // TODO: Optimize (not necessary if we change handler)
-            return;
-        }
-
+        // TODO: Eventually these can be added to the `Data` enum (C/Cython blocking), process here for now
         if let Some(instrument) = data.downcast_ref::<InstrumentAny>() {
             self.handle_instrument(instrument.clone());
         } else if let Some(funding_rate) = data.downcast_ref::<FundingRateUpdate>() {
@@ -764,6 +826,8 @@ impl DataEngine {
         } else {
             log::error!("Cannot process data {data:?}, type is unrecognized");
         }
+
+        // TODO: Add custom data handling here
     }
 
     /// Processes a `Data` enum instance, dispatching to appropriate handlers.
@@ -815,7 +879,7 @@ impl DataEngine {
         }
 
         let topic = switchboard::get_instrument_topic(instrument.id());
-        msgbus::publish_instrument(topic, &instrument);
+        msgbus::publish_any(topic, &instrument);
     }
 
     fn handle_delta(&mut self, delta: OrderBookDelta) {
@@ -984,7 +1048,7 @@ impl DataEngine {
 
     fn handle_instrument_close(&mut self, close: InstrumentClose) {
         let topic = switchboard::get_instrument_close_topic(close.instrument_id);
-        msgbus::publish_instrument_close(topic, &close);
+        msgbus::publish_any(topic, &close);
     }
 
     // -- SUBSCRIPTION HANDLERS -------------------------------------------------------------------
@@ -1269,10 +1333,10 @@ impl DataEngine {
 
         // Unsubscribe from topics that no longer have subscriptions
         if !has_deltas {
-            msgbus::unsubscribe_deltas(deltas_topic.into(), &deltas_handler);
+            msgbus::unsubscribe_book_deltas(deltas_topic.into(), &deltas_handler);
         }
         if !has_depth10 {
-            msgbus::unsubscribe_depth10(depth_topic.into(), &depth_handler);
+            msgbus::unsubscribe_book_depth10(depth_topic.into(), &depth_handler);
         }
 
         // Remove BookUpdater only when no subscriptions remain
@@ -1378,13 +1442,13 @@ impl DataEngine {
         // Subscribe to deltas (typed router handles duplicates)
         let topic = switchboard::get_book_deltas_topic(*instrument_id);
         let deltas_handler = TypedHandler::new(updater.clone());
-        msgbus::subscribe_deltas(topic.into(), deltas_handler, Some(self.msgbus_priority));
+        msgbus::subscribe_book_deltas(topic.into(), deltas_handler, Some(self.msgbus_priority));
 
         // Subscribe to depth10 if not only_deltas
         if !only_deltas {
             let topic = switchboard::get_book_depth10_topic(*instrument_id);
             let depth_handler = TypedHandler::new(updater);
-            msgbus::subscribe_depth10(topic.into(), depth_handler, Some(self.msgbus_priority));
+            msgbus::subscribe_book_depth10(topic.into(), depth_handler, Some(self.msgbus_priority));
         }
 
         Ok(())

@@ -15,7 +15,7 @@
 
 mod common;
 
-use std::{any::Any, cell::RefCell, num::NonZeroUsize, rc::Rc};
+use std::{any::Any, cell::RefCell, num::NonZeroUsize, rc::Rc, time::Duration};
 #[cfg(feature = "defi")]
 use std::{str::FromStr, sync::Arc};
 
@@ -38,19 +38,19 @@ use nautilus_common::{
     messages::data::{
         DataCommand, RequestBars, RequestBookDepth, RequestBookSnapshot, RequestCommand,
         RequestCustomData, RequestInstrument, RequestInstruments, RequestQuotes, RequestTrades,
-        SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth10, SubscribeCommand,
-        SubscribeCustomData, SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
-        SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades, UnsubscribeBars,
-        UnsubscribeBookDeltas, UnsubscribeBookDepth10, UnsubscribeCommand, UnsubscribeCustomData,
-        UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeInstrument,
-        UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
+        SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth10, SubscribeBookSnapshots,
+        SubscribeCommand, SubscribeCustomData, SubscribeFundingRates, SubscribeIndexPrices,
+        SubscribeInstrument, SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades,
+        UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth10, UnsubscribeCommand,
+        UnsubscribeCustomData, UnsubscribeFundingRates, UnsubscribeIndexPrices,
+        UnsubscribeInstrument, UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
     },
     msgbus::{
-        self, MessageBus,
-        handler::ShareableMessageHandler,
+        self, MessageBus, TypedIntoHandler,
         stubs::get_typed_message_saving_handler,
         switchboard::{self, MessagingSwitchboard},
     },
+    testing::wait_until,
 };
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_data::{client::DataClientAdapter, engine::DataEngine};
@@ -69,11 +69,12 @@ use nautilus_model::{
     data::{
         Bar, BarType, Data, DataType, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate,
         OrderBookDeltas, OrderBookDeltas_API, OrderBookDepth10, QuoteTick, TradeTick,
-        stubs::{stub_delta, stub_deltas, stub_depth10},
+        stubs::{OrderBookDeltaTestBuilder, stub_delta, stub_deltas, stub_depth10},
     },
     enums::{BookType, PriceType},
     identifiers::{ClientId, TraderId, Venue},
     instruments::{CurrencyPair, Instrument, InstrumentAny, stubs::audusd_sim},
+    orderbook::OrderBook,
     stubs::TestDefault,
     types::Price,
 };
@@ -112,12 +113,12 @@ fn data_engine(
     let data_engine = Rc::new(RefCell::new(DataEngine::new(clock, cache, None)));
 
     let data_engine_clone = data_engine.clone();
-    let handler = ShareableMessageHandler::from_typed(move |cmd: &DataCommand| {
+    let handler = TypedIntoHandler::from(move |cmd: DataCommand| {
         data_engine_clone.borrow_mut().execute(cmd);
     });
 
     let endpoint = MessagingSwitchboard::data_engine_execute();
-    msgbus::register_any(endpoint, handler);
+    msgbus::register_data_command_endpoint(endpoint, handler);
 
     data_engine
 }
@@ -355,7 +356,7 @@ fn test_execute_subscribe_custom_data(
         None,
     );
     let sub_cmd = DataCommand::Subscribe(SubscribeCommand::Data(sub));
-    data_engine.execute(&sub_cmd);
+    data_engine.execute(sub_cmd.clone());
 
     assert!(data_engine.subscribed_custom_data().contains(&data_type));
     {
@@ -372,7 +373,7 @@ fn test_execute_subscribe_custom_data(
         None,
     );
     let unsub_cmd = DataCommand::Unsubscribe(UnsubscribeCommand::Data(unsub));
-    data_engine.execute(&unsub_cmd);
+    data_engine.execute(unsub_cmd.clone());
 
     assert!(!data_engine.subscribed_custom_data().contains(&data_type));
     assert_eq!(recorder.borrow().as_slice(), &[sub_cmd, unsub_cmd]);
@@ -411,7 +412,7 @@ fn test_execute_subscribe_book_deltas(
         None,
         None,
     )));
-    data_engine.execute(&sub_cmd);
+    data_engine.execute(sub_cmd.clone());
 
     assert!(
         data_engine
@@ -432,7 +433,7 @@ fn test_execute_subscribe_book_deltas(
             None,
             None,
         )));
-    data_engine.execute(&unsub_cmd);
+    data_engine.execute(unsub_cmd.clone());
 
     assert!(
         !data_engine
@@ -481,7 +482,7 @@ fn test_unsubscribe_book_deltas_removes_book_updater(
         None,
         None,
     )));
-    data_engine.execute(&sub_cmd);
+    data_engine.execute(sub_cmd);
 
     // BookUpdater should be subscribed
     assert_eq!(msgbus::subscriber_count_deltas(deltas_topic), 1);
@@ -497,7 +498,7 @@ fn test_unsubscribe_book_deltas_removes_book_updater(
             None,
             None,
         )));
-    data_engine.execute(&unsub_cmd);
+    data_engine.execute(unsub_cmd);
 
     // BookUpdater should be unsubscribed and removed
     assert_eq!(msgbus::subscriber_count_deltas(deltas_topic), 0);
@@ -541,7 +542,7 @@ fn test_unsubscribe_depth10_keeps_deltas_book_updater(
             None,
             None,
         )));
-    data_engine.execute(&sub_deltas);
+    data_engine.execute(sub_deltas);
 
     let sub_depth =
         DataCommand::Subscribe(SubscribeCommand::BookDepth10(SubscribeBookDepth10::new(
@@ -556,7 +557,7 @@ fn test_unsubscribe_depth10_keeps_deltas_book_updater(
             None,
             None,
         )));
-    data_engine.execute(&sub_depth);
+    data_engine.execute(sub_depth);
 
     // BookUpdater subscribed to both topics
     assert_eq!(msgbus::subscriber_count_deltas(deltas_topic), 1);
@@ -574,7 +575,7 @@ fn test_unsubscribe_depth10_keeps_deltas_book_updater(
             None,
         ),
     ));
-    data_engine.execute(&unsub_depth);
+    data_engine.execute(unsub_depth);
 
     // BookUpdater should remain subscribed to deltas but not depth10
     assert_eq!(msgbus::subscriber_count_deltas(deltas_topic), 1);
@@ -591,7 +592,7 @@ fn test_unsubscribe_depth10_keeps_deltas_book_updater(
             None,
             None,
         )));
-    data_engine.execute(&unsub_deltas);
+    data_engine.execute(unsub_deltas);
 
     assert_eq!(msgbus::subscriber_count_deltas(deltas_topic), 0);
     assert_eq!(msgbus::subscriber_count_depth10(depth_topic), 0);
@@ -628,7 +629,7 @@ fn test_execute_subscribe_instrument(
         None,
     );
     let sub_cmd = DataCommand::Subscribe(SubscribeCommand::Instrument(sub));
-    data_engine.execute(&sub_cmd);
+    data_engine.execute(sub_cmd.clone());
 
     assert!(
         data_engine
@@ -649,7 +650,7 @@ fn test_execute_subscribe_instrument(
         None,
     );
     let unsub_cmd = DataCommand::Unsubscribe(UnsubscribeCommand::Instrument(unsub));
-    data_engine.execute(&unsub_cmd);
+    data_engine.execute(unsub_cmd.clone());
 
     assert!(
         !data_engine
@@ -690,7 +691,7 @@ fn test_execute_subscribe_quotes(
         None,
     );
     let sub_cmd = DataCommand::Subscribe(SubscribeCommand::Quotes(sub));
-    data_engine.execute(&sub_cmd);
+    data_engine.execute(sub_cmd.clone());
 
     assert!(data_engine.subscribed_quotes().contains(&audusd_sim.id));
     {
@@ -707,7 +708,7 @@ fn test_execute_subscribe_quotes(
         None,
     );
     let unsub_cmd = DataCommand::Unsubscribe(UnsubscribeCommand::Quotes(unsub));
-    data_engine.execute(&unsub_cmd);
+    data_engine.execute(unsub_cmd.clone());
 
     assert!(!data_engine.subscribed_quotes().contains(&audusd_sim.id));
     assert_eq!(recorder.borrow().as_slice(), &[sub_cmd, unsub_cmd]);
@@ -744,7 +745,7 @@ fn test_execute_subscribe_trades(
         None,
     );
     let sub_cmd = DataCommand::Subscribe(SubscribeCommand::Trades(sub));
-    data_engine.execute(&sub_cmd);
+    data_engine.execute(sub_cmd.clone());
 
     assert!(data_engine.subscribed_trades().contains(&audusd_sim.id));
     {
@@ -761,7 +762,7 @@ fn test_execute_subscribe_trades(
         None,
     );
     let unsub_cmd = DataCommand::Unsubscribe(UnsubscribeCommand::Trades(ubsub));
-    data_engine.execute(&unsub_cmd);
+    data_engine.execute(unsub_cmd.clone());
 
     assert!(!data_engine.subscribed_trades().contains(&audusd_sim.id));
     assert_eq!(recorder.borrow().as_slice(), &[sub_cmd, unsub_cmd]);
@@ -803,7 +804,7 @@ fn test_execute_subscribe_bars(
         None,
     );
     let sub_cmd = DataCommand::Subscribe(SubscribeCommand::Bars(sub));
-    data_engine.execute(&sub_cmd);
+    data_engine.execute(sub_cmd.clone());
 
     assert!(data_engine.subscribed_bars().contains(&bar_type));
     {
@@ -820,7 +821,7 @@ fn test_execute_subscribe_bars(
         None,
     );
     let unsub_cmd = DataCommand::Unsubscribe(UnsubscribeCommand::Bars(unsub));
-    data_engine.execute(&unsub_cmd);
+    data_engine.execute(unsub_cmd.clone());
 
     assert_eq!(audusd_sim.id(), bar_type.instrument_id());
     assert!(!data_engine.subscribed_bars().contains(&bar_type));
@@ -858,7 +859,7 @@ fn test_execute_subscribe_mark_prices(
         None,
     );
     let sub_cmd = DataCommand::Subscribe(SubscribeCommand::MarkPrices(sub));
-    data_engine.execute(&sub_cmd);
+    data_engine.execute(sub_cmd.clone());
 
     assert!(
         data_engine
@@ -879,7 +880,7 @@ fn test_execute_subscribe_mark_prices(
         None,
     );
     let unsub_cmd = DataCommand::Unsubscribe(UnsubscribeCommand::MarkPrices(unsub));
-    data_engine.execute(&unsub_cmd);
+    data_engine.execute(unsub_cmd.clone());
 
     assert!(
         !data_engine
@@ -919,7 +920,7 @@ fn test_execute_subscribe_index_prices(
         None,
         None,
     )));
-    data_engine.execute(&sub_cmd);
+    data_engine.execute(sub_cmd.clone());
 
     assert!(
         data_engine
@@ -941,7 +942,7 @@ fn test_execute_subscribe_index_prices(
             None,
         ),
     ));
-    data_engine.execute(&unsub_cmd);
+    data_engine.execute(unsub_cmd.clone());
 
     assert!(
         !data_engine
@@ -984,7 +985,7 @@ fn test_execute_subscribe_funding_rates(
         None,
     );
     let sub_cmd = DataCommand::Subscribe(SubscribeCommand::FundingRates(sub));
-    data_engine.execute(&sub_cmd);
+    data_engine.execute(sub_cmd.clone());
 
     assert!(
         data_engine
@@ -1005,7 +1006,7 @@ fn test_execute_subscribe_funding_rates(
         None,
     );
     let unsub_cmd = DataCommand::Unsubscribe(UnsubscribeCommand::FundingRates(unsub));
-    data_engine.execute(&unsub_cmd);
+    data_engine.execute(unsub_cmd.clone());
 
     assert!(
         !data_engine
@@ -1050,7 +1051,7 @@ fn test_execute_request_data(
         params: None,
     };
     let cmd = DataCommand::Request(RequestCommand::Data(req));
-    data_engine.execute(&cmd);
+    data_engine.execute(cmd.clone());
 
     assert_eq!(recorder.borrow()[0], cmd);
 }
@@ -1086,7 +1087,7 @@ fn test_execute_request_instrument(
         None,
     );
     let cmd = DataCommand::Request(RequestCommand::Instrument(req));
-    data_engine.execute(&cmd);
+    data_engine.execute(cmd.clone());
 
     assert_eq!(recorder.borrow()[0], cmd);
 }
@@ -1121,7 +1122,7 @@ fn test_execute_request_instruments(
         None,
     );
     let cmd = DataCommand::Request(RequestCommand::Instruments(req));
-    data_engine.execute(&cmd);
+    data_engine.execute(cmd.clone());
 
     assert_eq!(recorder.borrow()[0], cmd);
 }
@@ -1156,7 +1157,7 @@ fn test_execute_request_book_snapshot(
         None, // params
     );
     let cmd = DataCommand::Request(RequestCommand::BookSnapshot(req));
-    data_engine.execute(&cmd);
+    data_engine.execute(cmd.clone());
 
     assert_eq!(recorder.borrow()[0], cmd);
 }
@@ -1193,7 +1194,7 @@ fn test_execute_request_quotes(
         None, // params
     );
     let cmd = DataCommand::Request(RequestCommand::Quotes(req));
-    data_engine.execute(&cmd);
+    data_engine.execute(cmd.clone());
 
     assert_eq!(recorder.borrow()[0], cmd);
 }
@@ -1230,7 +1231,7 @@ fn test_execute_request_trades(
         None, // params
     );
     let cmd = DataCommand::Request(RequestCommand::Trades(req));
-    data_engine.execute(&cmd);
+    data_engine.execute(cmd.clone());
 
     assert_eq!(recorder.borrow()[0], cmd);
 }
@@ -1266,7 +1267,7 @@ fn test_execute_request_bars(
         None, // params
     );
     let cmd = DataCommand::Request(RequestCommand::Bars(req));
-    data_engine.execute(&cmd);
+    data_engine.execute(cmd.clone());
 
     assert_eq!(recorder.borrow()[0], cmd);
 }
@@ -1304,7 +1305,7 @@ fn test_execute_request_order_book_depth(
         None, // params
     );
     let cmd = DataCommand::Request(RequestCommand::BookDepth(req));
-    data_engine.execute(&cmd);
+    data_engine.execute(cmd.clone());
 
     assert_eq!(recorder.borrow()[0], cmd);
 }
@@ -1336,17 +1337,16 @@ fn test_process_instrument(
     );
     let cmd = DataCommand::Subscribe(SubscribeCommand::Instrument(sub));
 
-    let endpoint = MessagingSwitchboard::data_engine_execute();
-    msgbus::send_any(endpoint, &cmd as &dyn Any);
+    data_engine.borrow_mut().execute(cmd);
 
-    let (typed_handler, saving_handler) = get_typed_message_saving_handler::<InstrumentAny>(None);
+    let handler = msgbus::stubs::get_message_saving_handler::<InstrumentAny>(None);
     let topic = switchboard::get_instrument_topic(audusd_sim.id());
-    msgbus::subscribe_instruments(topic.into(), typed_handler, None);
+    msgbus::subscribe_any(topic.into(), handler.clone(), None);
 
     let mut data_engine = data_engine.borrow_mut();
     data_engine.process(&audusd_sim as &dyn Any);
     let cache = &data_engine.get_cache();
-    let messages = saving_handler.get_messages();
+    let messages = msgbus::stubs::get_saved_messages::<InstrumentAny>(handler);
 
     assert_eq!(
         cache.instrument(&audusd_sim.id()),
@@ -1380,13 +1380,12 @@ fn test_process_book_delta(
     );
     let cmd = DataCommand::Subscribe(SubscribeCommand::BookDeltas(sub));
 
-    let endpoint = MessagingSwitchboard::data_engine_execute();
-    msgbus::send_any(endpoint, &cmd as &dyn Any);
+    data_engine.borrow_mut().execute(cmd);
 
     let delta = stub_delta();
     let (handler, saver) = get_typed_message_saving_handler::<OrderBookDeltas>(None);
     let topic = switchboard::get_book_deltas_topic(delta.instrument_id);
-    msgbus::subscribe_deltas(topic.into(), handler, None);
+    msgbus::subscribe_book_deltas(topic.into(), handler, None);
 
     let mut data_engine = data_engine.borrow_mut();
     data_engine.process_data(Data::Delta(delta));
@@ -1420,14 +1419,13 @@ fn test_process_book_deltas(
     );
     let cmd = DataCommand::Subscribe(SubscribeCommand::BookDeltas(sub));
 
-    let endpoint = MessagingSwitchboard::data_engine_execute();
-    msgbus::send_any(endpoint, &cmd as &dyn Any);
+    data_engine.borrow_mut().execute(cmd);
 
     // TODO: Using FFI API wrapper temporarily until Cython gone
     let deltas = OrderBookDeltas_API::new(stub_deltas());
     let (handler, saver) = get_typed_message_saving_handler::<OrderBookDeltas>(None);
     let topic = switchboard::get_book_deltas_topic(deltas.instrument_id);
-    msgbus::subscribe_deltas(topic.into(), handler, None);
+    msgbus::subscribe_book_deltas(topic.into(), handler, None);
 
     let mut data_engine = data_engine.borrow_mut();
     data_engine.process_data(Data::Deltas(deltas.clone()));
@@ -1462,13 +1460,12 @@ fn test_process_book_depth10(
     );
     let cmd = DataCommand::Subscribe(SubscribeCommand::BookDepth10(sub));
 
-    let endpoint = MessagingSwitchboard::data_engine_execute();
-    msgbus::send_any(endpoint, &cmd as &dyn Any);
+    data_engine.borrow_mut().execute(cmd);
 
     let depth = stub_depth10();
     let (handler, saver) = get_typed_message_saving_handler::<OrderBookDepth10>(None);
     let topic = switchboard::get_book_depth10_topic(depth.instrument_id);
-    msgbus::subscribe_depth10(topic.into(), handler, None);
+    msgbus::subscribe_book_depth10(topic.into(), handler, None);
 
     let mut data_engine = data_engine.borrow_mut();
     data_engine.process_data(Data::from(depth));
@@ -1500,8 +1497,7 @@ fn test_process_quote_tick(
     );
     let cmd = DataCommand::Subscribe(SubscribeCommand::Quotes(sub));
 
-    let endpoint = MessagingSwitchboard::data_engine_execute();
-    msgbus::send_any(endpoint, &cmd as &dyn Any);
+    data_engine.borrow_mut().execute(cmd);
 
     let quote = QuoteTick::default();
     let (handler, saver) = get_typed_message_saving_handler::<QuoteTick>(None);
@@ -1539,8 +1535,7 @@ fn test_process_trade_tick(
     );
     let cmd = DataCommand::Subscribe(SubscribeCommand::Trades(sub));
 
-    let endpoint = MessagingSwitchboard::data_engine_execute();
-    msgbus::send_any(endpoint, &cmd as &dyn Any);
+    data_engine.borrow_mut().execute(cmd);
 
     let trade = TradeTick::default();
     let (handler, saver) = get_typed_message_saving_handler::<TradeTick>(None);
@@ -1578,8 +1573,7 @@ fn test_process_mark_price(
     );
     let cmd = DataCommand::Subscribe(SubscribeCommand::MarkPrices(sub));
 
-    let endpoint = MessagingSwitchboard::data_engine_execute();
-    msgbus::send_any(endpoint, &cmd as &dyn Any);
+    data_engine.borrow_mut().execute(cmd);
 
     let mark_price = MarkPriceUpdate::new(
         audusd_sim.id,
@@ -1633,8 +1627,7 @@ fn test_process_index_price(
     );
     let cmd = DataCommand::Subscribe(SubscribeCommand::IndexPrices(sub));
 
-    let endpoint = MessagingSwitchboard::data_engine_execute();
-    msgbus::send_any(endpoint, &cmd as &dyn Any);
+    data_engine.borrow_mut().execute(cmd);
 
     let index_price = IndexPriceUpdate::new(
         audusd_sim.id,
@@ -1685,8 +1678,7 @@ fn test_process_funding_rate_through_any(
     );
     let cmd = DataCommand::Subscribe(SubscribeCommand::FundingRates(sub));
 
-    let endpoint = MessagingSwitchboard::data_engine_execute();
-    msgbus::send_any(endpoint, &cmd as &dyn Any);
+    data_engine.borrow_mut().execute(cmd);
 
     let funding_rate = FundingRateUpdate::new(
         audusd_sim.id,
@@ -1735,8 +1727,7 @@ fn test_process_funding_rate(
     );
     let cmd = DataCommand::Subscribe(SubscribeCommand::FundingRates(sub));
 
-    let endpoint = MessagingSwitchboard::data_engine_execute();
-    msgbus::send_any(endpoint, &cmd as &dyn Any);
+    data_engine.borrow_mut().execute(cmd);
 
     let funding_rate = FundingRateUpdate::new(
         audusd_sim.id,
@@ -1784,8 +1775,7 @@ fn test_process_funding_rate_updates_existing(
     );
     let cmd = DataCommand::Subscribe(SubscribeCommand::FundingRates(sub));
 
-    let endpoint = MessagingSwitchboard::data_engine_execute();
-    msgbus::send_any(endpoint, &cmd as &dyn Any);
+    data_engine.borrow_mut().execute(cmd);
 
     let funding_rate1 = FundingRateUpdate::new(
         audusd_sim.id,
@@ -1834,8 +1824,7 @@ fn test_process_bar(data_engine: Rc<RefCell<DataEngine>>, data_client: DataClien
     );
     let cmd = DataCommand::Subscribe(SubscribeCommand::Bars(sub));
 
-    let endpoint = MessagingSwitchboard::data_engine_execute();
-    msgbus::send_any(endpoint, &cmd as &dyn Any);
+    data_engine.borrow_mut().execute(cmd);
 
     let (handler, saver) = get_typed_message_saving_handler::<Bar>(None);
     let topic = switchboard::get_bars_topic(bar.bar_type);
@@ -1884,7 +1873,7 @@ fn test_execute_subscribe_blocks(
         ts_init: UnixNanos::default(),
         params: None,
     }));
-    data_engine.execute(&sub_cmd);
+    data_engine.execute(sub_cmd.clone());
 
     assert!(data_engine.subscribed_blocks().contains(&blockchain));
     {
@@ -1899,7 +1888,7 @@ fn test_execute_subscribe_blocks(
             ts_init: UnixNanos::default(),
             params: None,
         }));
-    data_engine.execute(&unsub_cmd);
+    data_engine.execute(unsub_cmd.clone());
 
     assert!(!data_engine.subscribed_blocks().contains(&blockchain));
     assert_eq!(recorder.borrow().as_slice(), &[sub_cmd, unsub_cmd]);
@@ -1936,7 +1925,7 @@ fn test_execute_subscribe_pool_swaps(
         ts_init: UnixNanos::default(),
         params: None,
     }));
-    data_engine.execute(&sub_cmd);
+    data_engine.execute(sub_cmd.clone());
 
     assert!(data_engine.subscribed_pool_swaps().contains(&instrument_id));
     {
@@ -1972,7 +1961,7 @@ fn test_execute_subscribe_pool_swaps(
             ts_init: UnixNanos::default(),
             params: None,
         }));
-    data_engine.execute(&unsub_cmd);
+    data_engine.execute(unsub_cmd.clone());
 
     assert!(!data_engine.subscribed_pool_swaps().contains(&instrument_id));
     // After unsubscribe, should have snapshot request, subscribe, and unsubscribe
@@ -1997,8 +1986,7 @@ fn test_process_block(data_engine: Rc<RefCell<DataEngine>>, data_client: DataCli
     });
     let cmd = DataCommand::DefiSubscribe(sub);
 
-    let endpoint = MessagingSwitchboard::data_engine_execute();
-    msgbus::send_any(endpoint, &cmd as &dyn Any);
+    data_engine.borrow_mut().execute(cmd);
 
     let block = Block::new(
         "0x123".to_string(),
@@ -2109,8 +2097,7 @@ fn test_process_pool_swap(data_engine: Rc<RefCell<DataEngine>>, data_client: Dat
     });
     let cmd = DataCommand::DefiSubscribe(sub);
 
-    let endpoint = MessagingSwitchboard::data_engine_execute();
-    msgbus::send_any(endpoint, &cmd as &dyn Any);
+    data_engine.borrow_mut().execute(cmd);
 
     let (typed_handler, saving_handler) = get_typed_message_saving_handler::<PoolSwap>(None);
     let topic = defi::switchboard::get_defi_pool_swaps_topic(instrument_id);
@@ -2157,7 +2144,7 @@ fn test_execute_subscribe_pool_liquidity_updates(
             params: None,
         },
     ));
-    data_engine.execute(&sub_cmd);
+    data_engine.execute(sub_cmd.clone());
 
     assert!(
         data_engine
@@ -2198,7 +2185,7 @@ fn test_execute_subscribe_pool_liquidity_updates(
             params: None,
         },
     ));
-    data_engine.execute(&unsub_cmd);
+    data_engine.execute(unsub_cmd.clone());
 
     assert!(
         !data_engine
@@ -2244,7 +2231,7 @@ fn test_execute_subscribe_pool_fee_collects(
             params: None,
         },
     ));
-    data_engine.execute(&sub_cmd);
+    data_engine.execute(sub_cmd.clone());
 
     assert!(
         data_engine
@@ -2285,7 +2272,7 @@ fn test_execute_subscribe_pool_fee_collects(
             params: None,
         },
     ));
-    data_engine.execute(&unsub_cmd);
+    data_engine.execute(unsub_cmd.clone());
 
     assert!(
         !data_engine
@@ -2331,7 +2318,7 @@ fn test_execute_subscribe_pool_flash_events(
             params: None,
         },
     ));
-    data_engine.execute(&sub_cmd);
+    data_engine.execute(sub_cmd.clone());
 
     assert!(data_engine.subscribed_pool_flash().contains(&instrument_id));
     {
@@ -2368,7 +2355,7 @@ fn test_execute_subscribe_pool_flash_events(
             params: None,
         },
     ));
-    data_engine.execute(&unsub_cmd);
+    data_engine.execute(unsub_cmd.clone());
 
     assert!(!data_engine.subscribed_pool_flash().contains(&instrument_id));
     // After unsubscribe, should have snapshot request, subscribe, and unsubscribe
@@ -2468,8 +2455,7 @@ fn test_process_pool_liquidity_update(
     });
     let cmd = DataCommand::DefiSubscribe(sub);
 
-    let endpoint = MessagingSwitchboard::data_engine_execute();
-    msgbus::send_any(endpoint, &cmd as &dyn Any);
+    data_engine.borrow_mut().execute(cmd);
 
     let (typed_handler, saving_handler) =
         get_typed_message_saving_handler::<PoolLiquidityUpdate>(None);
@@ -2572,8 +2558,7 @@ fn test_process_pool_fee_collect(
     });
     let cmd = DataCommand::DefiSubscribe(sub);
 
-    let endpoint = MessagingSwitchboard::data_engine_execute();
-    msgbus::send_any(endpoint, &cmd as &dyn Any);
+    data_engine.borrow_mut().execute(cmd);
 
     let (typed_handler, saving_handler) = get_typed_message_saving_handler::<PoolFeeCollect>(None);
     let topic = defi::switchboard::get_defi_collect_topic(instrument_id);
@@ -2673,8 +2658,7 @@ fn test_process_pool_flash(data_engine: Rc<RefCell<DataEngine>>, data_client: Da
     });
     let cmd = DataCommand::DefiSubscribe(sub);
 
-    let endpoint = MessagingSwitchboard::data_engine_execute();
-    msgbus::send_any(endpoint, &cmd as &dyn Any);
+    data_engine.borrow_mut().execute(cmd);
 
     let (typed_handler, saving_handler) = get_typed_message_saving_handler::<PoolFlash>(None);
     let topic = defi::switchboard::get_defi_flash_topic(instrument_id);
@@ -2809,8 +2793,7 @@ fn test_pool_updater_processes_swap_updates_profiler(
         params: None,
     });
     let cmd = DataCommand::DefiSubscribe(sub);
-    let endpoint = MessagingSwitchboard::data_engine_execute();
-    msgbus::send_any(endpoint, &cmd as &dyn Any);
+    data_engine.borrow_mut().execute(cmd);
 
     // Create and process swap that changes tick
     let new_price = U160::from(56022770974786139918731938227u128); // Different price
@@ -2941,8 +2924,7 @@ fn test_pool_updater_processes_mint_updates_profiler(
         params: None,
     });
     let cmd = DataCommand::DefiSubscribe(sub);
-    let endpoint = MessagingSwitchboard::data_engine_execute();
-    msgbus::send_any(endpoint, &cmd as &dyn Any);
+    data_engine.borrow_mut().execute(cmd);
 
     // Create and process mint event
     let mint = PoolLiquidityUpdate::new(
@@ -3084,8 +3066,7 @@ fn test_pool_updater_processes_burn_updates_profiler(
         params: None,
     });
     let cmd = DataCommand::DefiSubscribe(sub);
-    let endpoint = MessagingSwitchboard::data_engine_execute();
-    msgbus::send_any(endpoint, &cmd as &dyn Any);
+    data_engine.borrow_mut().execute(cmd);
 
     // Create and process burn event
     let burn = PoolLiquidityUpdate::new(
@@ -3108,8 +3089,9 @@ fn test_pool_updater_processes_burn_updates_profiler(
         None,
     );
 
-    let mut data_engine = data_engine.borrow_mut();
-    data_engine.process_defi_data(DefiData::PoolLiquidityUpdate(burn));
+    data_engine
+        .borrow_mut()
+        .process_defi_data(DefiData::PoolLiquidityUpdate(burn));
 
     // Verify profiler tick map was updated (liquidity decreased)
     let final_liquidity = cache
@@ -3196,8 +3178,7 @@ fn test_pool_updater_processes_collect_updates_profiler(
         params: None,
     });
     let cmd = DataCommand::DefiSubscribe(sub);
-    let endpoint = MessagingSwitchboard::data_engine_execute();
-    msgbus::send_any(endpoint, &cmd as &dyn Any);
+    data_engine.borrow_mut().execute(cmd);
 
     // Create and process collect event
     let owner = Address::from([0xAB; 20]);
@@ -3305,8 +3286,7 @@ fn test_pool_updater_processes_flash_updates_profiler(
         params: None,
     });
     let cmd = DataCommand::DefiSubscribe(sub);
-    let endpoint = MessagingSwitchboard::data_engine_execute();
-    msgbus::send_any(endpoint, &cmd as &dyn Any);
+    data_engine.borrow_mut().execute(cmd);
 
     // Create and process flash event
     let initiator = Address::from([0xAB; 20]);
@@ -3378,7 +3358,7 @@ fn test_execute_defi_request_pool_snapshot(
     );
 
     let cmd = DataCommand::DefiRequest(DefiRequestCommand::PoolSnapshot(request));
-    data_engine.execute(&cmd);
+    data_engine.execute(cmd.clone());
 
     // Verify command was forwarded to the client
     assert_eq!(recorder.borrow().len(), 1);
@@ -3418,7 +3398,7 @@ fn test_setup_pool_updater_requests_snapshot(
     );
 
     let cmd = DataCommand::DefiSubscribe(DefiSubscribeCommand::Pool(subscribe_pool));
-    data_engine.execute(&cmd);
+    data_engine.execute(cmd.clone());
 
     // Verify two commands were recorded:
     // 1. The SubscribePool command (forwarded to client first)
@@ -3525,7 +3505,7 @@ fn test_setup_pool_updater_skips_snapshot_when_pool_in_cache(
     );
 
     let cmd = DataCommand::DefiSubscribe(DefiSubscribeCommand::Pool(subscribe_pool));
-    data_engine.execute(&cmd);
+    data_engine.execute(cmd.clone());
 
     // Verify the cache-first optimization: when a pool exists in the data engine's
     // cache, setup_pool_updater should skip the snapshot request and proceed
@@ -3593,7 +3573,7 @@ fn test_pool_snapshot_request_routing_by_client_id(
     );
 
     let cmd = DataCommand::DefiRequest(DefiRequestCommand::PoolSnapshot(request));
-    data_engine.execute(&cmd);
+    data_engine.execute(cmd.clone());
 
     // Verify request was routed to CLIENT1 only
     assert_eq!(recorder_1.borrow().len(), 1);
@@ -3639,4 +3619,94 @@ async fn test_data_engine_connect_succeeds_with_working_client(
     data_engine.register_client(adapter, None);
 
     data_engine.connect().await;
+}
+
+#[rstest]
+fn test_process_book_snapshot_publish(
+    audusd_sim: CurrencyPair,
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    // Ensure message bus is initialized
+    let _ = msgbus::get_message_bus();
+
+    // Create data engine
+    let data_engine = Rc::new(RefCell::new(DataEngine::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+
+    let data_engine_clone = data_engine.clone();
+    let handler = TypedIntoHandler::from(move |cmd: DataCommand| {
+        data_engine_clone.borrow_mut().execute(cmd);
+    });
+    let endpoint = MessagingSwitchboard::data_engine_execute();
+    msgbus::register_data_command_endpoint(endpoint, handler);
+
+    // Register mock client
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        clock.clone(),
+        cache.clone(),
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut data_engine.borrow_mut(),
+    );
+
+    // Add instrument to cache
+    let _ = cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim));
+
+    // Set up book snapshot handler to capture published snapshots
+    let interval_ms = NonZeroUsize::new(100).unwrap();
+    let topic = switchboard::get_book_snapshots_topic(audusd_sim.id, interval_ms);
+    let (handler, saver) = get_typed_message_saving_handler::<OrderBook>(None);
+    msgbus::subscribe_book_snapshots(topic.into(), handler, None);
+
+    // Subscribe to book snapshots (sets up timer and book updater)
+    let sub = SubscribeBookSnapshots::new(
+        audusd_sim.id,
+        BookType::L2_MBP,
+        Some(client_id),
+        Some(venue),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        interval_ms,
+        None,
+        None,
+    );
+    let cmd = DataCommand::Subscribe(SubscribeCommand::BookSnapshots(sub));
+    data_engine.borrow_mut().execute(cmd);
+
+    // Process deltas to populate the order book
+    let delta = OrderBookDeltaTestBuilder::new(audusd_sim.id).build();
+    let deltas = OrderBookDeltas_API::new(OrderBookDeltas::new(audusd_sim.id, vec![delta]));
+    data_engine.borrow_mut().process_data(Data::Deltas(deltas));
+
+    // Advance clock past the interval to trigger snapshot timer
+    let advance_ns = 200_000_000u64; // 200ms in nanoseconds
+    let events = clock.borrow_mut().advance_time(advance_ns.into(), true);
+
+    // Process timer events (fire callbacks)
+    let handlers = clock.borrow().match_handlers(events);
+    for handler in handlers {
+        handler.callback.call(handler.event);
+    }
+
+    // Verify snapshot was published and received
+    wait_until(
+        || !saver.get_messages().is_empty(),
+        Duration::from_millis(100),
+    );
+
+    let messages = saver.get_messages();
+    assert!(!messages.is_empty(), "Expected at least one book snapshot");
+    assert_eq!(messages[0].instrument_id, audusd_sim.id);
 }

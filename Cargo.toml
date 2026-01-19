@@ -231,6 +231,7 @@ serde_json = { version = "1.0.149", default-features = false, features = [
   "std",
 ] }
 serde_urlencoded = "0.7.1"
+smallvec = "1.15.1"
 sqlx = { version = "0.8.6", default-features = false, features = [
   "postgres",
   "runtime-tokio",
@@ -246,7 +247,7 @@ tabled = { version = "0.20.0", default-features = false, features = [
   "std",
   "derive",
 ] }
-thiserror = "2.0.17"
+thiserror = "2.0.18"
 tokio = { version = "1.49.0", default-features = false, features = [
   "rt-multi-thread",
   "sync",

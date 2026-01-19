@@ -48,18 +48,20 @@ use nautilus_common::{
         },
     },
     msgbus::{
-        self, get_message_bus,
+        self, MessagingSwitchboard, TypedIntoHandler, get_message_bus,
         switchboard::{self},
     },
 };
-use nautilus_core::UUID4;
+use nautilus_core::{UUID4, UnixNanos, WeakCell};
 use nautilus_model::{
     enums::{ContingencyType, OmsType, OrderSide, PositionSide},
     events::{
         OrderDenied, OrderEvent, OrderEventAny, OrderFilled, PositionChanged, PositionClosed,
         PositionEvent, PositionOpened,
     },
-    identifiers::{ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, Venue},
+    identifiers::{
+        ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, Venue, VenueOrderId,
+    },
     instruments::{Instrument, InstrumentAny},
     orderbook::own::{OwnOrderBook, should_handle_own_book_order},
     orders::{Order, OrderAny, OrderError},
@@ -129,6 +131,41 @@ impl ExecutionEngine {
             pos_id_generator: PositionIdGenerator::new(trader_id, clock),
             config: config.unwrap_or_default(),
         }
+    }
+
+    /// Registers all message bus handlers for the execution engine.
+    pub fn register_msgbus_handlers(engine: Rc<RefCell<Self>>) {
+        let weak = WeakCell::from(Rc::downgrade(&engine));
+
+        let weak1 = weak.clone();
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::exec_engine_execute(),
+            TypedIntoHandler::from(move |cmd: TradingCommand| {
+                if let Some(rc) = weak1.upgrade() {
+                    rc.borrow().execute(cmd);
+                }
+            }),
+        );
+
+        let weak2 = weak.clone();
+        msgbus::register_order_event_endpoint(
+            MessagingSwitchboard::exec_engine_process(),
+            TypedIntoHandler::from(move |event: OrderEventAny| {
+                if let Some(rc) = weak2.upgrade() {
+                    rc.borrow_mut().process(event);
+                }
+            }),
+        );
+
+        let weak3 = weak;
+        msgbus::register_execution_report_endpoint(
+            MessagingSwitchboard::exec_engine_reconcile_execution_report(),
+            TypedIntoHandler::from(move |report: ExecutionReport| {
+                if let Some(rc) = weak3.upgrade() {
+                    rc.borrow_mut().reconcile_execution_report(report);
+                }
+            }),
+        );
     }
 
     #[must_use]
@@ -282,6 +319,40 @@ impl ExecutionEngine {
             client.generate_mass_status(lookback_mins).await
         } else {
             anyhow::bail!("Client {client_id} not found")
+        }
+    }
+
+    /// Registers an external order with the execution client for tracking.
+    ///
+    /// This is called after reconciliation creates an external order, allowing the
+    /// execution client to track it for subsequent events (e.g., cancellations).
+    pub fn register_external_order(
+        &self,
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+        instrument_id: InstrumentId,
+        strategy_id: StrategyId,
+        ts_init: UnixNanos,
+    ) {
+        let venue = instrument_id.venue;
+        if let Some(client_id) = self.routing_map.get(&venue) {
+            if let Some(client) = self.clients.get(client_id) {
+                client.register_external_order(
+                    client_order_id,
+                    venue_order_id,
+                    instrument_id,
+                    strategy_id,
+                    ts_init,
+                );
+            }
+        } else if let Some(default) = &self.default_client {
+            default.register_external_order(
+                client_order_id,
+                venue_order_id,
+                instrument_id,
+                strategy_id,
+                ts_init,
+            );
         }
     }
 
@@ -559,8 +630,8 @@ impl ExecutionEngine {
     }
 
     /// Reconciles an execution report.
-    pub fn reconcile_execution_report(&mut self, report: &ExecutionReport) {
-        match report {
+    pub fn reconcile_execution_report(&mut self, report: ExecutionReport) {
+        match &report {
             ExecutionReport::Order(order_report) => {
                 self.reconcile_order_status_report(order_report);
             }
@@ -789,13 +860,13 @@ impl ExecutionEngine {
     }
 
     /// Executes a trading command by routing it to the appropriate execution client.
-    pub fn execute(&self, command: &TradingCommand) {
-        self.execute_command(command);
+    pub fn execute(&self, command: TradingCommand) {
+        self.execute_command(&command);
     }
 
     /// Processes an order event, updating internal state and routing as needed.
-    pub fn process(&mut self, event: &OrderEventAny) {
-        self.handle_event(event);
+    pub fn process(&mut self, event: OrderEventAny) {
+        self.handle_event(&event);
     }
 
     /// Starts the execution engine.
@@ -1079,12 +1150,6 @@ impl ExecutionEngine {
             && let Err(e) = self.cache.borrow().snapshot_order_state(order)
         {
             log::error!("Failed to snapshot order state: {e}");
-            return;
-        }
-
-        if get_message_bus().borrow().has_backing {
-            let topic = switchboard::get_order_snapshots_topic(order.client_order_id());
-            msgbus::publish_order(topic, order);
         }
     }
 
@@ -1097,9 +1162,6 @@ impl ExecutionEngine {
         // if let Some(pnl) = self.cache.borrow().calculate_unrealized_pnl(&position) {
         //     position.unrealized_pnl(last)
         // }
-
-        let topic = switchboard::get_positions_snapshots_topic(position.id);
-        msgbus::publish_position(topic, position);
     }
 
     fn handle_event(&mut self, event: &OrderEventAny) {
