@@ -245,16 +245,13 @@ impl DeribitWebSocketClient {
                             call_python(py, &callback, py_obj);
                         }),
                         NautilusWsMessage::Error(err) => {
-                            log::error!("Deribit WebSocket error: {err}");
+                            log::error!("WebSocket error: {err}");
                         }
                         NautilusWsMessage::Reconnected => {
-                            log::info!("Deribit WebSocket reconnected");
+                            log::info!("WebSocket reconnected");
                         }
                         NautilusWsMessage::Authenticated(auth_result) => {
-                            log::info!(
-                                "Deribit WebSocket authenticated (scope: {})",
-                                auth_result.scope
-                            );
+                            log::info!("WebSocket authenticated (scope: {})", auth_result.scope);
                         }
                         NautilusWsMessage::Raw(msg) => {
                             log::debug!("Received raw message, skipping: {msg}");
@@ -714,6 +711,35 @@ impl DeribitWebSocketClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             client
                 .unsubscribe_user_trades()
+                .await
+                .map_err(to_pyvalue_err)
+        })
+    }
+
+    /// Subscribes to user portfolio updates for all currencies.
+    ///
+    /// Requires authentication. Subscribes to `user.portfolio.any` channel which
+    /// provides real-time account balance and margin updates.
+    #[pyo3(name = "subscribe_user_portfolio")]
+    fn py_subscribe_user_portfolio<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .subscribe_user_portfolio()
+                .await
+                .map_err(to_pyvalue_err)
+        })
+    }
+
+    /// Unsubscribes from user portfolio updates for all currencies.
+    #[pyo3(name = "unsubscribe_user_portfolio")]
+    fn py_unsubscribe_user_portfolio<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .unsubscribe_user_portfolio()
                 .await
                 .map_err(to_pyvalue_err)
         })

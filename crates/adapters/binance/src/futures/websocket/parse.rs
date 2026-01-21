@@ -49,6 +49,7 @@ use crate::common::enums::{BinanceKlineInterval, BinanceWsEventType};
 pub fn parse_agg_trade(
     msg: &BinanceFuturesAggTradeMsg,
     instrument: &InstrumentAny,
+    ts_init: UnixNanos,
 ) -> BinanceWsResult<TradeTick> {
     let instrument_id = instrument.id();
     let price_precision = instrument.price_precision();
@@ -79,7 +80,7 @@ pub fn parse_agg_trade(
         aggressor_side,
         trade_id,
         ts_event,
-        ts_event,
+        ts_init,
     ))
 }
 
@@ -91,6 +92,7 @@ pub fn parse_agg_trade(
 pub fn parse_trade(
     msg: &BinanceFuturesTradeMsg,
     instrument: &InstrumentAny,
+    ts_init: UnixNanos,
 ) -> BinanceWsResult<TradeTick> {
     let instrument_id = instrument.id();
     let price_precision = instrument.price_precision();
@@ -121,7 +123,7 @@ pub fn parse_trade(
         aggressor_side,
         trade_id,
         ts_event,
-        ts_event,
+        ts_init,
     ))
 }
 
@@ -133,6 +135,7 @@ pub fn parse_trade(
 pub fn parse_book_ticker(
     msg: &BinanceFuturesBookTickerMsg,
     instrument: &InstrumentAny,
+    ts_init: UnixNanos,
 ) -> BinanceWsResult<QuoteTick> {
     let instrument_id = instrument.id();
     let price_precision = instrument.price_precision();
@@ -164,7 +167,7 @@ pub fn parse_book_ticker(
         Quantity::new(bid_size, size_precision),
         Quantity::new(ask_size, size_precision),
         ts_event,
-        ts_event,
+        ts_init,
     ))
 }
 
@@ -176,6 +179,7 @@ pub fn parse_book_ticker(
 pub fn parse_depth_update(
     msg: &BinanceFuturesDepthUpdateMsg,
     instrument: &InstrumentAny,
+    ts_init: UnixNanos,
 ) -> BinanceWsResult<OrderBookDeltas> {
     let instrument_id = instrument.id();
     let price_precision = instrument.price_precision();
@@ -217,7 +221,7 @@ pub fn parse_depth_update(
             flags,
             msg.final_update_id,
             ts_event,
-            ts_event,
+            ts_init,
         ));
     }
 
@@ -253,7 +257,7 @@ pub fn parse_depth_update(
             flags,
             msg.final_update_id,
             ts_event,
-            ts_event,
+            ts_init,
         ));
     }
 
@@ -268,6 +272,7 @@ pub fn parse_depth_update(
 pub fn parse_mark_price(
     msg: &BinanceFuturesMarkPriceMsg,
     instrument: &InstrumentAny,
+    ts_init: UnixNanos,
 ) -> BinanceWsResult<(MarkPriceUpdate, IndexPriceUpdate)> {
     let instrument_id = instrument.id();
     let price_precision = instrument.price_precision();
@@ -287,14 +292,14 @@ pub fn parse_mark_price(
         instrument_id,
         Price::new(mark_price, price_precision),
         ts_event,
-        ts_event,
+        ts_init,
     );
 
     let index_update = IndexPriceUpdate::new(
         instrument_id,
         Price::new(index_price, price_precision),
         ts_event,
-        ts_event,
+        ts_init,
     );
 
     Ok((mark_update, index_update))
@@ -364,6 +369,7 @@ fn interval_to_bar_spec(interval: BinanceKlineInterval) -> BarSpecification {
 pub fn parse_kline(
     msg: &BinanceFuturesKlineMsg,
     instrument: &InstrumentAny,
+    ts_init: UnixNanos,
 ) -> BinanceWsResult<Option<Bar>> {
     // Only emit bars when the kline is closed
     if !msg.kline.is_closed {
@@ -414,7 +420,7 @@ pub fn parse_kline(
         Price::new(close, price_precision),
         Quantity::new(volume, size_precision),
         ts_event,
-        ts_event,
+        ts_init,
     );
 
     Ok(Some(bar))

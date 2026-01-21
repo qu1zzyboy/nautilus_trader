@@ -135,7 +135,7 @@ version = "1.4.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.alloy-chains]]
-version = "0.2.27"
+version = "0.2.28"
 criteria = "safe-to-deploy"
 
 [[exemptions.alloy-consensus]]
@@ -1234,34 +1234,6 @@ criteria = "safe-to-deploy"
 version = "0.1.1"
 criteria = "safe-to-run"
 
-[[exemptions.icu_collections]]
-version = "2.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.icu_locale_core]]
-version = "2.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.icu_normalizer]]
-version = "2.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.icu_normalizer_data]]
-version = "2.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.icu_properties]]
-version = "2.1.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.icu_properties_data]]
-version = "2.1.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.icu_provider]]
-version = "2.1.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.impl-codec]]
 version = "0.6.0"
 criteria = "safe-to-deploy"
@@ -1627,7 +1599,7 @@ version = "0.3.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.object_store]]
-version = "0.12.4"
+version = "0.12.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.once_cell]]
@@ -1643,7 +1615,7 @@ version = "11.1.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.openssl-probe]]
-version = "0.2.0"
+version = "0.2.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.ordered-float]]
@@ -1876,10 +1848,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.radium]]
 version = "0.7.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.rand_core]]
-version = "0.9.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.rand_xorshift]]
@@ -2850,10 +2818,6 @@ criteria = "safe-to-deploy"
 version = "0.7.14"
 criteria = "safe-to-deploy"
 
-[[exemptions.writeable]]
-version = "0.6.2"
-criteria = "safe-to-deploy"
-
 [[exemptions.wyz]]
 version = "0.5.1"
 criteria = "safe-to-deploy"
@@ -2895,7 +2859,7 @@ version = "0.5.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.zmij]]
-version = "1.0.15"
+version = "1.0.16"
 criteria = "safe-to-deploy"
 
 [[exemptions.zstd]]

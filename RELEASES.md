@@ -18,10 +18,15 @@ Released on TBD (UTC).
 
 ### Security
 - Fixed `CVec::empty()` to use dangling pointer instead of null, avoiding undefined behavior in `Vec::from_raw_parts`
+- Masked Binance listen keys in execution client logs
+- Refactored supply chain security checks and update dependencies
+- Improved TLS cert loading and socket suffix validation
 
 ### Fixes
 - Fixed matching engine liquidity consumption using cumulative book quantity
 - Fixed matching engine trade execution fills discarded with `liquidity_consumption`
+- Fixed remaining `F_LAST` flag checks to use proper bitmask comparison
+- Fixed OTO child order sizing with rapid parent fills (#3435), thanks for reporting @dxwil
 - Fixed `ExecAlgorithm` spawn quantity accounting (will now restore quantity from denied/rejected spawned orders)
 - Fixed reconciliation `venue_order_id` indexing and validation
 - Fixed analyzer epoch timestamp from empty shell positions
@@ -43,8 +48,12 @@ Released on TBD (UTC).
 - Fixed Databento `databento_data` to fetch definitions for full date range (#3414), thanks @Johnkhk
 - Fixed Databento zero-length interval at dataset boundary (#3429), thanks @shzhng
 - Fixed Deribit auth token refresh race condition (#3402), thanks @filipmacek
+- Fixed Deribit race condition between response and subscription (#3436), thanks @filipmacek
+- Fixed Interactive Brokers `fetch_all_open_orders` in client cache key preventing connection sharing (#3441), thanks @shzhng
+- Fixed Interactive Brokers synthetic position order reconciliation causing filled_qty mismatch errors during periodic consistency checks (#3443), thanks @shzhng
 - Fixed Polymarket order state race condition where PLACEMENT events could arrive late
 - Fixed Polymarket duplicate WebSocket subscriptions (#3403), thanks for reporting @santivazq
+- Fixed Polymarket duplicate trade_id for multi-order fills (#3450), thanks for reporting @santivazq
 
 ### Internal Improvements
 - Added support for setting cache database adapter in cache and `LiveNode` (#3401), thanks @filipmacek
@@ -54,6 +63,8 @@ Released on TBD (UTC).
 - Added Deribit order submission (#3408), thanks @filipmacek
 - Added Deribit live reconciliation support (#3421), thanks @filipmacek
 - Added Deribit rate limiting for HTTP and WebSocket clients (#3424), thanks @filipmacek
+- Added Deribit side-specific order cancellation (#3442), thanks @filipmacek
+- Added Deribit real-time portfolio WS subscription (#3444), thanks @filipmacek
 - Added Polymarket data loader rate limiting
 - Removed `tracing` crate from Rust codebase, migrated to `log` crate for simpler logging
 - Refactored computation of greeks (#3393), thanks @faysou
@@ -70,8 +81,9 @@ Released on TBD (UTC).
 - Refined greeks safeguards and docs (#3407), thanks @faysou
 - Refined processing of gaps in aggregated historical bars (#3412), thanks @faysou
 - Refined Interactive Brokers adapter (#3195), thanks @faysou
-- Refined OptionExerciseModule (#3423), thanks @faysou
+- Refined `OptionExerciseModule` (#3423), thanks @faysou
 - Refined instrument `is_spread()` method (#3434), thanks @faysou
+- Refined `OrderBookDeltas.batch` (#3437), thanks @faysou
 - Optimized message bus publish with thread-local `SmallVec` buffers in Rust
 - Optimized message bus pattern matching with greedy algorithm
 - Upgraded Interactive Brokers adapter to `ibapi` 10.37.2 (#3427), thanks @faysou

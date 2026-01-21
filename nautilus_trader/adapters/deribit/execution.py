@@ -24,6 +24,7 @@ from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus
 from nautilus_trader.common.enums import LogColor
+from nautilus_trader.common.enums import LogLevel
 from nautilus_trader.common.secure import mask_api_key
 from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.execution.messages import BatchCancelOrders
@@ -57,6 +58,7 @@ from nautilus_trader.model.functions import order_type_to_pyo3
 from nautilus_trader.model.functions import time_in_force_to_pyo3
 from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientId
+from nautilus_trader.model.identifiers import ClientOrderId
 
 
 class DeribitExecutionClient(LiveExecutionClient):
@@ -162,7 +164,8 @@ class DeribitExecutionClient(LiveExecutionClient):
 
         await self._ws_client.subscribe_user_orders()
         await self._ws_client.subscribe_user_trades()
-        self._log.info("Subscribed to user order and trade updates", LogColor.BLUE)
+        await self._ws_client.subscribe_user_portfolio()
+        self._log.info("Subscribed to user order, trade, and portfolio updates", LogColor.BLUE)
 
         # Fetch initial account state
         try:
@@ -199,9 +202,9 @@ class DeribitExecutionClient(LiveExecutionClient):
                     command.instrument_id.value,
                 )
 
-            # command.start/end are UnixNanos (has as_u64 method)
-            start = command.start.as_u64() if command.start else None
-            end = command.end.as_u64() if command.end else None
+            # command.start/end are pandas Timestamps, convert to nanoseconds
+            start = command.start.value if command.start else None
+            end = command.end.value if command.end else None
 
             pyo3_reports = await self._http_client.request_order_status_reports(
                 account_id=self.pyo3_account_id,
@@ -218,6 +221,12 @@ class DeribitExecutionClient(LiveExecutionClient):
         except Exception as e:
             self._log.exception("Failed to generate OrderStatusReports", e)
 
+        self._log_report_receipt(
+            len(reports),
+            "OrderStatusReport",
+            command.log_receipt_level,
+        )
+
         return reports
 
     async def generate_fill_reports(
@@ -232,8 +241,9 @@ class DeribitExecutionClient(LiveExecutionClient):
                     command.instrument_id.value,
                 )
 
-            start = command.start.as_u64() if command.start else None
-            end = command.end.as_u64() if command.end else None
+            # command.start/end are pandas Timestamps, convert to nanoseconds
+            start = command.start.value if command.start else None
+            end = command.end.value if command.end else None
 
             pyo3_reports = await self._http_client.request_fill_reports(
                 account_id=self.pyo3_account_id,
@@ -248,6 +258,8 @@ class DeribitExecutionClient(LiveExecutionClient):
                 reports.append(report)
         except Exception as e:
             self._log.exception("Failed to generate FillReports", e)
+
+        self._log_report_receipt(len(reports), "FillReport", LogLevel.INFO)
 
         return reports
 
@@ -274,6 +286,12 @@ class DeribitExecutionClient(LiveExecutionClient):
                 reports.append(report)
         except Exception as e:
             self._log.exception("Failed to generate PositionStatusReports", e)
+
+        self._log_report_receipt(
+            len(reports),
+            "PositionStatusReport",
+            command.log_receipt_level,
+        )
 
         return reports
 
@@ -559,15 +577,64 @@ class DeribitExecutionClient(LiveExecutionClient):
             )
 
     async def _cancel_all_orders(self, command: CancelAllOrders) -> None:
-        # Deribit doesn't support side filtering - log warning if specified
+        # If specific side requested, cancel orders individually (Deribit API doesn't support side filtering)
         if command.order_side != OrderSide.NO_ORDER_SIDE:
-            self._log.warning(
-                "Deribit cancel_all_by_instrument doesn't support order_side filtering. "
-                "Cancelling all orders for instrument regardless of side.",
+            open_orders = self._cache.orders_open(
+                instrument_id=command.instrument_id,
+                side=command.order_side,
             )
 
-        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
+            if not open_orders:
+                self._log.debug(
+                    f"No open {command.order_side.name} orders to cancel for {command.instrument_id}",
+                )
+                return
 
+            self._log.info(
+                f"Cancelling {len(open_orders)} {command.order_side.name} orders "
+                f"for {command.instrument_id} (side-filtered)",
+            )
+
+            for order in open_orders:
+                if order.venue_order_id is None:
+                    self._log.warning(
+                        f"Cannot cancel order {order.client_order_id} - no venue_order_id",
+                    )
+                    continue
+
+                try:
+                    pyo3_trader_id = nautilus_pyo3.TraderId.from_str(order.trader_id.value)
+                    pyo3_strategy_id = nautilus_pyo3.StrategyId.from_str(order.strategy_id.value)
+                    pyo3_order_instrument_id = nautilus_pyo3.InstrumentId.from_str(
+                        order.instrument_id.value,
+                    )
+                    pyo3_client_order_id = nautilus_pyo3.ClientOrderId.from_str(
+                        order.client_order_id.value,
+                    )
+
+                    await self._ws_client.cancel_order(
+                        order_id=order.venue_order_id.value,
+                        client_order_id=pyo3_client_order_id,
+                        trader_id=pyo3_trader_id,
+                        strategy_id=pyo3_strategy_id,
+                        instrument_id=pyo3_order_instrument_id,
+                    )
+                except Exception as e:
+                    self._log.error(
+                        f"Failed to cancel order {order.client_order_id}: {e}",
+                    )
+                    self.generate_order_cancel_rejected(
+                        strategy_id=order.strategy_id,
+                        instrument_id=order.instrument_id,
+                        client_order_id=order.client_order_id,
+                        venue_order_id=order.venue_order_id,
+                        reason=str(e),
+                        ts_event=self._clock.timestamp_ns(),
+                    )
+            return
+
+        # No side filtering - use bulk cancel API
+        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
         try:
             self._log.info(
                 f"Cancelling all orders for instrument {command.instrument_id}",
@@ -675,7 +742,7 @@ class DeribitExecutionClient(LiveExecutionClient):
             else:
                 self._log.warning(f"Received unhandled message type: {type(msg)}")
         except Exception as e:
-            self._log.exception("Error handling websocket message", e)
+            self._log.exception("Error handling WebSocket message", e)
 
     def _handle_account_state(self, msg: nautilus_pyo3.AccountState) -> None:
         account_state = AccountState.from_dict(msg.to_dict())
@@ -692,13 +759,55 @@ class DeribitExecutionClient(LiveExecutionClient):
 
     def _handle_fill_report(self, msg: Any) -> None:
         report = FillReport.from_pyo3(msg)
-        self._send_fill_report(report)
+
+        # External orders go to reconciliation
+        if self._is_external_order(report.client_order_id):
+            self._send_fill_report(report)
+            return
+
+        order = self._cache.order(report.client_order_id)
+        if order is None:
+            self._log.error(
+                f"Cannot process fill report - order for {report.client_order_id!r} not found",
+            )
+            return
+
+        instrument = self._cache.instrument(order.instrument_id)
+        if instrument is None:
+            self._log.error(
+                f"Cannot process fill report - instrument {order.instrument_id} not found",
+            )
+            return
+
+        self.generate_order_filled(
+            strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=report.venue_order_id,
+            venue_position_id=report.venue_position_id,
+            trade_id=report.trade_id,
+            order_side=order.side,
+            order_type=order.order_type,
+            last_qty=report.last_qty,
+            last_px=report.last_px,
+            quote_currency=instrument.quote_currency,
+            commission=report.commission,
+            liquidity_side=report.liquidity_side,
+            ts_event=report.ts_event,
+        )
 
     def _handle_order_rejected(self, pyo3_event: nautilus_pyo3.OrderRejected) -> None:
         event = OrderRejected.from_dict(pyo3_event.to_dict())
         self._send_order_event(event)
 
     def _handle_order_accepted(self, pyo3_event: nautilus_pyo3.OrderAccepted) -> None:
+        client_order_id = ClientOrderId(pyo3_event.client_order_id.value)
+        order = self._cache.order(client_order_id)
+
+        # Skip if order already in terminal state (race condition with fills/cancels)
+        if order is not None and order.is_closed:
+            return
+
         event = OrderAccepted.from_dict(pyo3_event.to_dict())
         self._send_order_event(event)
 
@@ -721,3 +830,6 @@ class DeribitExecutionClient(LiveExecutionClient):
     def _handle_order_modify_rejected(self, pyo3_event: nautilus_pyo3.OrderModifyRejected) -> None:
         event = OrderModifyRejected.from_dict(pyo3_event.to_dict())
         self._send_order_event(event)
+
+    def _is_external_order(self, client_order_id: ClientOrderId) -> bool:
+        return not client_order_id or not self._cache.strategy_id_for_order(client_order_id)
