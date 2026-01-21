@@ -38,22 +38,12 @@ use ustr::Ustr;
 use super::{
     messages::{
         BinanceFuturesAccountConfigMsg, BinanceFuturesAccountUpdateMsg, BinanceFuturesAggTradeMsg,
-<<<<<<< HEAD:crates/adapters/binance/src/futures/websocket/handler.rs
-
         BinanceFuturesBookTickerMsg, BinanceFuturesContinuousKlineMsg, BinanceFuturesDepthUpdateMsg,
-        BinanceFuturesHandlerCommand, BinanceFuturesKlineMsg, BinanceFuturesListenKeyExpiredMsg,
+        BinanceFuturesKlineMsg, BinanceFuturesListenKeyExpiredMsg, DataHandlerCommand,
         BinanceFuturesMarginCallMsg, BinanceFuturesMarkPriceMsg, BinanceFuturesOrderUpdateMsg,
         BinanceFuturesTradeMsg, BinanceFuturesWsErrorMsg, BinanceFuturesWsErrorResponse,
-        BinanceFuturesWsMessage, BinanceFuturesWsSubscribeRequest, BinanceFuturesWsSubscribeResponse,
-        NautilusFuturesDataWsMessage, NautilusFuturesExecWsMessage,
-=======
-        BinanceFuturesBookTickerMsg, BinanceFuturesDepthUpdateMsg, BinanceFuturesExecWsMessage,
-        BinanceFuturesKlineMsg, BinanceFuturesListenKeyExpiredMsg, BinanceFuturesMarginCallMsg,
-        BinanceFuturesMarkPriceMsg, BinanceFuturesOrderUpdateMsg, BinanceFuturesTradeMsg,
-        BinanceFuturesWsErrorMsg, BinanceFuturesWsErrorResponse, BinanceFuturesWsSubscribeRequest,
-        BinanceFuturesWsSubscribeResponse, DataHandlerCommand, NautilusDataWsMessage,
-        NautilusWsMessage,
->>>>>>> develop:crates/adapters/binance/src/futures/websocket/handler_data.rs
+        BinanceFuturesWsSubscribeRequest, BinanceFuturesWsSubscribeResponse,
+        NautilusDataWsMessage, NautilusWsMessage,
     },
     parse::{
         extract_event_type, extract_pair, extract_symbol, parse_agg_trade, parse_book_ticker,
