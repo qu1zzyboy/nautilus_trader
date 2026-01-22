@@ -675,7 +675,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
         command: GeneratePositionStatusReports,
     ) -> list[PositionStatusReport]:
         report = []
-        positions: list[IBPosition] | None = await self._client.get_positions(
+        positions: list[IBPosition] = await self._client.get_positions(
             self.account_id.get_id(),
         )
 
