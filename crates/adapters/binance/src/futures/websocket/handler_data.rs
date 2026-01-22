@@ -39,7 +39,7 @@ use super::{
     messages::{
         BinanceFuturesAccountConfigMsg, BinanceFuturesAccountUpdateMsg, BinanceFuturesAggTradeMsg,
         BinanceFuturesBookTickerMsg, BinanceFuturesContinuousKlineMsg, BinanceFuturesDepthUpdateMsg,
-        BinanceFuturesKlineMsg, BinanceFuturesListenKeyExpiredMsg, DataHandlerCommand,
+        BinanceFuturesExecWsMessage, BinanceFuturesKlineMsg, BinanceFuturesListenKeyExpiredMsg, DataHandlerCommand,
         BinanceFuturesMarginCallMsg, BinanceFuturesMarkPriceMsg, BinanceFuturesOrderUpdateMsg,
         BinanceFuturesTradeMsg, BinanceFuturesWsErrorMsg, BinanceFuturesWsErrorResponse,
         BinanceFuturesWsSubscribeRequest, BinanceFuturesWsSubscribeResponse,
@@ -73,7 +73,7 @@ pub struct BinanceFuturesDataWsFeedHandler {
 
 impl Debug for BinanceFuturesDataWsFeedHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct(stringify!(BinanceFuturesWsFeedHandler))
+        f.debug_struct(stringify!(BinanceFuturesDataWsFeedHandler))
             .field("instruments_count", &self.instruments.len())
             .field("pending_requests", &self.pending_requests.len())
             .finish_non_exhaustive()
