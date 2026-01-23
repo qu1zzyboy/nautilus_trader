@@ -44,7 +44,8 @@ pub fn indicators(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::average::wma::WeightedMovingAverage>()?;
 
     // Book
-    m.add_class::<crate::book::imbalance::BookImbalanceRatio>()?;
+        m.add_class::<crate::book::imbalance::BookImbalanceRatio>()?;
+        m.add_class::<crate::book::imbalance_l0::BookImbalanceLevel0>()?;
 
     // Ratio
     m.add_class::<crate::ratio::efficiency_ratio::EfficiencyRatio>()?;
