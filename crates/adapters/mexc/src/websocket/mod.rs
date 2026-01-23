@@ -29,8 +29,10 @@ pub mod client;
 pub mod enums;
 pub mod error;
 pub mod handler;
+pub mod handler_exec;
 pub mod messages;
 pub mod parse;
 
 pub use crate::websocket::client::MexcWebSocketClient;
+pub use crate::websocket::handler_exec::MexcExecWsFeedHandler;
 

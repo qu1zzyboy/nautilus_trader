@@ -101,3 +101,26 @@ pub enum NautilusWsMessage {
     /// Execution messages (order updates, account updates, etc.).
     Exec(MexcExecWsMessage),
 }
+
+/// Commands for the MEXC execution WebSocket handler.
+///
+/// These commands allow the execution client to register orders and manage
+/// the handler's internal state for correlating WebSocket updates with order context.
+#[derive(Clone, Debug)]
+pub enum ExecHandlerCommand {
+    /// Register an order for context tracking.
+    RegisterOrder {
+        client_order_id: nautilus_model::identifiers::ClientOrderId,
+        trader_id: nautilus_model::identifiers::TraderId,
+        strategy_id: nautilus_model::identifiers::StrategyId,
+        instrument_id: nautilus_model::identifiers::InstrumentId,
+    },
+    /// Register a cancel request for context tracking.
+    RegisterCancel {
+        client_order_id: nautilus_model::identifiers::ClientOrderId,
+        trader_id: nautilus_model::identifiers::TraderId,
+        strategy_id: nautilus_model::identifiers::StrategyId,
+        instrument_id: nautilus_model::identifiers::InstrumentId,
+        venue_order_id: Option<nautilus_model::identifiers::VenueOrderId>,
+    },
+}

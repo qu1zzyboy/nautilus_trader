@@ -56,7 +56,7 @@ use nautilus_model::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId, Venue,
         VenueOrderId,
     },
-    instruments::Instrument,
+    instruments::{Instrument, InstrumentAny},
     orders::Order,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, Money, Price, Quantity},
@@ -70,7 +70,8 @@ use super::super::{
     http::client::MexcRawHttpClient,
     websocket::{
         client::MexcWebSocketClient,
-        messages::{MexcExecWsMessage, NautilusWsMessage},
+        handler_exec::MexcExecWsFeedHandler,
+        messages::{ExecHandlerCommand, MexcExecWsMessage, NautilusWsMessage},
     },
 };
 use crate::common::consts::MEXC_VENUE;
@@ -99,6 +100,8 @@ pub struct MexcExecutionClient {
     connected: AtomicBool,
     instruments_initialized: AtomicBool,
     pending_tasks: Mutex<Vec<JoinHandle<()>>>,
+    exec_cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<ExecHandlerCommand>>,
+    handler_signal: Arc<AtomicBool>,
 }
 
 impl MexcExecutionClient {
@@ -156,6 +159,8 @@ impl MexcExecutionClient {
             connected: AtomicBool::new(false),
             instruments_initialized: AtomicBool::new(false),
             pending_tasks: Mutex::new(Vec::new()),
+            exec_cmd_tx: None,
+            handler_signal: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -232,6 +237,59 @@ impl MexcExecutionClient {
         anyhow::bail!("Account registration timeout after {timeout_secs} seconds");
     }
 
+    /// Refreshes account state by requesting it from the exchange.
+    async fn refresh_account_state(&self) -> anyhow::Result<AccountState> {
+        use crate::http::query::GetAccountParams;
+
+        let mexc_account = self
+            .http_client
+            .get_account(GetAccountParams::default())
+            .await
+            .context("failed to request MEXC account state")?;
+
+        let ts_now = self.clock.get_time_ns();
+        let mut balances = Vec::with_capacity(mexc_account.balances.len());
+
+        for balance in &mexc_account.balances {
+            let free: f64 = balance.free.parse().unwrap_or(0.0);
+            let locked: f64 = balance.locked.parse().unwrap_or(0.0);
+            let total = free + locked;
+
+            // Skip zero balances
+            if total == 0.0 && locked == 0.0 {
+                continue;
+            }
+
+            let currency = Currency::from(balance.asset.as_str());
+            let account_balance = AccountBalance::new(
+                Money::new(total, currency),
+                Money::new(locked.max(0.0), currency),
+                Money::new(free.max(0.0), currency),
+            );
+            balances.push(account_balance);
+        }
+
+        // Ensure at least one balance exists
+        if balances.is_empty() {
+            let zero_currency = Currency::USDT();
+            let zero_money = Money::new(0.0, zero_currency);
+            let zero_balance = AccountBalance::new(zero_money, zero_money, zero_money);
+            balances.push(zero_balance);
+        }
+
+        Ok(AccountState::new(
+            self.core.account_id,
+            self.core.account_type,
+            balances,
+            Vec::new(), // margins (not applicable for spot)
+            true,       // reported
+            UUID4::new(),
+            ts_now,
+            ts_now,
+            None, // base currency
+        ))
+    }
+
     fn spawn_task<F>(&self, description: &'static str, fut: F)
     where
         F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
@@ -300,6 +358,44 @@ impl MexcExecutionClient {
             _ => {
                 log::warn!("Unknown MEXC trade type: {trade_type}, defaulting to Buy");
                 OrderSide::Buy
+            }
+        }
+    }
+
+    /// Registers an order with the execution handler for context tracking.
+    fn register_order(&self, order: &nautilus_model::orders::OrderAny) {
+        if let Some(ref cmd_tx) = self.exec_cmd_tx {
+            let cmd = ExecHandlerCommand::RegisterOrder {
+                client_order_id: order.client_order_id(),
+                trader_id: order.trader_id(),
+                strategy_id: order.strategy_id(),
+                instrument_id: order.instrument_id(),
+            };
+            if let Err(e) = cmd_tx.send(cmd) {
+                log::error!("Failed to register order with handler: {e}");
+            }
+        }
+    }
+
+    /// Registers a cancel request with the execution handler for context tracking.
+    fn register_cancel(
+        &self,
+        client_order_id: ClientOrderId,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        venue_order_id: Option<VenueOrderId>,
+    ) {
+        if let Some(ref cmd_tx) = self.exec_cmd_tx {
+            let cmd = ExecHandlerCommand::RegisterCancel {
+                client_order_id,
+                trader_id,
+                strategy_id,
+                instrument_id,
+                venue_order_id,
+            };
+            if let Err(e) = cmd_tx.send(cmd) {
+                log::error!("Failed to register cancel with handler: {e}");
             }
         }
     }
@@ -578,6 +674,10 @@ impl MexcExecutionClient {
 
         let http_client = self.http_client.clone();
         let order = self.core.get_order(&cmd.client_order_id)?;
+
+        // Register order with handler for context tracking before HTTP request
+        self.register_order(&order);
+
         let exec_sender = self.exec_sender.clone();
         let trader_id = self.core.trader_id;
         let account_id = self.core.account_id;
@@ -774,6 +874,71 @@ impl ExecutionClient for MexcExecutionClient {
         // Reinitialize cancellation token in case of reconnection
         self.cancellation_token = CancellationToken::new();
 
+        // Load instruments if not already done
+        if !self.instruments_initialized.load(Ordering::Acquire) {
+            let mexc_instruments = self
+                .http_client
+                .get_exchange_info(None)
+                .await
+                .context("failed to request MEXC exchange info")?;
+
+            let ts_init = self.clock.get_time_ns();
+            let mut instruments = Vec::with_capacity(mexc_instruments.len());
+
+            for mexc_instrument in &mexc_instruments {
+                match crate::http::parse::parse_instrument_any(mexc_instrument, ts_init) {
+                    crate::http::parse::InstrumentParseResult::Ok(boxed) => {
+                        instruments.push(*boxed);
+                    }
+                    crate::http::parse::InstrumentParseResult::Inactive { symbol, reason } => {
+                        log::debug!(
+                            "Skipping inactive instrument: symbol={}, reason={}",
+                            symbol,
+                            reason
+                        );
+                    }
+                    crate::http::parse::InstrumentParseResult::Unsupported {
+                        symbol,
+                        instrument_type,
+                    } => {
+                        log::debug!(
+                            "Skipping unsupported instrument: symbol={}, type={}",
+                            symbol,
+                            instrument_type
+                        );
+                    }
+                    crate::http::parse::InstrumentParseResult::Failed {
+                        symbol,
+                        instrument_type,
+                        error,
+                    } => {
+                        log::warn!(
+                            "Failed to parse instrument: symbol={}, type={}, error={}",
+                            symbol,
+                            instrument_type,
+                            error
+                        );
+                    }
+                }
+            }
+
+            if instruments.is_empty() {
+                log::warn!("No instruments returned for MEXC");
+            } else {
+                log::info!("Loaded {} MEXC instruments", instruments.len());
+
+                // Add instruments to Nautilus Cache for reconciliation
+                let cache = self.core.cache();
+                for instrument in &instruments {
+                    if let Err(e) = cache.borrow_mut().add_instrument(instrument.clone()) {
+                        log::debug!("Instrument already in cache: {e}");
+                    }
+                }
+            }
+
+            self.instruments_initialized.store(true, Ordering::Release);
+        }
+
         // Create listen key for user data stream
         log::info!("Creating listen key for MEXC user data stream...");
         let listen_key_response = self
@@ -817,37 +982,93 @@ impl ExecutionClient for MexcExecutionClient {
                 log::info!("Successfully subscribed to private execution channels");
             }
 
-            // Start WebSocket message processing loop
-            let stream = ws_client.stream();
-            let exec_sender = self.exec_sender.clone();
-            let trader_id = self.core.trader_id;
-            let account_id = self.core.account_id;
-            let account_type = self.core.account_type;
-            let clock = self.clock;
-            let cancel = self.cancellation_token.clone();
+            // Create channels for the execution handler
+            let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
 
-            let ws_task = get_runtime().spawn(async move {
-                pin_mut!(stream);
+            // Store command channel for order registration
+            self.exec_cmd_tx = Some(cmd_tx.clone());
+
+            // Create channel for account updates (handled separately from order events)
+            let (account_tx, mut account_rx) = tokio::sync::mpsc::unbounded_channel();
+            let exec_sender_account = self.exec_sender.clone();
+            let cancel_account = self.cancellation_token.clone();
+            let account_handle_task = get_runtime().spawn(async move {
                 loop {
                     tokio::select! {
-                        Some(message) = stream.next() => {
-                            Self::handle_ws_message(
-                                message,
-                                &exec_sender,
-                                trader_id,
-                                account_id,
-                                account_type,
-                                clock,
-                            );
+                        Some(account_state) = account_rx.recv() => {
+                            if let Err(e) = exec_sender_account.send(ExecutionEvent::Account(account_state)) {
+                                log::error!("Failed to send account state event: {e}");
+                                break;
+                            }
                         }
-                        () = cancel.cancelled() => {
-                            log::debug!("User data stream task cancelled");
+                        () = cancel_account.cancelled() => {
+                            log::debug!("Account update handler task cancelled");
                             break;
                         }
                     }
                 }
             });
-            *self.ws_task.lock().expect(MUTEX_POISONED) = Some(ws_task);
+
+            // Create and initialize the execution handler
+            let mut handler = MexcExecWsFeedHandler::new(
+                self.clock,
+                self.core.trader_id,
+                self.core.account_id,
+                self.core.account_type,
+                self.handler_signal.clone(),
+                cmd_rx,
+                raw_rx,
+                Some(account_tx),
+            );
+
+            // Set up raw message forwarding from WebSocket to handler
+            let stream = ws_client.stream();
+            let cancel = self.cancellation_token.clone();
+            let raw_forward_task = get_runtime().spawn(async move {
+                pin_mut!(stream);
+                loop {
+                    tokio::select! {
+                        Some(message) = stream.next() => {
+                            if let Err(e) = raw_tx.send(message) {
+                                log::error!("Failed to forward raw message to handler: {e}");
+                                break;
+                            }
+                        }
+                        () = cancel.cancelled() => {
+                            log::debug!("Raw message forwarding task cancelled");
+                            break;
+                        }
+                    }
+                }
+            });
+
+            // Start handler processing loop
+            let exec_sender = self.exec_sender.clone();
+            let cancel = self.cancellation_token.clone();
+            let handler_task = get_runtime().spawn(async move {
+                loop {
+                    tokio::select! {
+                        Some(event) = handler.next() => {
+                            if let Err(e) = exec_sender.send(ExecutionEvent::Order(event)) {
+                                log::error!("Failed to send order event from handler: {e}");
+                                break;
+                            }
+                        }
+                        () = cancel.cancelled() => {
+                            log::debug!("Handler processing task cancelled");
+                            break;
+                        }
+                    }
+                }
+            });
+
+            // Store all tasks
+            let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
+            tasks.push(raw_forward_task);
+            tasks.push(handler_task);
+            tasks.push(account_handle_task);
+            drop(tasks);
 
             // Start listen key keepalive task
             let http_client = self.http_client.clone();
@@ -885,8 +1106,28 @@ impl ExecutionClient for MexcExecutionClient {
             *self.keepalive_task.lock().expect(MUTEX_POISONED) = Some(keepalive_task);
         }
 
-        // TODO: Request initial account state
-        // let account_state = self.refresh_account_state().await?;
+        // Request initial account state
+        let account_state = self
+            .refresh_account_state()
+            .await
+            .context("failed to request MEXC account state")?;
+
+        if !account_state.balances.is_empty() {
+            log::info!(
+                "Received account state with {} balance(s)",
+                account_state.balances.len()
+            );
+        }
+
+        if let Err(e) = self
+            .exec_sender
+            .send(ExecutionEvent::Account(account_state))
+        {
+            log::warn!("Failed to send account state: {e}");
+        }
+
+        // Wait for account to be registered in cache before completing connect
+        self.await_account_registered(30.0).await?;
 
         self.connected.store(true, Ordering::Release);
         log::info!("Connected: client_id={}", self.core.client_id);
