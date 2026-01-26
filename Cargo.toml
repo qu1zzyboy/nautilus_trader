@@ -15,6 +15,7 @@ members = [
   "crates/adapters/kraken",
   "crates/adapters/mexc",
   "crates/adapters/okx",
+  "crates/adapters/sandbox",
   "crates/adapters/tardis",
   "crates/analysis",
   "crates/backtest",
@@ -42,7 +43,7 @@ members = [
 [workspace.package]
 version = "0.53.0"
 edition = "2024"
-rust-version = "1.92.0"
+rust-version = "1.93.0"
 authors = ["Nautech Systems <info@nautechsystems.io>"]
 license = "LGPL-3.0-or-later"
 readme = "README.md"
@@ -84,6 +85,7 @@ nautilus-trading = { path = "crates/trading", version = "0.53.0" }
 
 # -----------------------------------------------------------------------------
 # Adapters
+#
 # Note: default-features = false to control high-precision separately (not supported on Windows)
 # -----------------------------------------------------------------------------
 nautilus-architect-ax = { path = "crates/adapters/architect_ax", version = "0.53.0" }
@@ -98,6 +100,7 @@ nautilus-dydx = { path = "crates/adapters/dydx", version = "0.53.0", default-fea
 nautilus-hyperliquid = { path = "crates/adapters/hyperliquid", version = "0.53.0", default-features = false }
 nautilus-kraken = { path = "crates/adapters/kraken", version = "0.53.0", default-features = false }
 nautilus-okx = { path = "crates/adapters/okx", version = "0.53.0", default-features = false }
+nautilus-sandbox = { path = "crates/adapters/sandbox", version = "0.53.0", default-features = false }
 nautilus-tardis = { path = "crates/adapters/tardis", version = "0.53.0", default-features = false }
 
 # -----------------------------------------------------------------------------
@@ -117,7 +120,7 @@ arrow = { version = "57.2.0", default-features = false, features = [
 ] }
 async-stream = "0.3.6"
 async-trait = "0.1.89"
-aws-lc-rs = { version = "1.15.3", default-features = false, features = [
+aws-lc-rs = { version = "1.15.4", default-features = false, features = [
   "non-fips",
 ] }
 base64 = "0.22.1"
@@ -131,7 +134,7 @@ chrono = { version = "0.4.43", default-features = false, features = [
 chrono-tz = "0.10.4"
 clap = { version = "4.5.54", features = ["derive", "env"] }
 dashmap = "6.1.0"
-datafusion = { version = "52.0.0", default-features = false, features = [
+datafusion = { version = "52.1.0", default-features = false, features = [
   "parquet",
   "regex_expressions",
   "unicode_expressions",
@@ -240,7 +243,7 @@ sqlx = { version = "0.8.6", default-features = false, features = [
   "rust_decimal",
 ] }
 strum = { version = "0.27.2", features = ["derive"] }
-sysinfo = { version = "0.37.2", default-features = false, features = [
+sysinfo = { version = "0.38.0", default-features = false, features = [
   "system",
 ] }
 tabled = { version = "0.20.0", default-features = false, features = [
@@ -267,21 +270,28 @@ toml = { version = "0.9.11", default-features = false, features = [
   "parse",
   "serde",
 ] }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.22", default-features = false, features = [
+  "std",
+  "env-filter",
+  "fmt",
+  "registry",
+] }
 unbounded-interval-tree = { version = "1.1.2", default-features = false }
 url = { version = "2.5.8", default-features = false }
 ustr = { version = "1.1.0", features = ["serde"] }
-uuid = { version = "1.19.0", features = ["v4", "serde"] }
+uuid = { version = "1.20.0", features = ["v4", "serde"] }
 webpki-roots = "1.0.5"
 
 # -----------------------------------------------------------------------------
 # Adapter dependencies
 # -----------------------------------------------------------------------------
-alloy = { version = "1.4.3", default-features = false, features = [
+alloy = { version = "1.5.2", default-features = false, features = [
   "sol-types",
   "contract",
 ] }
-alloy-signer = { version = "1.4.3", default-features = false }
-alloy-signer-local = { version = "1.4.3", default-features = false, features = [
+alloy-signer = { version = "1.5.2", default-features = false }
+alloy-signer-local = { version = "1.5.2", default-features = false, features = [
   "mnemonic",
 ] }
 alloy-sol-types = "1.5.2"
@@ -303,7 +313,7 @@ prost = { version = "0.13.5", default-features = false, features = ["std"] }
 ryu = "1.0.22"
 serde_repr = "0.1.20"
 serde_with = "3.16.1"
-time = { version = "0.3.45", default-features = false, features = [
+time = { version = "0.3.46", default-features = false, features = [
   "macros",
   "parsing",
   "serde",
@@ -352,9 +362,9 @@ walkdir = "2.5.0"
 cargo-audit = "0.22.0"
 cargo-deny = "0.19.0"
 cargo-edit = "0.13.8"
-cargo-llvm-cov = "0.6.23"
+cargo-llvm-cov = "0.7.1"
 cargo-machete = "0.9.1"
-cargo-nextest = "0.9.122"
+cargo-nextest = "0.9.123"
 cargo-vet = "0.10.2"
 lychee = "0.22.0"
 

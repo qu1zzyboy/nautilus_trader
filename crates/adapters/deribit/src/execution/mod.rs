@@ -28,33 +28,27 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, pin_mut};
 use nautilus_common::{
     clients::ExecutionClient,
-    live::{runner::get_exec_event_sender, runtime::get_runtime},
-    messages::{
-        ExecutionEvent, ExecutionReport as NautilusExecutionReport,
-        execution::{
-            BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-            GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
-            GenerateOrderStatusReportsBuilder, GeneratePositionStatusReports,
-            GeneratePositionStatusReportsBuilder, ModifyOrder, QueryAccount, QueryOrder,
-            SubmitOrder, SubmitOrderList,
-        },
+    live::{get_runtime, runner::get_exec_event_sender},
+    messages::execution::{
+        BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
+        GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
+        GenerateOrderStatusReportsBuilder, GeneratePositionStatusReports,
+        GeneratePositionStatusReportsBuilder, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
+        SubmitOrderList,
     },
 };
 use nautilus_core::{
-    MUTEX_POISONED, UUID4, UnixNanos,
-    datetime::{NANOSECONDS_IN_SECOND, nanos_to_millis},
-    time::get_atomic_clock_realtime,
+    MUTEX_POISONED, UnixNanos,
+    datetime::NANOSECONDS_IN_SECOND,
+    time::{AtomicTime, get_atomic_clock_realtime},
 };
-use nautilus_live::ExecutionClientCore;
+use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{OmsType, OrderSide, OrderType, TimeInForce, TriggerType},
-    events::{
-        AccountState, OrderCancelRejected, OrderEventAny, OrderModifyRejected, OrderRejected,
-        OrderSubmitted,
-    },
+    enums::{AccountType, OmsType, OrderSide, OrderType, TimeInForce, TriggerType},
+    events::OrderEventAny,
     identifiers::{AccountId, ClientId, Venue},
-    orders::Order,
+    orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance},
 };
@@ -76,10 +70,11 @@ use crate::{
 #[derive(Debug)]
 pub struct DeribitExecutionClient {
     core: ExecutionClientCore,
+    clock: &'static AtomicTime,
     config: DeribitExecClientConfig,
+    emitter: ExecutionEventEmitter,
     http_client: DeribitHttpClient,
     ws_client: DeribitWebSocketClient,
-    exec_event_sender: Option<tokio::sync::mpsc::UnboundedSender<ExecutionEvent>>,
     started: bool,
     connected: AtomicBool,
     instruments_initialized: AtomicBool,
@@ -128,12 +123,22 @@ impl DeribitExecutionClient {
         // Set account ID for order/fill reports
         ws_client.set_account_id(core.account_id);
 
+        let clock = get_atomic_clock_realtime();
+        let emitter = ExecutionEventEmitter::new(
+            clock,
+            core.trader_id,
+            core.account_id,
+            AccountType::Margin,
+            None,
+        );
+
         Ok(Self {
             core,
+            clock,
             config,
+            emitter,
             http_client,
             ws_client,
-            exec_event_sender: None,
             started: false,
             connected: AtomicBool::new(false),
             instruments_initialized: AtomicBool::new(false),
@@ -167,16 +172,6 @@ impl DeribitExecutionClient {
         }
     }
 
-    /// Dispatches an account state event to the execution event sender.
-    fn dispatch_account_state(&self, account_state: AccountState) -> anyhow::Result<()> {
-        if let Some(sender) = &self.exec_event_sender {
-            sender
-                .send(ExecutionEvent::Account(account_state))
-                .map_err(|e| anyhow::anyhow!("Failed to send account state: {e}"))?;
-        }
-        Ok(())
-    }
-
     /// Builds Deribit order parameters from a Nautilus order.
     fn build_order_params(order: &dyn Order) -> DeribitOrderParams {
         let order_type = match order.order_type() {
@@ -198,7 +193,15 @@ impl DeribitExecutionClient {
                 TimeInForce::Gtc => "good_til_cancelled",
                 TimeInForce::Ioc => "immediate_or_cancel",
                 TimeInForce::Fok => "fill_or_kill",
-                TimeInForce::Gtd => "good_til_date",
+                TimeInForce::Gtd => {
+                    if order.expire_time().is_some() {
+                        log::warn!(
+                            "Deribit GTD orders expire at 8:00 UTC only - custom expire_time is ignored. \
+                            For custom expiry times, use managed GTD with emulation_trigger."
+                        );
+                    }
+                    "good_til_day"
+                }
                 other => {
                     log::warn!(
                         "Unsupported time_in_force {other:?} for Deribit, falling back to GTC"
@@ -209,12 +212,9 @@ impl DeribitExecutionClient {
             .to_string(),
         );
 
-        // For GTD orders, extract expire_time and convert to milliseconds for Deribit
-        let valid_until = if order.time_in_force() == TimeInForce::Gtd {
-            order.expire_time().map(|t| nanos_to_millis(t.as_u64()))
-        } else {
-            None
-        };
+        // Deribit's `valid_until` is a REQUEST timeout, not order expiry.
+        // Deribit's `good_til_day` expires at end of trading session (8 UTC).
+        let valid_until = None;
 
         // Map trigger type for stop orders
         let trigger = order.trigger_type().and_then(|tt| {
@@ -259,45 +259,28 @@ impl DeribitExecutionClient {
     /// Submits a single order to Deribit.
     ///
     /// This is the core submission logic shared by `submit_order` and `submit_order_list`.
-    fn submit_single_order(
-        &self,
-        order: &dyn Order,
-        ts_init: UnixNanos,
-        task_name: &'static str,
-    ) -> anyhow::Result<()> {
+    fn submit_single_order(&self, order: &OrderAny, task_name: &'static str) -> anyhow::Result<()> {
         if order.is_closed() {
             log::warn!("Cannot submit closed order {}", order.client_order_id());
             return Ok(());
         }
 
         // Validate instrument belongs to Deribit venue
+        // TODO: We can do this in a cenrtalized place (execution client adapter?) upstream
         if order.instrument_id().venue != *DERIBIT_VENUE {
-            let rejected_event = OrderRejected::new(
-                self.core.trader_id,
+            let ts_event = self.clock.get_time_ns();
+            self.emitter.emit_order_rejected_event(
                 order.strategy_id(),
                 order.instrument_id(),
                 order.client_order_id(),
-                self.core.account_id,
-                format!(
+                &format!(
                     "Instrument {} does not belong to DERIBIT venue (got {})",
                     order.instrument_id(),
                     order.instrument_id().venue
-                )
-                .into(),
-                UUID4::new(),
-                ts_init,
-                get_atomic_clock_realtime().get_time_ns(),
-                false,
+                ),
+                ts_event,
                 false,
             );
-
-            if let Some(sender) = &self.exec_event_sender
-                && let Err(e) = sender.send(ExecutionEvent::Order(OrderEventAny::Rejected(
-                    rejected_event,
-                )))
-            {
-                log::warn!("Failed to send OrderRejected event: {e}");
-            }
 
             log::error!(
                 "Cannot submit order: instrument {} does not belong to DERIBIT venue",
@@ -313,33 +296,12 @@ impl DeribitExecutionClient {
         let instrument_id = order.instrument_id();
         let order_side = order.order_side();
 
-        // Send OrderSubmitted event
-        let submit_event = OrderSubmitted::new(
-            self.core.trader_id,
-            strategy_id,
-            instrument_id,
-            client_order_id,
-            self.core.account_id,
-            UUID4::new(),
-            ts_init,
-            get_atomic_clock_realtime().get_time_ns(),
-        );
-
-        if let Some(sender) = &self.exec_event_sender {
-            log::debug!("OrderSubmitted client_order_id={client_order_id}");
-            if let Err(e) = sender.send(ExecutionEvent::Order(OrderEventAny::Submitted(
-                submit_event,
-            ))) {
-                log::warn!("Failed to send OrderSubmitted event: {e}");
-            }
-        } else {
-            log::warn!("Cannot send OrderSubmitted: exec_event_sender not initialized");
-        }
+        log::debug!("OrderSubmitted client_order_id={client_order_id}");
+        self.emitter.emit_order_submitted(order);
 
         let ws_client = self.ws_client.clone();
-        let exec_event_sender = self.exec_event_sender.clone();
-        let trader_id_clone = self.core.trader_id;
-        let account_id = self.core.account_id;
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
 
         self.spawn_task(task_name, async move {
             let result = ws_client
@@ -354,30 +316,15 @@ impl DeribitExecutionClient {
                 .await;
 
             if let Err(e) = result {
-                let rejected_event = OrderRejected::new(
-                    trader_id_clone,
+                let ts_event = clock.get_time_ns();
+                emitter.emit_order_rejected_event(
                     strategy_id,
                     instrument_id,
                     client_order_id,
-                    account_id,
-                    format!("{task_name}-error: {e}").into(),
-                    UUID4::new(),
-                    ts_init,
-                    get_atomic_clock_realtime().get_time_ns(),
-                    false,
+                    &format!("{task_name}-error: {e}"),
+                    ts_event,
                     false,
                 );
-
-                if let Some(sender) = &exec_event_sender {
-                    if let Err(send_err) = sender.send(ExecutionEvent::Order(
-                        OrderEventAny::Rejected(rejected_event),
-                    )) {
-                        log::warn!("Failed to send OrderRejected event: {send_err}");
-                    }
-                } else {
-                    log::warn!("Cannot send OrderRejected: exec_event_sender not initialized");
-                }
-
                 return Err(e.into());
             }
 
@@ -396,16 +343,12 @@ impl DeribitExecutionClient {
             return;
         }
 
-        let sender = self
-            .exec_event_sender
-            .as_ref()
-            .expect("exec_event_sender should be initialized")
-            .clone();
+        let emitter = self.emitter.clone();
 
         let handle = get_runtime().spawn(async move {
             pin_mut!(stream);
             while let Some(message) = stream.next().await {
-                dispatch_ws_message(message, &sender);
+                dispatch_ws_message(message, &emitter);
             }
         });
 
@@ -437,7 +380,7 @@ impl ExecutionClient for DeribitExecutionClient {
     }
 
     fn get_account(&self) -> Option<AccountAny> {
-        self.core.get_account()
+        self.core.cache().account(&self.core.account_id).cloned()
     }
 
     fn generate_account_state(
@@ -447,8 +390,9 @@ impl ExecutionClient for DeribitExecutionClient {
         reported: bool,
         ts_event: UnixNanos,
     ) -> anyhow::Result<()> {
-        self.core
-            .generate_account_state(balances, margins, reported, ts_event)
+        self.emitter
+            .emit_account_state(balances, margins, reported, ts_event);
+        Ok(())
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
@@ -456,6 +400,8 @@ impl ExecutionClient for DeribitExecutionClient {
             return Ok(());
         }
 
+        let sender = get_exec_event_sender();
+        self.emitter.set_sender(sender);
         self.started = true;
 
         log::info!(
@@ -484,11 +430,6 @@ impl ExecutionClient for DeribitExecutionClient {
     async fn connect(&mut self) -> anyhow::Result<()> {
         if self.connected.load(Ordering::Acquire) {
             return Ok(());
-        }
-
-        // Initialize exec event sender (must be done in async context after runner is set up)
-        if self.exec_event_sender.is_none() {
-            self.exec_event_sender = Some(get_exec_event_sender());
         }
 
         // Check if credentials are available before requesting account state
@@ -527,7 +468,7 @@ impl ExecutionClient for DeribitExecutionClient {
             .await
             .context("failed to request account state")?;
 
-        self.dispatch_account_state(account_state)?;
+        self.emitter.send_account_state(account_state);
 
         self.ws_client
             .connect()
@@ -597,7 +538,7 @@ impl ExecutionClient for DeribitExecutionClient {
             let params = GetOrderStateParams {
                 order_id: venue_order_id.to_string(),
             };
-            let ts_init = get_atomic_clock_realtime().get_time_ns();
+            let ts_init = self.clock.get_time_ns();
 
             match self.http_client.inner.get_order_state(params).await {
                 Ok(response) => {
@@ -697,7 +638,7 @@ impl ExecutionClient for DeribitExecutionClient {
         lookback_mins: Option<u64>,
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
         log::info!("Generating ExecutionMassStatus (lookback_mins={lookback_mins:?})");
-        let ts_now = get_atomic_clock_realtime().get_time_ns();
+        let ts_now = self.clock.get_time_ns();
         let start = lookback_mins.map(|mins| {
             let lookback_ns = mins
                 .saturating_mul(60)
@@ -752,7 +693,7 @@ impl ExecutionClient for DeribitExecutionClient {
     fn query_account(&self, _cmd: &QueryAccount) -> anyhow::Result<()> {
         let http_client = self.http_client.clone();
         let account_id = self.core.account_id;
-        let exec_sender = self.exec_event_sender.clone();
+        let emitter = self.emitter.clone();
 
         self.spawn_task("query_account", async move {
             let account_state = http_client
@@ -760,11 +701,7 @@ impl ExecutionClient for DeribitExecutionClient {
                 .await
                 .context("failed to query account state (check API credentials are valid)")?;
 
-            if let Some(sender) = exec_sender {
-                sender
-                    .send(ExecutionEvent::Account(account_state))
-                    .map_err(|e| anyhow::anyhow!("Failed to send account state: {e}"))?;
-            }
+            emitter.send_account_state(account_state);
             Ok(())
         });
 
@@ -808,8 +745,13 @@ impl ExecutionClient for DeribitExecutionClient {
     }
 
     fn submit_order(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
-        let order = self.core.get_order(&cmd.client_order_id)?;
-        self.submit_single_order(&order, cmd.ts_init, "submit_order")
+        let order = self
+            .core
+            .cache()
+            .order(&cmd.client_order_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Order not found: {}", cmd.client_order_id))?;
+        self.submit_single_order(&order, "submit_order")
     }
 
     fn submit_order_list(&self, cmd: &SubmitOrderList) -> anyhow::Result<()> {
@@ -828,7 +770,7 @@ impl ExecutionClient for DeribitExecutionClient {
         // Deribit doesn't have native batch order submission
         // Loop through and submit each order individually using shared helper
         for order in &cmd.order_list.orders {
-            self.submit_single_order(order, cmd.ts_init, "submit_order_list_item")?;
+            self.submit_single_order(order, "submit_order_list_item")?;
         }
 
         Ok(())
@@ -849,7 +791,10 @@ impl ExecutionClient for DeribitExecutionClient {
             qty
         } else {
             // Get order from cache to use its current quantity
-            let order = self.core.get_order(&cmd.client_order_id)?;
+            let cache = self.core.cache();
+            let order = cache
+                .order(&cmd.client_order_id)
+                .ok_or_else(|| anyhow::anyhow!("Order not found: {}", cmd.client_order_id))?;
             order.quantity()
         };
 
@@ -862,9 +807,8 @@ impl ExecutionClient for DeribitExecutionClient {
         let strategy_id = cmd.strategy_id;
         let instrument_id = cmd.instrument_id;
         let venue_order_id = cmd.venue_order_id;
-        let ts_init = cmd.ts_init;
-        let exec_event_sender = self.exec_event_sender.clone();
-        let account_id = self.core.account_id;
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
 
         log::info!(
             "Modifying order: order_id={order_id}, quantity={quantity}, price={price}, client_order_id={client_order_id}"
@@ -888,28 +832,15 @@ impl ExecutionClient for DeribitExecutionClient {
                     "Modify order failed: order_id={order_id}, client_order_id={client_order_id}, error={e}"
                 );
 
-                // Send OrderModifyRejected event
-                let rejected_event = OrderModifyRejected::new(
-                    trader_id,
+                let ts_event = clock.get_time_ns();
+                emitter.emit_order_modify_rejected_event(
                     strategy_id,
                     instrument_id,
                     client_order_id,
-                    format!("modify-order-error: {e}").into(),
-                    UUID4::new(),
-                    ts_init,
-                    get_atomic_clock_realtime().get_time_ns(),
-                    false,
                     venue_order_id,
-                    Some(account_id),
+                    &format!("modify-order-error: {e}"),
+                    ts_event,
                 );
-
-                if let Some(sender) = &exec_event_sender
-                    && let Err(send_err) = sender.send(ExecutionEvent::Order(
-                        OrderEventAny::ModifyRejected(rejected_event),
-                    ))
-                {
-                    log::warn!("Failed to send OrderModifyRejected event: {send_err}");
-                }
 
                 anyhow::bail!("Modify order failed: {e}");
             }
@@ -934,9 +865,8 @@ impl ExecutionClient for DeribitExecutionClient {
         let strategy_id = cmd.strategy_id;
         let instrument_id = cmd.instrument_id;
         let venue_order_id = cmd.venue_order_id;
-        let ts_init = cmd.ts_init;
-        let exec_event_sender = self.exec_event_sender.clone();
-        let account_id = self.core.account_id;
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
 
         log::info!("Canceling order: order_id={order_id}, client_order_id={client_order_id}");
 
@@ -956,28 +886,15 @@ impl ExecutionClient for DeribitExecutionClient {
                     "Cancel order failed: order_id={order_id}, client_order_id={client_order_id}, error={e}"
                 );
 
-                // Send OrderCancelRejected event
-                let rejected_event = OrderCancelRejected::new(
-                    trader_id,
+                let ts_event = clock.get_time_ns();
+                emitter.emit_order_cancel_rejected_event(
                     strategy_id,
                     instrument_id,
                     client_order_id,
-                    format!("cancel-order-error: {e}").into(),
-                    UUID4::new(),
-                    ts_init,
-                    get_atomic_clock_realtime().get_time_ns(),
-                    false,
                     venue_order_id,
-                    Some(account_id),
+                    &format!("cancel-order-error: {e}"),
+                    ts_event,
                 );
-
-                if let Some(sender) = &exec_event_sender
-                    && let Err(send_err) = sender.send(ExecutionEvent::Order(
-                        OrderEventAny::CancelRejected(rejected_event),
-                    ))
-                {
-                    log::warn!("Failed to send OrderCancelRejected event: {send_err}");
-                }
 
                 anyhow::bail!("Cancel order failed: {e}");
             }
@@ -1017,7 +934,7 @@ impl ExecutionClient for DeribitExecutionClient {
         );
 
         let orders_to_cancel: Vec<_> = {
-            let cache = self.core.cache().borrow();
+            let cache = self.core.cache();
             let open_orders = cache.orders_open(None, Some(&instrument_id), None, None, None);
 
             open_orders
@@ -1051,10 +968,6 @@ impl ExecutionClient for DeribitExecutionClient {
             instrument_id
         );
 
-        let ts_init = cmd.ts_init;
-        let exec_event_sender = self.exec_event_sender.clone();
-        let account_id = self.core.account_id;
-
         // Cancel each matching order individually
         for (venue_order_id_str, client_order_id, order_instrument_id, venue_order_id) in
             orders_to_cancel
@@ -1062,7 +975,8 @@ impl ExecutionClient for DeribitExecutionClient {
             let ws_client = self.ws_client.clone();
             let trader_id = cmd.trader_id;
             let strategy_id = cmd.strategy_id;
-            let exec_event_sender = exec_event_sender.clone();
+            let emitter = self.emitter.clone();
+            let clock = self.clock;
 
             self.spawn_task("cancel_order_by_side", async move {
                 if let Err(e) = ws_client
@@ -1079,27 +993,15 @@ impl ExecutionClient for DeribitExecutionClient {
                         "Cancel order failed: order_id={venue_order_id_str}, client_order_id={client_order_id}, error={e}"
                     );
 
-                    let rejected_event = OrderCancelRejected::new(
-                        trader_id,
+                    let ts_event = clock.get_time_ns();
+                    emitter.emit_order_cancel_rejected_event(
                         strategy_id,
                         order_instrument_id,
                         client_order_id,
-                        format!("cancel-order-error: {e}").into(),
-                        UUID4::new(),
-                        ts_init,
-                        get_atomic_clock_realtime().get_time_ns(),
-                        false,
                         venue_order_id,
-                        Some(account_id),
+                        &format!("cancel-order-error: {e}"),
+                        ts_event,
                     );
-
-                    if let Some(sender) = &exec_event_sender
-                        && let Err(send_err) = sender.send(ExecutionEvent::Order(
-                            OrderEventAny::CancelRejected(rejected_event),
-                        ))
-                    {
-                        log::warn!("Failed to send OrderCancelRejected event: {send_err}");
-                    }
                 }
                 Ok(())
             });
@@ -1132,38 +1034,26 @@ impl ExecutionClient for DeribitExecutionClient {
                     );
 
                     // Emit OrderCancelRejected event for missing venue_order_id
-                    if let Some(sender) = &self.exec_event_sender {
-                        let rejected_event = OrderCancelRejected::new(
-                            cancel.trader_id,
-                            cancel.strategy_id,
-                            cancel.instrument_id,
-                            cancel.client_order_id,
-                            "venue_order_id required for cancel".into(),
-                            UUID4::new(),
-                            cancel.ts_init,
-                            get_atomic_clock_realtime().get_time_ns(),
-                            false,
-                            None,
-                            Some(self.core.account_id),
-                        );
-                        if let Err(e) = sender.send(ExecutionEvent::Order(
-                            OrderEventAny::CancelRejected(rejected_event),
-                        )) {
-                            log::warn!("Failed to send OrderCancelRejected event: {e}");
-                        }
-                    }
+                    let ts_event = self.clock.get_time_ns();
+                    self.emitter.emit_order_cancel_rejected_event(
+                        cancel.strategy_id,
+                        cancel.instrument_id,
+                        cancel.client_order_id,
+                        None,
+                        "venue_order_id required for cancel",
+                        ts_event,
+                    );
                     continue;
                 }
             };
 
             let ws_client = self.ws_client.clone();
-            let exec_event_sender = self.exec_event_sender.clone();
+            let emitter = self.emitter.clone();
+            let clock = self.clock;
             let client_order_id = cancel.client_order_id;
             let trader_id = cancel.trader_id;
             let strategy_id = cancel.strategy_id;
             let instrument_id = cancel.instrument_id;
-            let account_id = self.core.account_id;
-            let ts_init = cancel.ts_init;
 
             self.spawn_task("batch_cancel_order", async move {
                 if let Err(e) = ws_client
@@ -1180,28 +1070,15 @@ impl ExecutionClient for DeribitExecutionClient {
                         "Batch cancel order failed: order_id={order_id}, client_order_id={client_order_id}, error={e}"
                     );
 
-                    // Send OrderCancelRejected event for this specific cancel
-                    let rejected_event = OrderCancelRejected::new(
-                        trader_id,
+                    let ts_event = clock.get_time_ns();
+                    emitter.emit_order_cancel_rejected_event(
                         strategy_id,
                         instrument_id,
                         client_order_id,
-                        format!("batch-cancel-error: {e}").into(),
-                        UUID4::new(),
-                        ts_init,
-                        get_atomic_clock_realtime().get_time_ns(),
-                        false,
                         None,
-                        Some(account_id),
+                        &format!("batch-cancel-error: {e}"),
+                        ts_event,
                     );
-
-                    if let Some(sender) = &exec_event_sender
-                        && let Err(send_err) = sender.send(ExecutionEvent::Order(
-                            OrderEventAny::CancelRejected(rejected_event),
-                        ))
-                    {
-                        log::warn!("Failed to send OrderCancelRejected event: {send_err}");
-                    }
 
                     anyhow::bail!("Batch cancel order failed: {e}");
                 }
@@ -1213,71 +1090,44 @@ impl ExecutionClient for DeribitExecutionClient {
     }
 }
 
-/// Dispatches a WebSocket message to the execution event sender.
-fn dispatch_ws_message(
-    message: NautilusWsMessage,
-    sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
-) {
+/// Dispatches a WebSocket message using the event emitter.
+fn dispatch_ws_message(message: NautilusWsMessage, emitter: &ExecutionEventEmitter) {
     match message {
         NautilusWsMessage::AccountState(state) => {
-            if let Err(e) = sender.send(ExecutionEvent::Account(state)) {
-                log::warn!("Failed to send account state: {e}");
-            }
+            emitter.send_account_state(state);
         }
         NautilusWsMessage::OrderStatusReports(reports) => {
             log::debug!("Processing {} order status report(s)", reports.len());
             for report in reports {
-                let exec_report = NautilusExecutionReport::Order(Box::new(report));
-                if let Err(e) = sender.send(ExecutionEvent::Report(exec_report)) {
-                    log::warn!("Failed to send order status report: {e}");
-                }
+                emitter.send_order_status_report(report);
             }
         }
         NautilusWsMessage::FillReports(reports) => {
             log::debug!("Processing {} fill report(s)", reports.len());
             for report in reports {
-                let exec_report = NautilusExecutionReport::Fill(Box::new(report));
-                if let Err(e) = sender.send(ExecutionEvent::Report(exec_report)) {
-                    log::warn!("Failed to send fill report: {e}");
-                }
+                emitter.send_fill_report(report);
             }
         }
         NautilusWsMessage::OrderRejected(event) => {
-            if let Err(e) = sender.send(ExecutionEvent::Order(OrderEventAny::Rejected(event))) {
-                log::warn!("Failed to send order rejected event: {e}");
-            }
+            emitter.send_order_event(OrderEventAny::Rejected(event));
         }
         NautilusWsMessage::OrderAccepted(event) => {
-            if let Err(e) = sender.send(ExecutionEvent::Order(OrderEventAny::Accepted(event))) {
-                log::warn!("Failed to send order accepted event: {e}");
-            }
+            emitter.send_order_event(OrderEventAny::Accepted(event));
         }
         NautilusWsMessage::OrderCanceled(event) => {
-            if let Err(e) = sender.send(ExecutionEvent::Order(OrderEventAny::Canceled(event))) {
-                log::warn!("Failed to send order canceled event: {e}");
-            }
+            emitter.send_order_event(OrderEventAny::Canceled(event));
         }
         NautilusWsMessage::OrderExpired(event) => {
-            if let Err(e) = sender.send(ExecutionEvent::Order(OrderEventAny::Expired(event))) {
-                log::warn!("Failed to send order expired event: {e}");
-            }
+            emitter.send_order_event(OrderEventAny::Expired(event));
         }
         NautilusWsMessage::OrderUpdated(event) => {
-            if let Err(e) = sender.send(ExecutionEvent::Order(OrderEventAny::Updated(event))) {
-                log::warn!("Failed to send order updated event: {e}");
-            }
+            emitter.send_order_event(OrderEventAny::Updated(event));
         }
         NautilusWsMessage::OrderCancelRejected(event) => {
-            if let Err(e) = sender.send(ExecutionEvent::Order(OrderEventAny::CancelRejected(event)))
-            {
-                log::warn!("Failed to send order cancel rejected event: {e}");
-            }
+            emitter.send_order_event(OrderEventAny::CancelRejected(event));
         }
         NautilusWsMessage::OrderModifyRejected(event) => {
-            if let Err(e) = sender.send(ExecutionEvent::Order(OrderEventAny::ModifyRejected(event)))
-            {
-                log::warn!("Failed to send order modify rejected event: {e}");
-            }
+            emitter.send_order_event(OrderEventAny::ModifyRejected(event));
         }
         NautilusWsMessage::Error(e) => {
             log::warn!("WebSocket error: {e}");

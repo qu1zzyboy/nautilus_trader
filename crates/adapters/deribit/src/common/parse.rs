@@ -146,7 +146,11 @@ pub fn parse_deribit_instrument_any(
             parse_option_instrument(instrument, ts_init, ts_event).map(Some)
         }
         DeribitInstrumentKind::FutureCombo | DeribitInstrumentKind::OptionCombo => {
-            // Skip combos for initial implementation
+            log::debug!(
+                "Skipping combo instrument: {} (kind={:?})",
+                instrument.instrument_name,
+                instrument.kind
+            );
             Ok(None)
         }
     }
@@ -853,7 +857,7 @@ mod tests {
         let instrument = instrument_any.expect("Should parse perpetual instrument");
 
         let InstrumentAny::CryptoPerpetual(perpetual) = instrument else {
-            panic!("Expected CryptoPerpetual, got {instrument:?}");
+            panic!("Expected CryptoPerpetual, was {instrument:?}");
         };
         assert_eq!(perpetual.id(), InstrumentId::from("BTC-PERPETUAL.DERIBIT"));
         assert_eq!(perpetual.raw_symbol(), Symbol::from("BTC-PERPETUAL"));
@@ -890,7 +894,7 @@ mod tests {
         let instrument = instrument_any.expect("Should parse future instrument");
 
         let InstrumentAny::CryptoFuture(future) = instrument else {
-            panic!("Expected CryptoFuture, got {instrument:?}");
+            panic!("Expected CryptoFuture, was {instrument:?}");
         };
         assert_eq!(future.id(), InstrumentId::from("BTC-27DEC24.DERIBIT"));
         assert_eq!(future.raw_symbol(), Symbol::from("BTC-27DEC24"));
@@ -936,7 +940,7 @@ mod tests {
 
         // Verify it's an OptionContract
         let InstrumentAny::OptionContract(option) = instrument else {
-            panic!("Expected OptionContract, got {instrument:?}");
+            panic!("Expected OptionContract, was {instrument:?}");
         };
 
         assert_eq!(
@@ -1185,14 +1189,14 @@ mod tests {
         let spread = book.spread().expect("Spread should exist");
         assert!(
             (spread - 0.5).abs() < 0.0001,
-            "Spread should be 0.5, got {spread}"
+            "Spread should be 0.5, was {spread}"
         );
 
         // Verify midpoint ((87003.0 + 87002.5) / 2 = 87002.75)
         let midpoint = book.midpoint().expect("Midpoint should exist");
         assert!(
             (midpoint - 87002.75).abs() < 0.0001,
-            "Midpoint should be 87002.75, got {midpoint}"
+            "Midpoint should be 87002.75, was {midpoint}"
         );
 
         // Verify level counts match input data

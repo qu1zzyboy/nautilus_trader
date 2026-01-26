@@ -17,6 +17,7 @@
 
 use ahash::AHashMap;
 use anyhow::Context;
+use chrono::{Duration, TimeZone, Timelike, Utc};
 use nautilus_core::{UUID4, UnixNanos, datetime::NANOSECONDS_IN_MILLISECOND};
 use nautilus_model::{
     data::{
@@ -46,6 +47,20 @@ use super::{
     },
 };
 use crate::http::models::DeribitPosition;
+
+fn next_8_utc(from_ns: UnixNanos) -> UnixNanos {
+    let from_secs = from_ns.as_u64() / 1_000_000_000;
+    let dt = Utc.timestamp_opt(from_secs as i64, 0).unwrap();
+    let next_8 = if dt.hour() < 8 {
+        dt.date_naive().and_hms_opt(8, 0, 0).unwrap().and_utc()
+    } else {
+        (dt.date_naive() + Duration::days(1))
+            .and_hms_opt(8, 0, 0)
+            .unwrap()
+            .and_utc()
+    };
+    UnixNanos::from(next_8.timestamp_nanos_opt().unwrap() as u64)
+}
 
 /// Parses a Deribit trade message into a Nautilus `TradeTick`.
 ///
@@ -118,70 +133,104 @@ pub fn parse_book_snapshot(
 
     let mut deltas = Vec::new();
 
-    // Add CLEAR action first for snapshot
-    deltas.push(OrderBookDelta::clear(
+    let has_levels = !msg.bids.is_empty() || !msg.asks.is_empty();
+
+    // All snapshot deltas get F_SNAPSHOT; CLEAR also gets F_LAST if no levels follow
+    let clear_flags = if has_levels {
+        RecordFlag::F_SNAPSHOT as u8
+    } else {
+        RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8
+    };
+
+    deltas.push(OrderBookDelta::new(
         instrument_id,
+        BookAction::Clear,
+        BookOrder::default(),
+        clear_flags,
         msg.change_id,
         ts_event,
         ts_init,
     ));
 
-    // Parse bids: ["new", price, amount] for snapshot (3-element format)
+    // Parse bids - handles both formats:
+    // - Simple channel: ["new", price, amount] (3 elements)
+    // - Grouped channel: [price, amount] (2 elements)
     for (i, bid) in msg.bids.iter().enumerate() {
-        if bid.len() >= 3 {
-            // Skip action field (bid[0]), use bid[1] for price and bid[2] for amount
-            let price_val = bid[1].as_f64().unwrap_or(0.0);
-            let amount_val = bid[2].as_f64().unwrap_or(0.0);
+        let (price_val, amount_val) = if bid.len() >= 3 {
+            // 3-element format: skip action field, use indices 1 and 2
+            (
+                bid[1].as_f64().unwrap_or(0.0),
+                bid[2].as_f64().unwrap_or(0.0),
+            )
+        } else if bid.len() >= 2 {
+            // 2-element format: use indices 0 and 1 directly
+            (
+                bid[0].as_f64().unwrap_or(0.0),
+                bid[1].as_f64().unwrap_or(0.0),
+            )
+        } else {
+            continue;
+        };
 
-            if amount_val > 0.0 {
-                let price = Price::new(price_val, price_precision);
-                let size = Quantity::new(amount_val, size_precision);
+        if amount_val > 0.0 {
+            let price = Price::new(price_val, price_precision);
+            let size = Quantity::new(amount_val, size_precision);
 
-                deltas.push(OrderBookDelta::new(
-                    instrument_id,
-                    BookAction::Add,
-                    BookOrder::new(OrderSide::Buy, price, size, i as u64),
-                    0, // No flags for regular deltas
-                    msg.change_id,
-                    ts_event,
-                    ts_init,
-                ));
-            }
+            deltas.push(OrderBookDelta::new(
+                instrument_id,
+                BookAction::Add,
+                BookOrder::new(OrderSide::Buy, price, size, i as u64),
+                RecordFlag::F_SNAPSHOT as u8,
+                msg.change_id,
+                ts_event,
+                ts_init,
+            ));
         }
     }
 
-    // Parse asks: ["new", price, amount] for snapshot (3-element format)
+    // Parse asks - handles both formats:
+    // - Simple channel: ["new", price, amount] (3 elements)
+    // - Grouped channel: [price, amount] (2 elements)
     let num_bids = msg.bids.len();
     for (i, ask) in msg.asks.iter().enumerate() {
-        if ask.len() >= 3 {
-            // Skip action field (ask[0]), use ask[1] for price and ask[2] for amount
-            let price_val = ask[1].as_f64().unwrap_or(0.0);
-            let amount_val = ask[2].as_f64().unwrap_or(0.0);
+        let (price_val, amount_val) = if ask.len() >= 3 {
+            // 3-element format: skip action field, use indices 1 and 2
+            (
+                ask[1].as_f64().unwrap_or(0.0),
+                ask[2].as_f64().unwrap_or(0.0),
+            )
+        } else if ask.len() >= 2 {
+            // 2-element format: use indices 0 and 1 directly
+            (
+                ask[0].as_f64().unwrap_or(0.0),
+                ask[1].as_f64().unwrap_or(0.0),
+            )
+        } else {
+            continue;
+        };
 
-            if amount_val > 0.0 {
-                let price = Price::new(price_val, price_precision);
-                let size = Quantity::new(amount_val, size_precision);
+        if amount_val > 0.0 {
+            let price = Price::new(price_val, price_precision);
+            let size = Quantity::new(amount_val, size_precision);
 
-                deltas.push(OrderBookDelta::new(
-                    instrument_id,
-                    BookAction::Add,
-                    BookOrder::new(OrderSide::Sell, price, size, (num_bids + i) as u64),
-                    0, // No flags for regular deltas
-                    msg.change_id,
-                    ts_event,
-                    ts_init,
-                ));
-            }
+            deltas.push(OrderBookDelta::new(
+                instrument_id,
+                BookAction::Add,
+                BookOrder::new(OrderSide::Sell, price, size, (num_bids + i) as u64),
+                RecordFlag::F_SNAPSHOT as u8,
+                msg.change_id,
+                ts_event,
+                ts_init,
+            ));
         }
     }
 
-    // Set F_LAST flag on the last delta
     if let Some(last) = deltas.last_mut() {
         *last = OrderBookDelta::new(
             last.instrument_id,
             last.action,
             last.order,
-            RecordFlag::F_LAST as u8,
+            RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8,
             last.sequence,
             last.ts_event,
             last.ts_init,
@@ -303,7 +352,7 @@ pub fn parse_book_msg(
 ///
 /// # Errors
 ///
-/// Returns an error if the quote cannot be parsed.
+/// Returns an error if the quote cannot be parsed or prices are missing.
 pub fn parse_ticker_to_quote(
     msg: &DeribitTickerMsg,
     instrument: &InstrumentAny,
@@ -313,8 +362,15 @@ pub fn parse_ticker_to_quote(
     let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
 
-    let bid_price = Price::new(msg.best_bid_price.unwrap_or(0.0), price_precision);
-    let ask_price = Price::new(msg.best_ask_price.unwrap_or(0.0), price_precision);
+    let bid_price_val = msg
+        .best_bid_price
+        .context("Missing best_bid_price in ticker")?;
+    let ask_price_val = msg
+        .best_ask_price
+        .context("Missing best_ask_price in ticker")?;
+
+    let bid_price = Price::new(bid_price_val, price_precision);
+    let ask_price = Price::new(ask_price_val, price_precision);
     let bid_size = Quantity::new(msg.best_bid_amount.unwrap_or(0.0), size_precision);
     let ask_size = Quantity::new(msg.best_ask_amount.unwrap_or(0.0), size_precision);
     let ts_event = UnixNanos::new(msg.timestamp * NANOSECONDS_IN_MILLISECOND);
@@ -552,13 +608,16 @@ pub fn parse_user_order_msg(
         _ => OrderType::Limit, // Default to Limit for unknown types
     };
 
-    // Map Deribit time in force to Nautilus
+    // Deribit supports: good_til_cancelled, good_til_day, fill_or_kill, immediate_or_cancel
     let time_in_force = match msg.time_in_force.as_str() {
-        "good_til_cancelled" | "gtc" => TimeInForce::Gtc,
-        "good_til_day" | "gtd" => TimeInForce::Gtd,
-        "fill_or_kill" | "fok" => TimeInForce::Fok,
-        "immediate_or_cancel" | "ioc" => TimeInForce::Ioc,
-        _ => TimeInForce::Gtc, // Default to GTC
+        "good_til_cancelled" => TimeInForce::Gtc,
+        "good_til_day" => TimeInForce::Gtd,
+        "fill_or_kill" => TimeInForce::Fok,
+        "immediate_or_cancel" => TimeInForce::Ioc,
+        other => {
+            log::warn!("Unknown time_in_force '{other}', defaulting to GTC");
+            TimeInForce::Gtc
+        }
     };
 
     // Map Deribit order state to Nautilus status
@@ -616,6 +675,11 @@ pub fn parse_user_order_msg(
     {
         let price = Price::from_decimal_dp(price_val, price_precision)?;
         report = report.with_price(price);
+    }
+
+    if time_in_force == TimeInForce::Gtd {
+        let expire_time = next_8_utc(ts_accepted);
+        report = report.with_expire_time(expire_time);
     }
 
     // Add average price if filled
@@ -1317,6 +1381,66 @@ mod tests {
         assert_eq!(ask_change.order.side, OrderSide::Sell);
         assert_eq!(ask_change.order.price, instrument.make_price(42501.5));
         assert_eq!(ask_change.order.size, instrument.make_qty(700.0, None));
+    }
+
+    #[rstest]
+    fn test_parse_book_grouped_snapshot() {
+        // Test parsing grouped book channel format: book.{instrument}.{group}.{depth}.{interval}
+        // This format has NO type field and uses 2-element arrays [price, amount]
+        let instrument = test_perpetual_instrument();
+        let json = load_test_json("ws_book_grouped_snapshot.json");
+        let response: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let msg: DeribitBookMsg =
+            serde_json::from_value(response["params"]["data"].clone()).unwrap();
+
+        // Validate raw message format - grouped channel uses 2-element arrays: [price, amount]
+        assert_eq!(
+            msg.bids[0].len(),
+            2,
+            "Grouped bids should have 2 elements: [price, amount]"
+        );
+        assert_eq!(
+            msg.asks[0].len(),
+            2,
+            "Grouped asks should have 2 elements: [price, amount]"
+        );
+
+        // Verify msg_type defaults to Snapshot (grouped channel has no type field)
+        assert_eq!(
+            msg.msg_type,
+            DeribitBookMsgType::Snapshot,
+            "Grouped channel should default to Snapshot type"
+        );
+
+        let deltas = parse_book_snapshot(&msg, &instrument, UnixNanos::default()).unwrap();
+
+        assert_eq!(deltas.instrument_id, instrument.id());
+        // Should have CLEAR + 10 bids + 10 asks = 21 deltas
+        assert_eq!(deltas.deltas.len(), 21);
+
+        // First delta should be CLEAR
+        assert_eq!(deltas.deltas[0].action, BookAction::Clear);
+
+        // Verify first bid was parsed correctly from [89532.5, 254900.0]
+        let first_bid = &deltas.deltas[1];
+        assert_eq!(first_bid.action, BookAction::Add);
+        assert_eq!(first_bid.order.side, OrderSide::Buy);
+        assert_eq!(first_bid.order.price, instrument.make_price(89532.5));
+        assert_eq!(first_bid.order.size, instrument.make_qty(254900.0, None));
+
+        // Verify first ask was parsed correctly from [89533.0, 91570.0]
+        let first_ask = &deltas.deltas[11];
+        assert_eq!(first_ask.action, BookAction::Add);
+        assert_eq!(first_ask.order.side, OrderSide::Sell);
+        assert_eq!(first_ask.order.price, instrument.make_price(89533.0));
+        assert_eq!(first_ask.order.size, instrument.make_qty(91570.0, None));
+
+        // Check F_LAST flag on last delta
+        let last = deltas.deltas.last().unwrap();
+        assert_eq!(
+            last.flags & RecordFlag::F_LAST as u8,
+            RecordFlag::F_LAST as u8
+        );
     }
 
     #[rstest]

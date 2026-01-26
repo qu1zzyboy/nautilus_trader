@@ -210,10 +210,10 @@ pub fn parse_spot_instrument(
         None,
         None,
         None,
+        None,
+        None,
         maker_fee,
         taker_fee,
-        None,
-        None,
         ts_event,
         ts_init,
     );
@@ -331,13 +331,11 @@ pub fn parse_futures_instrument(
 }
 
 fn parse_price(value: &str, field: &str) -> anyhow::Result<Price> {
-    Price::from_str(value)
-        .map_err(|err| anyhow::anyhow!("Failed to parse {field}='{value}': {err}"))
+    Price::from_str(value).map_err(|e| anyhow::anyhow!("Failed to parse {field}='{value}': {e}"))
 }
 
 fn parse_quantity(value: &str, field: &str) -> anyhow::Result<Quantity> {
-    Quantity::from_str(value)
-        .map_err(|err| anyhow::anyhow!("Failed to parse {field}='{value}': {err}"))
+    Quantity::from_str(value).map_err(|e| anyhow::anyhow!("Failed to parse {field}='{value}': {e}"))
 }
 
 /// Returns a currency from the internal map or creates a new crypto currency.
@@ -1096,6 +1094,10 @@ mod tests {
                 assert!(pair.price_increment.as_f64() > 0.0);
                 assert!(pair.size_increment.as_f64() > 0.0);
                 assert!(pair.min_quantity.is_some());
+                assert_eq!(pair.maker_fee, dec!(0.0025));
+                assert_eq!(pair.taker_fee, dec!(0.004));
+                assert_eq!(pair.margin_init, dec!(0));
+                assert_eq!(pair.margin_maint, dec!(0));
             }
             _ => panic!("Expected CurrencyPair"),
         }

@@ -1013,7 +1013,7 @@ impl BinanceFuturesHttpClient {
             BinanceProductType::UsdM | BinanceProductType::CoinM => {}
             _ => {
                 return Err(BinanceFuturesHttpError::ValidationError(format!(
-                    "BinanceFuturesHttpClient requires UsdM or CoinM product type, got {product_type:?}"
+                    "BinanceFuturesHttpClient requires UsdM or CoinM product type, was {product_type:?}"
                 )));
             }
         }
@@ -1474,6 +1474,8 @@ impl BinanceFuturesHttpClient {
             new_order_resp_type: None,
             good_till_date: None,
             recv_window: None,
+            price_match: None,
+            self_trade_prevention_mode: None,
         };
 
         let order = self.raw.submit_order(&params).await?;
@@ -1764,7 +1766,7 @@ impl BinanceFuturesHttpClient {
             let order_instrument_id = instrument_id.unwrap_or_else(|| {
                 // Build instrument ID from order symbol
                 let suffix = self.product_type.suffix();
-                InstrumentId::from(format!("{}{}.BINANCE", order.symbol, suffix).as_str())
+                InstrumentId::from(format!("{}{}.BINANCE", order.symbol, suffix))
             });
 
             let size_precision = self.get_size_precision(&order.symbol).unwrap_or(8); // Default precision if not in cache
@@ -2036,7 +2038,7 @@ mod tests {
                 assert_eq!(code, -1121);
                 assert_eq!(message, "Invalid symbol.");
             }
-            other => panic!("Expected BinanceError, got {other:?}"),
+            other => panic!("Expected BinanceError, was {other:?}"),
         }
     }
 }

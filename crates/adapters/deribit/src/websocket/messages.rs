@@ -165,11 +165,14 @@ pub struct DeribitTradeMsg {
     pub combo_id: Option<String>,
 }
 
-/// Order book data from book.{instrument}.raw channel.
+/// Order book data from book.{instrument}.{interval} or book.{instrument}.{group}.{depth}.{interval} channels.
+///
+/// Note: The grouped book channel (`book.{instrument}.{group}.{depth}.{interval}`) does not include
+/// a `type` field since it always sends complete snapshots. We default to `Snapshot` when not present.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeribitBookMsg {
-    /// Message type (snapshot or change).
-    #[serde(rename = "type")]
+    /// Message type (snapshot or change). Defaults to Snapshot for grouped channels.
+    #[serde(rename = "type", default = "default_book_msg_type")]
     pub msg_type: DeribitBookMsgType,
     /// Instrument name.
     pub instrument_name: Ustr,
@@ -183,6 +186,11 @@ pub struct DeribitBookMsg {
     pub bids: Vec<Vec<serde_json::Value>>,
     /// Ask levels: [action, price, amount] where action is "new" for snapshot, "new"/"change"/"delete" for change.
     pub asks: Vec<Vec<serde_json::Value>>,
+}
+
+/// Default book message type for grouped channels (always snapshot).
+fn default_book_msg_type() -> DeribitBookMsgType {
+    DeribitBookMsgType::Snapshot
 }
 
 /// Parsed order book level.
@@ -364,7 +372,7 @@ pub struct DeribitOrderParams {
         with = "rust_decimal::serde::float_option"
     )]
     pub price: Option<Decimal>,
-    /// Time in force: "good_til_cancelled", "good_til_date", "fill_or_kill", "immediate_or_cancel".
+    /// Time in force: "good_til_cancelled", "good_til_day", "fill_or_kill", "immediate_or_cancel".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_in_force: Option<String>,
     /// Post-only flag. If true and order would take liquidity, price is adjusted
@@ -834,7 +842,7 @@ mod tests {
                 assert_eq!(error.code, 10028);
                 assert_eq!(error.message, "too_many_requests");
             }
-            _ => panic!("Expected Response with error, got {msg:?}"),
+            _ => panic!("Expected Response with error, was {msg:?}"),
         }
     }
 

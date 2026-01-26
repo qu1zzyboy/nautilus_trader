@@ -19,9 +19,9 @@
 //!
 //! Message types are separated into data (public market data) and execution
 //! (private user data stream) concerns:
-//! - [`NautilusFuturesDataWsMessage`] - Market data for data clients
-//! - [`NautilusFuturesExecWsMessage`] - User data for execution clients
-//! - [`BinanceFuturesWsMessage`] - Wrapper enum containing both
+//! - [`NautilusDataWsMessage`] - Market data for data clients.
+//! - [`NautilusExecWsMessage`] - User data for execution clients.
+//! - [`NautilusWsMessage`] - Wrapper enum containing both.
 
 use nautilus_model::{
     data::{Data, OrderBookDeltas},
@@ -68,8 +68,12 @@ pub enum NautilusWsMessage {
 pub enum NautilusDataWsMessage {
     /// Market data (trades, quotes, etc.).
     Data(Vec<Data>),
-    /// Order book deltas.
-    Deltas(OrderBookDeltas),
+    /// Order book deltas with Binance-specific sequence metadata for validation.
+    DepthUpdate {
+        deltas: OrderBookDeltas,
+        first_update_id: u64,
+        prev_final_update_id: u64,
+    },
     /// Instrument update.
     Instrument(Box<InstrumentAny>),
     /// Raw JSON message (for debugging or unhandled types).
@@ -105,7 +109,7 @@ pub enum NautilusExecWsMessage {
 ///
 /// These are raw messages from the user data stream that require
 /// a listen key for authentication. The execution handler processes these
-/// and emits normalized Nautilus events via [`NautilusFuturesExecEvent`].
+/// and emits normalized Nautilus events via [`NautilusExecWsMessage`].
 #[derive(Debug, Clone)]
 pub enum BinanceFuturesExecWsMessage {
     /// Account update (balance/position changes).
