@@ -17,6 +17,7 @@
 
 pub mod atr;
 pub mod dc;
+pub mod dc_fixed;
 pub mod fuzzy;
 pub mod kc;
 pub mod kp;
