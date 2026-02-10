@@ -27,7 +27,11 @@ use std::{
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use nautilus_common::live::get_runtime;
-use nautilus_core::{UnixNanos, consts::NAUTILUS_USER_AGENT};
+use nautilus_core::{
+    consts::NAUTILUS_USER_AGENT,
+    nanos::UnixNanos,
+    time::{AtomicTime, get_atomic_clock_realtime},
+};
 use nautilus_model::{
     enums::{OrderSide, OrderType, TimeInForce},
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
@@ -41,12 +45,15 @@ use nautilus_network::{
         AuthTracker, PingHandler, WebSocketClient, WebSocketConfig, channel_message_handler,
     },
 };
-use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use super::handler::{FeedHandler, HandlerCommand, WsOrderInfo};
 use crate::{
-    common::enums::{AxOrderSide, AxOrderType, AxTimeInForce},
+    common::{
+        consts::AX_NAUTILUS_TAG,
+        enums::{AxOrderRequestType, AxOrderSide, AxOrderType, AxTimeInForce},
+        parse::{client_order_id_to_cid, quantity_to_contracts},
+    },
     websocket::messages::{AxOrdersWsMessage, AxWsPlaceOrder, OrderMetadata},
 };
 
@@ -82,11 +89,22 @@ impl core::fmt::Display for AxOrdersWsClientError {
 
 impl std::error::Error for AxOrdersWsClientError {}
 
+impl From<&'static str> for AxOrdersWsClientError {
+    fn from(msg: &'static str) -> Self {
+        Self::ClientError(msg.to_string())
+    }
+}
+
 /// Orders WebSocket client for Ax.
 ///
 /// Provides authenticated order management including placing, canceling,
 /// and monitoring order status via WebSocket.
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.architect")
+)]
 pub struct AxOrdersWebSocketClient {
+    clock: &'static AtomicTime,
     url: String,
     heartbeat: Option<u64>,
     connection_mode: Arc<ArcSwap<AtomicU8>>,
@@ -98,6 +116,7 @@ pub struct AxOrdersWebSocketClient {
     instruments_cache: Arc<DashMap<Ustr, InstrumentAny>>,
     orders_metadata: Arc<DashMap<ClientOrderId, OrderMetadata>>,
     venue_to_client_id: Arc<DashMap<VenueOrderId, ClientOrderId>>,
+    cid_to_client_order_id: Arc<DashMap<u64, ClientOrderId>>,
     request_id_counter: Arc<AtomicI64>,
     account_id: AccountId,
     trader_id: TraderId,
@@ -116,6 +135,7 @@ impl Debug for AxOrdersWebSocketClient {
 impl Clone for AxOrdersWebSocketClient {
     fn clone(&self) -> Self {
         Self {
+            clock: self.clock,
             url: self.url.clone(),
             heartbeat: self.heartbeat,
             connection_mode: Arc::clone(&self.connection_mode),
@@ -127,6 +147,7 @@ impl Clone for AxOrdersWebSocketClient {
             instruments_cache: Arc::clone(&self.instruments_cache),
             orders_metadata: Arc::clone(&self.orders_metadata),
             venue_to_client_id: Arc::clone(&self.venue_to_client_id),
+            cid_to_client_order_id: Arc::clone(&self.cid_to_client_order_id),
             request_id_counter: Arc::clone(&self.request_id_counter),
             account_id: self.account_id,
             trader_id: self.trader_id,
@@ -149,6 +170,7 @@ impl AxOrdersWebSocketClient {
         let connection_mode = Arc::new(ArcSwap::from_pointee(initial_mode));
 
         Self {
+            clock: get_atomic_clock_realtime(),
             url,
             heartbeat: heartbeat.or(Some(DEFAULT_HEARTBEAT_SECS)),
             connection_mode,
@@ -160,10 +182,15 @@ impl AxOrdersWebSocketClient {
             instruments_cache: Arc::new(DashMap::new()),
             orders_metadata: Arc::new(DashMap::new()),
             venue_to_client_id: Arc::new(DashMap::new()),
+            cid_to_client_order_id: Arc::new(DashMap::new()),
             request_id_counter: Arc::new(AtomicI64::new(1)),
             account_id,
             trader_id,
         }
+    }
+
+    fn generate_ts_init(&self) -> UnixNanos {
+        self.clock.get_time_ns()
     }
 
     /// Returns the WebSocket URL.
@@ -227,6 +254,18 @@ impl AxOrdersWebSocketClient {
         &self.orders_metadata
     }
 
+    /// Returns the cid to client order ID mapping for order correlation.
+    #[must_use]
+    pub fn cid_to_client_order_id(&self) -> &Arc<DashMap<u64, ClientOrderId>> {
+        &self.cid_to_client_order_id
+    }
+
+    /// Resolves a cid to a ClientOrderId if the mapping exists.
+    #[must_use]
+    pub fn resolve_cid(&self, cid: u64) -> Option<ClientOrderId> {
+        self.cid_to_client_order_id.get(&cid).map(|v| *v)
+    }
+
     /// Registers an external order with the WebSocket handler for event tracking.
     ///
     /// This allows the handler to create proper events (e.g., OrderCanceled, OrderFilled)
@@ -239,14 +278,13 @@ impl AxOrdersWebSocketClient {
         venue_order_id: VenueOrderId,
         instrument_id: InstrumentId,
         strategy_id: StrategyId,
-        ts_init: UnixNanos,
     ) -> bool {
         if self.orders_metadata.contains_key(&client_order_id) {
             return true;
         }
 
         // Required for correct precision on fills
-        let symbol = Ustr::from(instrument_id.symbol.as_str());
+        let symbol = instrument_id.symbol.inner();
         let Some(instrument) = self.get_cached_instrument(&symbol) else {
             log::warn!(
                 "Cannot register external order {client_order_id}: \
@@ -261,7 +299,7 @@ impl AxOrdersWebSocketClient {
             instrument_id,
             client_order_id,
             venue_order_id: Some(venue_order_id),
-            ts_init,
+            ts_init: self.generate_ts_init(),
             size_precision: instrument.size_precision(),
             price_precision: instrument.price_precision(),
             quote_currency: instrument.quote_currency(),
@@ -421,6 +459,7 @@ impl AxOrdersWebSocketClient {
         let account_id = self.account_id;
         let orders_metadata = Arc::clone(&self.orders_metadata);
         let venue_to_client_id = Arc::clone(&self.venue_to_client_id);
+        let cid_to_client_order_id = Arc::clone(&self.cid_to_client_order_id);
 
         let stream_handle = get_runtime().spawn(async move {
             let mut handler = FeedHandler::new(
@@ -431,6 +470,7 @@ impl AxOrdersWebSocketClient {
                 account_id,
                 orders_metadata,
                 venue_to_client_id,
+                cid_to_client_order_id,
             );
 
             while let Some(msg) = handler.next().await {
@@ -452,102 +492,6 @@ impl AxOrdersWebSocketClient {
         Ok(())
     }
 
-    /// Places an order via WebSocket.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the order command cannot be sent.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn place_order(
-        &self,
-        client_order_id: ClientOrderId,
-        symbol: Ustr,
-        side: AxOrderSide,
-        quantity: i64,
-        price: Decimal,
-        time_in_force: AxTimeInForce,
-        post_only: bool,
-        tag: Option<String>,
-    ) -> AxOrdersWsResult<i64> {
-        let request_id = self.next_request_id();
-
-        let order = AxWsPlaceOrder {
-            rid: request_id,
-            t: "p".to_string(),
-            s: symbol.to_string(),
-            d: side,
-            q: quantity,
-            p: price,
-            tif: time_in_force,
-            po: post_only,
-            tag,
-            order_type: None,
-            trigger_price: None,
-        };
-
-        let order_info = WsOrderInfo {
-            client_order_id,
-            symbol,
-        };
-
-        self.send_cmd(HandlerCommand::PlaceOrder {
-            request_id,
-            order,
-            order_info,
-        })
-        .await?;
-
-        Ok(request_id)
-    }
-
-    /// Places a stop-loss limit order via WebSocket.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the order command cannot be sent.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn place_stop_loss_order(
-        &self,
-        client_order_id: ClientOrderId,
-        symbol: Ustr,
-        side: AxOrderSide,
-        quantity: i64,
-        limit_price: Decimal,
-        trigger_price: Decimal,
-        time_in_force: AxTimeInForce,
-        tag: Option<String>,
-    ) -> AxOrdersWsResult<i64> {
-        let request_id = self.next_request_id();
-
-        let order = AxWsPlaceOrder {
-            rid: request_id,
-            t: "p".to_string(),
-            s: symbol.to_string(),
-            d: side,
-            q: quantity,
-            p: limit_price,
-            tif: time_in_force,
-            po: false,
-            tag,
-            order_type: Some(AxOrderType::StopLossLimit),
-            trigger_price: Some(trigger_price),
-        };
-
-        let order_info = WsOrderInfo {
-            client_order_id,
-            symbol,
-        };
-
-        self.send_cmd(HandlerCommand::PlaceOrder {
-            request_id,
-            order,
-            order_info,
-        })
-        .await?;
-
-        Ok(request_id)
-    }
-
     /// Submits an order using Nautilus domain types.
     ///
     /// This method handles conversion from Nautilus domain types to AX-specific
@@ -556,7 +500,7 @@ impl AxOrdersWebSocketClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The order type is not supported (only LIMIT and STOP_LOSS_LIMIT).
+    /// - The order type is not supported (only MARKET (simulated), LIMIT and STOP_LIMIT).
     /// - The time-in-force is not supported.
     /// - The instrument is not found in the cache.
     /// - A limit order is missing a price.
@@ -576,145 +520,157 @@ impl AxOrdersWebSocketClient {
         price: Option<Price>,
         trigger_price: Option<Price>,
         post_only: bool,
-        ts_init: UnixNanos,
     ) -> AxOrdersWsResult<i64> {
-        // Validate order type
         if !matches!(
             order_type,
             OrderType::Market | OrderType::Limit | OrderType::StopLimit
         ) {
             return Err(AxOrdersWsClientError::ClientError(format!(
-                "Unsupported order type: {order_type:?}. AX supports MARKET (simulated as IOC), LIMIT and STOP_LIMIT."
+                "Unsupported order type: {order_type:?}. AX supports MARKET, LIMIT and STOP_LIMIT."
             )));
         }
 
         // Get instrument from cache for precision
-        let symbol = Ustr::from(instrument_id.symbol.as_str());
+        let symbol = instrument_id.symbol.inner();
         let instrument = self.get_cached_instrument(&symbol).ok_or_else(|| {
             AxOrdersWsClientError::ClientError(format!(
                 "Instrument {instrument_id} not found in cache"
             ))
         })?;
 
-        // For market orders, simulate as IOC limit order with aggressive price
-        let (effective_order_type, effective_tif) = if order_type == OrderType::Market {
-            (OrderType::Limit, TimeInForce::Ioc)
-        } else {
-            (order_type, time_in_force)
+        let ax_side = AxOrderSide::try_from(order_side)?;
+
+        let qty_contracts = quantity_to_contracts(quantity)
+            .map_err(|e| AxOrdersWsClientError::ClientError(e.to_string()))?;
+
+        // Market orders are simulated as IOC limit orders with aggressive pricing
+        // because Architect does not support native market orders
+        let request_id = self.next_request_id();
+
+        let (ax_price, ax_tif, ax_post_only, ax_order_type, ax_trigger_price) = match order_type {
+            OrderType::Market => {
+                let market_price = price.ok_or_else(|| {
+                    AxOrdersWsClientError::ClientError(
+                        "Market order requires price (calculated from quote)".to_string(),
+                    )
+                })?;
+                (
+                    market_price.as_decimal(),
+                    AxTimeInForce::Ioc,
+                    false,
+                    None,
+                    None,
+                )
+            }
+            OrderType::Limit => {
+                let ax_tif = AxTimeInForce::try_from(time_in_force)?;
+                let limit_price = price.ok_or_else(|| {
+                    AxOrdersWsClientError::ClientError("Limit order requires price".to_string())
+                })?;
+                (limit_price.as_decimal(), ax_tif, post_only, None, None)
+            }
+            OrderType::StopLimit => {
+                let ax_tif = AxTimeInForce::try_from(time_in_force)?;
+                let limit_price = price.ok_or_else(|| {
+                    AxOrdersWsClientError::ClientError(
+                        "Stop-limit order requires price".to_string(),
+                    )
+                })?;
+                let stop_price = trigger_price.ok_or_else(|| {
+                    AxOrdersWsClientError::ClientError(
+                        "Stop-limit order requires trigger price".to_string(),
+                    )
+                })?;
+                (
+                    limit_price.as_decimal(),
+                    ax_tif,
+                    false,
+                    Some(AxOrderType::StopLossLimit),
+                    Some(stop_price.as_decimal()),
+                )
+            }
+            _ => {
+                return Err(AxOrdersWsClientError::ClientError(format!(
+                    "Unsupported order type: {order_type:?}"
+                )));
+            }
         };
 
-        // Convert time-in-force
-        let ax_tif = AxTimeInForce::try_from(effective_tif).map_err(|_| {
-            AxOrdersWsClientError::ClientError(format!(
-                "Unsupported time-in-force: {effective_tif:?}"
-            ))
-        })?;
-
-        // Convert order side
-        let ax_side = AxOrderSide::try_from(order_side).map_err(|_| {
-            AxOrdersWsClientError::ClientError(format!("Invalid order side: {order_side:?}"))
-        })?;
-
-        // AX uses i64 contracts directly (not minor units)
-        let qty_contracts = quantity.as_f64() as i64;
-
-        // Store order metadata for event correlation
+        // Store order metadata for event correlation (after validation to avoid stale entries)
         let metadata = OrderMetadata {
             trader_id,
             strategy_id,
             instrument_id,
             client_order_id,
             venue_order_id: None,
-            ts_init,
+            ts_init: self.generate_ts_init(),
             size_precision: instrument.size_precision(),
             price_precision: instrument.price_precision(),
             quote_currency: instrument.quote_currency(),
         };
         self.orders_metadata.insert(client_order_id, metadata);
 
-        // Submit based on order type
-        let result = match effective_order_type {
-            OrderType::Limit => {
-                // For market orders, price is pre-calculated by execution client
-                let limit_price = price.ok_or_else(|| {
-                    AxOrdersWsClientError::ClientError("Limit order requires price".to_string())
-                })?;
+        // Store cid -> client_order_id mapping for correlation
+        let cid = client_order_id_to_cid(&client_order_id);
+        self.cid_to_client_order_id.insert(cid, client_order_id);
 
-                self.place_order(
-                    client_order_id,
-                    symbol,
-                    ax_side,
-                    qty_contracts,
-                    limit_price.as_decimal(),
-                    ax_tif,
-                    post_only && order_type != OrderType::Market, // Never post_only for market sim
-                    Some(client_order_id.to_string()),
-                )
-                .await
-            }
-            OrderType::StopLimit => {
-                let limit_price = price.ok_or_else(|| {
-                    AxOrdersWsClientError::ClientError(
-                        "Stop-loss limit order requires price".to_string(),
-                    )
-                })?;
-                let stop_price = trigger_price.ok_or_else(|| {
-                    AxOrdersWsClientError::ClientError(
-                        "Stop-loss limit order requires trigger price".to_string(),
-                    )
-                })?;
-
-                self.place_stop_loss_order(
-                    client_order_id,
-                    symbol,
-                    ax_side,
-                    qty_contracts,
-                    limit_price.as_decimal(),
-                    stop_price.as_decimal(),
-                    ax_tif,
-                    Some(client_order_id.to_string()),
-                )
-                .await
-            }
-            _ => unreachable!(), // Already validated above
+        let order = AxWsPlaceOrder {
+            rid: request_id,
+            t: AxOrderRequestType::PlaceOrder,
+            s: symbol,
+            d: ax_side,
+            q: qty_contracts,
+            p: ax_price,
+            tif: ax_tif,
+            po: ax_post_only,
+            tag: Some(AX_NAUTILUS_TAG.to_string()),
+            cid: Some(cid),
+            order_type: ax_order_type,
+            trigger_price: ax_trigger_price,
         };
 
-        // Remove metadata on failure
+        let order_info = WsOrderInfo {
+            client_order_id,
+            symbol,
+        };
+
+        let result = self
+            .send_cmd(HandlerCommand::PlaceOrder {
+                request_id,
+                order,
+                order_info,
+            })
+            .await;
+
         if result.is_err() {
             self.orders_metadata.remove(&client_order_id);
+            self.cid_to_client_order_id.remove(&cid);
         }
 
-        result
+        result?;
+        Ok(request_id)
     }
 
-    /// Cancels an order using Nautilus domain types.
+    /// Cancels an order via WebSocket.
+    ///
+    /// Uses `venue_order_id` if available, otherwise falls back to `client_order_id`.
     ///
     /// # Errors
     ///
     /// Returns an error if the cancel command cannot be sent.
-    pub async fn cancel_order_command(
+    pub async fn cancel_order(
         &self,
-        _instrument_id: InstrumentId,
         client_order_id: ClientOrderId,
         venue_order_id: Option<VenueOrderId>,
     ) -> AxOrdersWsResult<i64> {
         let order_id =
             venue_order_id.map_or_else(|| client_order_id.to_string(), |v| v.to_string());
 
-        self.cancel_order(&order_id).await
-    }
-
-    /// Cancels an order via WebSocket (raw method).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the cancel command cannot be sent.
-    pub async fn cancel_order(&self, order_id: &str) -> AxOrdersWsResult<i64> {
         let request_id = self.next_request_id();
 
         self.send_cmd(HandlerCommand::CancelOrder {
             request_id,
-            order_id: order_id.to_string(),
+            order_id,
         })
         .await?;
 

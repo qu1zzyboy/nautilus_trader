@@ -38,12 +38,13 @@ use ustr::Ustr;
 use super::{
     messages::{
         BinanceFuturesAccountConfigMsg, BinanceFuturesAccountUpdateMsg, BinanceFuturesAggTradeMsg,
-        BinanceFuturesBookTickerMsg, BinanceFuturesContinuousKlineMsg, BinanceFuturesDepthUpdateMsg,
-        BinanceFuturesExecWsMessage, BinanceFuturesKlineMsg, BinanceFuturesListenKeyExpiredMsg, DataHandlerCommand,
-        BinanceFuturesMarginCallMsg, BinanceFuturesMarkPriceMsg, BinanceFuturesOrderUpdateMsg,
-        BinanceFuturesTradeMsg, BinanceFuturesWsErrorMsg, BinanceFuturesWsErrorResponse,
-        BinanceFuturesWsSubscribeRequest, BinanceFuturesWsSubscribeResponse,
-        NautilusDataWsMessage, NautilusWsMessage,
+        BinanceFuturesAlgoUpdateMsg, BinanceFuturesBookTickerMsg, BinanceFuturesContinuousKlineMsg,
+        BinanceFuturesDepthUpdateMsg, BinanceFuturesExecWsMessage, BinanceFuturesKlineMsg,
+        BinanceFuturesListenKeyExpiredMsg, BinanceFuturesMarginCallMsg, BinanceFuturesMarkPriceMsg,
+        BinanceFuturesOrderUpdateMsg, BinanceFuturesTradeMsg, BinanceFuturesWsErrorMsg,
+        BinanceFuturesWsErrorResponse, BinanceFuturesWsSubscribeRequest,
+        BinanceFuturesWsSubscribeResponse, DataHandlerCommand, NautilusDataWsMessage,
+        NautilusWsMessage,
     },
     parse::{
         extract_event_type, extract_pair, extract_symbol, parse_agg_trade, parse_book_ticker,
@@ -490,6 +491,7 @@ impl BinanceFuturesDataWsFeedHandler {
             // User data events and Unknown handled before instrument lookup
             BinanceWsEventType::AccountUpdate
             | BinanceWsEventType::OrderTradeUpdate
+            | BinanceWsEventType::AlgoUpdate
             | BinanceWsEventType::MarginCall
             | BinanceWsEventType::AccountConfigUpdate
             | BinanceWsEventType::ListenKeyExpired
@@ -536,6 +538,23 @@ impl BinanceFuturesDataWsFeedHandler {
                     }
                     Err(e) => {
                         log::warn!("Failed to parse order update: {e}");
+                        None
+                    }
+                }
+            }
+            BinanceWsEventType::AlgoUpdate => {
+                match serde_json::from_value::<BinanceFuturesAlgoUpdateMsg>(json.clone()) {
+                    Ok(msg) => {
+                        log::debug!(
+                            "Algo order update: symbol={}, algo_id={}, status={:?}",
+                            msg.algo_order.symbol,
+                            msg.algo_order.algo_id,
+                            msg.algo_order.algo_status
+                        );
+                        Some(BinanceFuturesExecWsMessage::AlgoUpdate(Box::new(msg)))
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to parse algo order update: {e}");
                         None
                     }
                 }

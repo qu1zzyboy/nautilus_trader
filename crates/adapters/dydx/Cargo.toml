@@ -56,14 +56,16 @@ nautilus-system = { workspace = true }
 ahash = { workspace = true }
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
+async-stream = { workspace = true }
 async-trait = { workspace = true }
-bip32 = { workspace = true }
+base64 = { workspace = true }
 chrono = { workspace = true }
 cosmrs = { workspace = true }
 dashmap = { workspace = true }
 derive_builder = { workspace = true }
 dotenvy = { workspace = true }
 dydx-proto = { workspace = true }
+futures-util = { workspace = true }
 hex = { workspace = true }
 log = { workspace = true }
 prost = { workspace = true }

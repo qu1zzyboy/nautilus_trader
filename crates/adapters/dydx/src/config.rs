@@ -59,7 +59,6 @@ pub struct DydxAdapterConfig {
     /// - Mainnet: `DYDX_WALLET_ADDRESS`
     /// - Testnet: `DYDX_TESTNET_WALLET_ADDRESS`
     ///
-    /// If neither config nor env var is set, can be derived from mnemonic.
     /// Use `resolve_wallet_address()` to resolve from config or environment.
     #[serde(default)]
     pub wallet_address: Option<String>,
@@ -74,15 +73,15 @@ pub struct DydxAdapterConfig {
     /// `network` in future versions.
     #[serde(default)]
     pub is_testnet: bool,
-    /// Mnemonic phrase for wallet.
+    /// Private key (hex) for wallet signing.
     ///
     /// If not provided, falls back to environment variable:
-    /// - Mainnet: `DYDX_MNEMONIC`
-    /// - Testnet: `DYDX_TESTNET_MNEMONIC`
+    /// - Mainnet: `DYDX_PRIVATE_KEY`
+    /// - Testnet: `DYDX_TESTNET_PRIVATE_KEY`
     ///
     /// Use `DydxCredential::resolve()` to resolve from config or environment.
     #[serde(default)]
-    pub mnemonic: Option<String>,
+    pub private_key: Option<String>,
     /// Authenticator IDs for permissioned key trading.
     ///
     /// When provided, transactions will include a TxExtension to enable trading
@@ -169,7 +168,7 @@ impl Default for DydxAdapterConfig {
             wallet_address: None,
             subaccount: 0,
             is_testnet,
-            mnemonic: None,
+            private_key: None,
             authenticator_ids: Vec::new(),
             max_retries: default_max_retries(),
             retry_delay_initial_ms: default_retry_delay_initial_ms(),
@@ -199,12 +198,6 @@ pub struct DydxDataClientConfig {
     pub http_proxy_url: Option<String>,
     /// WebSocket proxy URL.
     pub ws_proxy_url: Option<String>,
-    /// Orderbook snapshot refresh interval in seconds (prevents stale books from missed messages).
-    /// Set to None to disable periodic refresh. Default: 60 seconds.
-    pub orderbook_refresh_interval_secs: Option<u64>,
-    /// Instrument refresh interval in seconds (updates instrument definitions periodically).
-    /// Set to None to disable periodic refresh. Default: 3600 seconds (60 minutes).
-    pub instrument_refresh_interval_secs: Option<u64>,
 }
 
 impl Default for DydxDataClientConfig {
@@ -219,8 +212,6 @@ impl Default for DydxDataClientConfig {
             is_testnet: false,
             http_proxy_url: None,
             ws_proxy_url: None,
-            orderbook_refresh_interval_secs: Some(60),
-            instrument_refresh_interval_secs: Some(3600),
         }
     }
 }
@@ -244,19 +235,17 @@ pub struct DYDXExecClientConfig {
     pub ws_endpoint: Option<String>,
     /// HTTP endpoint URL (optional, uses default for network if not provided).
     pub http_endpoint: Option<String>,
-    /// Wallet mnemonic for signing transactions.
+    /// Private key (hex) for wallet signing.
     ///
     /// If not provided, falls back to environment variable:
-    /// - Mainnet: `DYDX_MNEMONIC`
-    /// - Testnet: `DYDX_TESTNET_MNEMONIC`
-    pub mnemonic: Option<String>,
+    /// - Mainnet: `DYDX_PRIVATE_KEY`
+    /// - Testnet: `DYDX_TESTNET_PRIVATE_KEY`
+    pub private_key: Option<String>,
     /// Wallet address.
     ///
     /// If not provided, falls back to environment variable:
     /// - Mainnet: `DYDX_WALLET_ADDRESS`
     /// - Testnet: `DYDX_TESTNET_WALLET_ADDRESS`
-    ///
-    /// If neither config nor env var is set, derived from mnemonic.
     pub wallet_address: Option<String>,
     /// Subaccount number (default: 0).
     #[serde(default)]

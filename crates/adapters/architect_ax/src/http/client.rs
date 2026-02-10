@@ -25,14 +25,15 @@ use std::{
     },
 };
 
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use nautilus_core::{
     consts::NAUTILUS_USER_AGENT, nanos::UnixNanos, time::get_atomic_clock_realtime,
 };
 use nautilus_model::{
-    data::Bar,
+    data::{Bar, FundingRateUpdate},
     events::AccountState,
-    identifiers::AccountId,
+    identifiers::{AccountId, ClientOrderId, InstrumentId},
     instruments::{Instrument, any::InstrumentAny},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
 };
@@ -54,12 +55,13 @@ use super::{
         AxBatchCancelOrdersResponse, AxCancelAllOrdersResponse, AxCancelOrderResponse, AxCandle,
         AxCandleResponse, AxCandlesResponse, AxFillsResponse, AxFundingRatesResponse, AxInstrument,
         AxInstrumentsResponse, AxOpenOrdersResponse, AxPlaceOrderResponse, AxPositionsResponse,
-        AxRiskSnapshotResponse, AxTicker, AxTickersResponse, AxTransactionsResponse, AxWhoAmI,
-        BatchCancelOrdersRequest, CancelAllOrdersRequest, CancelOrderRequest, PlaceOrderRequest,
+        AxPreviewAggressiveLimitOrderResponse, AxRiskSnapshotResponse, AxTicker, AxTickersResponse,
+        AxTransactionsResponse, AxWhoAmI, BatchCancelOrdersRequest, CancelAllOrdersRequest,
+        CancelOrderRequest, PlaceOrderRequest, PreviewAggressiveLimitOrderRequest,
     },
     parse::{
-        parse_account_state, parse_bar, parse_fill_report, parse_order_status_report,
-        parse_perp_instrument, parse_position_status_report,
+        parse_account_state, parse_bar, parse_fill_report, parse_funding_rate,
+        parse_order_status_report, parse_perp_instrument, parse_position_status_report,
     },
     query::{
         GetCandleParams, GetCandlesParams, GetFundingRatesParams, GetInstrumentParams,
@@ -104,11 +106,7 @@ impl Default for AxRawHttpClient {
 
 impl Debug for AxRawHttpClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let has_session_token = self
-            .session_token
-            .read()
-            .map(|guard| guard.is_some())
-            .unwrap_or(false);
+        let has_session_token = self.session_token.read().is_ok_and(|guard| guard.is_some());
         f.debug_struct(stringify!(AxRawHttpClient))
             .field("base_url", &self.base_url)
             .field("orders_base_url", &self.orders_base_url)
@@ -123,6 +121,14 @@ impl AxRawHttpClient {
     #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Returns a masked version of the API key for logging purposes.
+    #[must_use]
+    pub fn api_key_masked(&self) -> String {
+        self.credential
+            .as_ref()
+            .map_or_else(|| "None".to_string(), |c| c.masked_api_key())
     }
 
     /// Cancel all pending HTTP requests.
@@ -262,21 +268,14 @@ impl AxRawHttpClient {
     }
 
     fn auth_headers(&self) -> Result<HashMap<String, String>, AxHttpError> {
-        let credential = self
-            .credential
-            .as_ref()
-            .ok_or(AxHttpError::MissingCredentials)?;
-
         // SAFETY: Lock poisoning indicates a panic in another thread, which is fatal
         let guard = self.session_token.read().expect("Lock poisoned");
-        let session_token = guard
-            .as_ref()
-            .ok_or_else(|| AxHttpError::ValidationError("Session token not set".to_string()))?;
+        let session_token = guard.as_ref().ok_or(AxHttpError::MissingSessionToken)?;
 
         let mut headers = HashMap::new();
         headers.insert(
             "Authorization".to_string(),
-            credential.bearer_token(session_token),
+            format!("Bearer {session_token}"),
         );
 
         Ok(headers)
@@ -479,7 +478,7 @@ impl AxRawHttpClient {
     /// # Errors
     ///
     /// Returns an error if the request fails or the response cannot be parsed.
-    pub async fn get_ticker(&self, symbol: &str) -> Result<AxTicker, AxHttpError> {
+    pub async fn get_ticker(&self, symbol: Ustr) -> Result<AxTicker, AxHttpError> {
         let params = GetTickerParams::new(symbol);
         self.send_request::<AxTicker, _>(Method::GET, "/ticker", Some(&params), None, true)
             .await
@@ -493,7 +492,7 @@ impl AxRawHttpClient {
     /// # Errors
     ///
     /// Returns an error if the request fails or the response cannot be parsed.
-    pub async fn get_instrument(&self, symbol: &str) -> Result<AxInstrument, AxHttpError> {
+    pub async fn get_instrument(&self, symbol: Ustr) -> Result<AxInstrument, AxHttpError> {
         let params = GetInstrumentParams::new(symbol);
         self.send_request::<AxInstrument, _>(Method::GET, "/instrument", Some(&params), None, false)
             .await
@@ -513,31 +512,7 @@ impl AxRawHttpClient {
         api_secret: &str,
         expiration_seconds: i32,
     ) -> Result<AxAuthenticateResponse, AxHttpError> {
-        self.authenticate_with_totp(api_key, api_secret, expiration_seconds, None)
-            .await
-    }
-
-    /// Authenticates with the AX Exchange API using API key credentials and optional 2FA.
-    ///
-    /// # Endpoint
-    /// `POST /authenticate`
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - 400: 2FA is required but `totp` was not provided.
-    /// - 401: Invalid credentials.
-    pub async fn authenticate_with_totp(
-        &self,
-        api_key: &str,
-        api_secret: &str,
-        expiration_seconds: i32,
-        totp: Option<&str>,
-    ) -> Result<AxAuthenticateResponse, AxHttpError> {
-        let mut request = AuthenticateApiKeyRequest::new(api_key, api_secret, expiration_seconds);
-        if let Some(code) = totp {
-            request = request.with_totp(code);
-        }
+        let request = AuthenticateApiKeyRequest::new(api_key, api_secret, expiration_seconds);
 
         let body = serde_json::to_vec(&request)
             .map_err(|e| AxHttpError::JsonError(format!("Failed to serialize request: {e}")))?;
@@ -550,6 +525,42 @@ impl AxRawHttpClient {
             false,
         )
         .await
+    }
+
+    /// Authenticates using stored credentials or environment variables.
+    ///
+    /// # Credential Resolution
+    ///
+    /// Credentials are resolved in the following order:
+    /// 1. Stored credentials (from `with_credentials` constructor)
+    /// 2. Environment variables (`AX_API_KEY` and `AX_API_SECRET`)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - No credentials are available from either source
+    /// - The HTTP request fails
+    /// - The credentials are invalid
+    pub async fn authenticate_auto(
+        &self,
+        expiration_seconds: i32,
+    ) -> Result<AxAuthenticateResponse, AxHttpError> {
+        let (api_key, api_secret) = self
+            .resolve_credentials()
+            .ok_or(AxHttpError::MissingCredentials)?;
+
+        self.authenticate(&api_key, &api_secret, expiration_seconds)
+            .await
+    }
+
+    fn resolve_credentials(&self) -> Option<(String, String)> {
+        if let Some(cred) = &self.credential {
+            return Some((cred.api_key().to_string(), cred.api_secret().to_string()));
+        }
+
+        let api_key = std::env::var("AX_API_KEY").ok()?;
+        let api_secret = std::env::var("AX_API_SECRET").ok()?;
+        Some((api_key, api_secret))
     }
 
     /// Places a new order.
@@ -693,7 +704,7 @@ impl AxRawHttpClient {
     /// Returns an error if the request fails or the response cannot be parsed.
     pub async fn get_candles(
         &self,
-        symbol: &str,
+        symbol: Ustr,
         start_timestamp_ns: i64,
         end_timestamp_ns: i64,
         candle_width: AxCandleWidth,
@@ -720,7 +731,7 @@ impl AxRawHttpClient {
     /// Returns an error if the request fails or the response cannot be parsed.
     pub async fn get_current_candle(
         &self,
-        symbol: &str,
+        symbol: Ustr,
         candle_width: AxCandleWidth,
     ) -> Result<AxCandle, AxHttpError> {
         let params = GetCandleParams::new(symbol, candle_width);
@@ -746,7 +757,7 @@ impl AxRawHttpClient {
     /// Returns an error if the request fails or the response cannot be parsed.
     pub async fn get_last_candle(
         &self,
-        symbol: &str,
+        symbol: Ustr,
         candle_width: AxCandleWidth,
     ) -> Result<AxCandle, AxHttpError> {
         let params = GetCandleParams::new(symbol, candle_width);
@@ -772,7 +783,7 @@ impl AxRawHttpClient {
     /// Returns an error if the request fails or the response cannot be parsed.
     pub async fn get_funding_rates(
         &self,
-        symbol: &str,
+        symbol: Ustr,
         start_timestamp_ns: i64,
         end_timestamp_ns: i64,
     ) -> Result<AxFundingRatesResponse, AxHttpError> {
@@ -801,6 +812,34 @@ impl AxRawHttpClient {
             "/risk-snapshot",
             None,
             None,
+            true,
+        )
+        .await
+    }
+
+    /// Previews an aggressive limit order to get the "take through" price.
+    ///
+    /// This endpoint calculates the price needed to sweep the order book for a given
+    /// quantity, which is used to simulate market orders on AX (which only supports
+    /// limit orders natively).
+    ///
+    /// # Endpoint
+    /// `POST /preview-aggressive-limit-order`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    pub async fn preview_aggressive_limit_order(
+        &self,
+        request: &PreviewAggressiveLimitOrderRequest,
+    ) -> Result<AxPreviewAggressiveLimitOrderResponse, AxHttpError> {
+        let body = serde_json::to_vec(request)
+            .map_err(|e| AxHttpError::JsonError(format!("Failed to serialize request: {e}")))?;
+        self.send_request::<AxPreviewAggressiveLimitOrderResponse, ()>(
+            Method::POST,
+            "/preview-aggressive-limit-order",
+            None,
+            Some(body),
             true,
         )
         .await
@@ -842,22 +881,15 @@ impl AxRawHttpClient {
 pub struct AxHttpClient {
     pub(crate) inner: Arc<AxRawHttpClient>,
     pub(crate) instruments_cache: Arc<DashMap<Ustr, InstrumentAny>>,
-    cache_initialized: AtomicBool,
+    cache_initialized: Arc<AtomicBool>,
 }
 
 impl Clone for AxHttpClient {
     fn clone(&self) -> Self {
-        let cache_initialized = AtomicBool::new(false);
-
-        let is_initialized = self.cache_initialized.load(Ordering::Acquire);
-        if is_initialized {
-            cache_initialized.store(true, Ordering::Release);
-        }
-
         Self {
             inner: self.inner.clone(),
             instruments_cache: self.instruments_cache.clone(),
-            cache_initialized,
+            cache_initialized: self.cache_initialized.clone(),
         }
     }
 }
@@ -896,7 +928,7 @@ impl AxHttpClient {
                 proxy_url,
             )?),
             instruments_cache: Arc::new(DashMap::new()),
-            cache_initialized: AtomicBool::new(false),
+            cache_initialized: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -930,7 +962,7 @@ impl AxHttpClient {
                 proxy_url,
             )?),
             instruments_cache: Arc::new(DashMap::new()),
-            cache_initialized: AtomicBool::new(false),
+            cache_initialized: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -938,6 +970,12 @@ impl AxHttpClient {
     #[must_use]
     pub fn base_url(&self) -> &str {
         self.inner.base_url()
+    }
+
+    /// Returns a masked version of the API key for logging purposes.
+    #[must_use]
+    pub fn api_key_masked(&self) -> String {
+        self.inner.api_key_masked()
     }
 
     /// Cancel all pending HTTP requests.
@@ -1015,24 +1053,24 @@ impl AxHttpClient {
         Ok(resp.token)
     }
 
-    /// Authenticates with Ax using API credentials and TOTP.
+    /// Authenticates using stored credentials or environment variables.
+    ///
+    /// # Credential Resolution
+    ///
+    /// Credentials are resolved in the following order:
+    /// 1. Stored credentials (from `with_credentials` constructor)
+    /// 2. Environment variables (`AX_API_KEY` and `AX_API_SECRET`)
     ///
     /// On success, the session token is automatically stored for subsequent authenticated requests.
     ///
     /// # Errors
     ///
-    /// Returns an error if the HTTP request fails or credentials are invalid.
-    pub async fn authenticate_with_totp(
-        &self,
-        api_key: &str,
-        api_secret: &str,
-        expiration_seconds: i32,
-        totp_code: Option<&str>,
-    ) -> Result<String, AxHttpError> {
-        let resp = self
-            .inner
-            .authenticate_with_totp(api_key, api_secret, expiration_seconds, totp_code)
-            .await?;
+    /// Returns an error if:
+    /// - No credentials are available from either source
+    /// - The HTTP request fails
+    /// - The credentials are invalid
+    pub async fn authenticate_auto(&self, expiration_seconds: i32) -> Result<String, AxHttpError> {
+        let resp = self.inner.authenticate_auto(expiration_seconds).await?;
         self.inner.set_session_token(resp.token.clone());
         Ok(resp.token)
     }
@@ -1095,7 +1133,7 @@ impl AxHttpClient {
     /// Returns an error if the HTTP request fails or instrument parsing fails.
     pub async fn request_instrument(
         &self,
-        symbol: &str,
+        symbol: Ustr,
         maker_fee: Option<Decimal>,
         taker_fee: Option<Decimal>,
     ) -> anyhow::Result<InstrumentAny> {
@@ -1110,6 +1148,83 @@ impl AxHttpClient {
         let ts_init = self.generate_ts_init();
 
         parse_perp_instrument(&resp, maker_fee, taker_fee, ts_init, ts_init)
+    }
+
+    /// Requests historical bars from Ax and parses them to Nautilus Bar types.
+    ///
+    /// Requires the instrument to be cached (call `request_instruments` first).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The instrument is not found in the cache.
+    /// - The HTTP request fails.
+    /// - Bar parsing fails.
+    pub async fn request_bars(
+        &self,
+        symbol: Ustr,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        width: AxCandleWidth,
+    ) -> anyhow::Result<Vec<Bar>> {
+        let instrument = self
+            .get_instrument(&symbol)
+            .ok_or_else(|| anyhow::anyhow!("Instrument {symbol} not found in cache"))?;
+
+        let start_ns = start.and_then(|dt| dt.timestamp_nanos_opt()).unwrap_or(0);
+        let end_ns = end
+            .and_then(|dt| dt.timestamp_nanos_opt())
+            .unwrap_or_else(|| self.generate_ts_init().as_i64());
+        let resp = self
+            .inner
+            .get_candles(symbol, start_ns, end_ns, width)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let ts_init = self.generate_ts_init();
+        let mut bars = Vec::with_capacity(resp.candles.len());
+
+        for candle in &resp.candles {
+            match parse_bar(candle, &instrument, ts_init) {
+                Ok(bar) => bars.push(bar),
+                Err(e) => {
+                    log::warn!("Failed to parse bar for {symbol}: {e}");
+                }
+            }
+        }
+
+        Ok(bars)
+    }
+
+    /// Requests funding rates from Ax and parses them to Nautilus types.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails.
+    pub async fn request_funding_rates(
+        &self,
+        instrument_id: InstrumentId,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+    ) -> Result<Vec<FundingRateUpdate>, AxHttpError> {
+        let symbol = instrument_id.symbol.inner();
+        let start_ns = start.and_then(|dt| dt.timestamp_nanos_opt()).unwrap_or(0);
+        let end_ns = end
+            .and_then(|dt| dt.timestamp_nanos_opt())
+            .unwrap_or_else(|| self.generate_ts_init().as_i64());
+        let response = self
+            .inner
+            .get_funding_rates(symbol, start_ns, end_ns)
+            .await?;
+
+        let ts_init = self.generate_ts_init();
+        let funding_rates = response
+            .funding_rates
+            .iter()
+            .map(|r| parse_funding_rate(r, instrument_id, ts_init))
+            .collect();
+
+        Ok(funding_rates)
     }
 
     /// Requests account state from Ax and parses to a Nautilus [`AccountState`].
@@ -1131,68 +1246,12 @@ impl AxHttpClient {
         parse_account_state(&response, account_id, ts_init, ts_init)
     }
 
-    /// Requests funding rates from Ax.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the HTTP request fails.
-    pub async fn request_funding_rates(
-        &self,
-        symbol: &str,
-        start_timestamp_ns: i64,
-        end_timestamp_ns: i64,
-    ) -> Result<AxFundingRatesResponse, AxHttpError> {
-        self.inner
-            .get_funding_rates(symbol, start_timestamp_ns, end_timestamp_ns)
-            .await
-    }
-
-    /// Requests historical bars from Ax and parses them to Nautilus Bar types.
-    ///
-    /// Requires the instrument to be cached (call `request_instruments` first).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The instrument is not found in the cache.
-    /// - The HTTP request fails.
-    /// - Bar parsing fails.
-    pub async fn request_bars(
-        &self,
-        symbol: &str,
-        start_timestamp_ns: i64,
-        end_timestamp_ns: i64,
-        width: AxCandleWidth,
-    ) -> anyhow::Result<Vec<Bar>> {
-        let symbol_ustr = ustr::Ustr::from(symbol);
-        let instrument = self
-            .get_instrument(&symbol_ustr)
-            .ok_or_else(|| anyhow::anyhow!("Instrument {symbol} not found in cache"))?;
-
-        let resp = self
-            .inner
-            .get_candles(symbol, start_timestamp_ns, end_timestamp_ns, width)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
-
-        let ts_init = self.generate_ts_init();
-        let mut bars = Vec::with_capacity(resp.candles.len());
-
-        for candle in &resp.candles {
-            match parse_bar(candle, &instrument, ts_init) {
-                Ok(bar) => bars.push(bar),
-                Err(e) => {
-                    log::warn!("Failed to parse bar for {symbol}: {e}");
-                }
-            }
-        }
-
-        Ok(bars)
-    }
-
     /// Requests open orders from Ax and parses them to Nautilus [`OrderStatusReport`].
     ///
     /// Requires instruments to be cached for parsing order details.
+    ///
+    /// The `cid_resolver` parameter is an optional function that resolves a `cid` (u64)
+    /// to a `ClientOrderId`. This is needed for correlating orders submitted via WebSocket.
     ///
     /// # Errors
     ///
@@ -1200,10 +1259,14 @@ impl AxHttpClient {
     /// - The HTTP request fails.
     /// - An order's instrument is not found in the cache.
     /// - Order parsing fails.
-    pub async fn request_order_status_reports(
+    pub async fn request_order_status_reports<F>(
         &self,
         account_id: AccountId,
-    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        cid_resolver: Option<F>,
+    ) -> anyhow::Result<Vec<OrderStatusReport>>
+    where
+        F: Fn(u64) -> Option<ClientOrderId>,
+    {
         let response = self
             .inner
             .get_open_orders()
@@ -1218,7 +1281,13 @@ impl AxHttpClient {
                 .get_instrument(&order.s)
                 .ok_or_else(|| anyhow::anyhow!("Instrument {} not found in cache", order.s))?;
 
-            match parse_order_status_report(order, account_id, &instrument, ts_init) {
+            match parse_order_status_report(
+                order,
+                account_id,
+                &instrument,
+                ts_init,
+                cid_resolver.as_ref(),
+            ) {
                 Ok(report) => reports.push(report),
                 Err(e) => {
                     log::warn!("Failed to parse order {}: {e}", order.oid);
@@ -1292,6 +1361,11 @@ impl AxHttpClient {
         let mut reports = Vec::with_capacity(response.positions.len());
 
         for position in &response.positions {
+            // Skip flat positions (zero quantity)
+            if position.signed_quantity == 0 {
+                continue;
+            }
+
             let instrument = self.get_instrument(&position.symbol).ok_or_else(|| {
                 anyhow::anyhow!("Instrument {} not found in cache", position.symbol)
             })?;

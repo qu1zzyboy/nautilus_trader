@@ -17,10 +17,7 @@
 
 use std::{
     future::Future,
-    sync::{
-        Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
@@ -48,7 +45,9 @@ use nautilus_model::{
     accounts::AccountAny,
     enums::{AccountType, OmsType, OrderType},
     events::OrderEventAny,
-    identifiers::{AccountId, ClientId, InstrumentId, Venue},
+    identifiers::{
+        AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId, Venue, VenueOrderId,
+    },
     orders::Order,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance},
@@ -61,7 +60,7 @@ use crate::{
         enums::{OKXInstrumentType, OKXMarginMode, OKXTradeMode},
     },
     config::OKXExecClientConfig,
-    http::client::OKXHttpClient,
+    http::{client::OKXHttpClient, models::OKXCancelAlgoOrderRequest},
     websocket::{
         client::OKXWebSocketClient,
         messages::{ExecutionReport, NautilusWsMessage},
@@ -78,9 +77,6 @@ pub struct OKXExecutionClient {
     ws_private: OKXWebSocketClient,
     ws_business: OKXWebSocketClient,
     trade_mode: OKXTradeMode,
-    started: bool,
-    connected: AtomicBool,
-    instruments_initialized: AtomicBool,
     ws_stream_handle: Option<JoinHandle<()>>,
     ws_business_stream_handle: Option<JoinHandle<()>>,
     pending_tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -148,9 +144,6 @@ impl OKXExecutionClient {
             ws_private,
             ws_business,
             trade_mode,
-            started: false,
-            connected: AtomicBool::new(false),
-            instruments_initialized: AtomicBool::new(false),
             ws_stream_handle: None,
             ws_business_stream_handle: None,
             pending_tasks: Mutex::new(Vec::new()),
@@ -439,7 +432,7 @@ impl OKXExecutionClient {
 #[async_trait(?Send)]
 impl ExecutionClient for OKXExecutionClient {
     fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::Acquire)
+        self.core.is_connected()
     }
 
     fn client_id(&self) -> ClientId {
@@ -463,16 +456,18 @@ impl ExecutionClient for OKXExecutionClient {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
-        if self.connected.load(Ordering::Acquire) {
+        if self.core.is_connected() {
             return Ok(());
         }
 
         let instrument_types = self.instrument_types();
 
-        if !self.instruments_initialized.load(Ordering::Acquire) {
+        if !self.core.instruments_initialized() {
             let mut all_instruments = Vec::new();
+            let mut all_inst_id_codes = Vec::new();
+
             for instrument_type in &instrument_types {
-                let instruments = self
+                let (instruments, inst_id_codes) = self
                     .http_client
                     .request_instruments(*instrument_type, None)
                     .await
@@ -492,12 +487,14 @@ impl ExecutionClient for OKXExecutionClient {
 
                 self.http_client.cache_instruments(instruments.clone());
                 all_instruments.extend(instruments);
+                all_inst_id_codes.extend(inst_id_codes);
             }
 
             if !all_instruments.is_empty() {
                 self.ws_private.cache_instruments(all_instruments);
+                self.ws_private.cache_inst_id_codes(all_inst_id_codes);
             }
-            self.instruments_initialized.store(true, Ordering::Release);
+            self.core.set_instruments_initialized();
         }
 
         self.ws_private.connect().await?;
@@ -570,13 +567,13 @@ impl ExecutionClient for OKXExecutionClient {
         // Wait for account to be registered in cache before completing connect
         self.await_account_registered(30.0).await?;
 
-        self.connected.store(true, Ordering::Release);
+        self.core.set_connected();
         log::info!("Connected: client_id={}", self.core.client_id);
         Ok(())
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
-        if !self.connected.load(Ordering::Acquire) {
+        if self.core.is_disconnected() {
             return Ok(());
         }
 
@@ -599,7 +596,7 @@ impl ExecutionClient for OKXExecutionClient {
             handle.abort();
         }
 
-        self.connected.store(false, Ordering::Release);
+        self.core.set_disconnected();
         log::info!("Disconnected: client_id={}", self.core.client_id);
         Ok(())
     }
@@ -629,13 +626,13 @@ impl ExecutionClient for OKXExecutionClient {
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
-        if self.started {
+        if self.core.is_started() {
             return Ok(());
         }
 
         let sender = get_exec_event_sender();
         self.emitter.set_sender(sender);
-        self.started = true;
+        self.core.set_started();
 
         // Spawn instrument bootstrap task
         let http_client = self.http_client.clone();
@@ -644,15 +641,18 @@ impl ExecutionClient for OKXExecutionClient {
 
         get_runtime().spawn(async move {
             let mut all_instruments = Vec::new();
+            let mut all_inst_id_codes = Vec::new();
+
             for instrument_type in instrument_types {
                 match http_client.request_instruments(instrument_type, None).await {
-                    Ok(instruments) => {
+                    Ok((instruments, inst_id_codes)) => {
                         if instruments.is_empty() {
                             log::warn!("No instruments returned for {instrument_type:?}");
                             continue;
                         }
                         http_client.cache_instruments(instruments.clone());
                         all_instruments.extend(instruments);
+                        all_inst_id_codes.extend(inst_id_codes);
                     }
                     Err(e) => {
                         log::error!("Failed to request instruments for {instrument_type:?}: {e}");
@@ -666,6 +666,7 @@ impl ExecutionClient for OKXExecutionClient {
                 );
             } else {
                 ws_private.cache_instruments(all_instruments);
+                ws_private.cache_inst_id_codes(all_inst_id_codes);
                 log::info!("Instruments initialized");
             }
         });
@@ -686,12 +687,12 @@ impl ExecutionClient for OKXExecutionClient {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
-        if !self.started {
+        if self.core.is_stopped() {
             return Ok(());
         }
 
-        self.started = false;
-        self.connected.store(false, Ordering::Release);
+        self.core.set_stopped();
+        self.core.set_disconnected();
         if let Some(handle) = self.ws_stream_handle.take() {
             handle.abort();
         }
@@ -728,7 +729,7 @@ impl ExecutionClient for OKXExecutionClient {
     fn submit_order_list(&self, cmd: &SubmitOrderList) -> anyhow::Result<()> {
         log::warn!(
             "submit_order_list not yet implemented for OKX execution client (got {} orders)",
-            cmd.order_list.orders.len()
+            cmd.order_list.client_order_ids.len()
         );
         Ok(())
     }
@@ -782,7 +783,7 @@ impl ExecutionClient for OKXExecutionClient {
             // Use OKX's mass-cancel endpoint (requires market maker permissions)
             self.mass_cancel_instrument(cmd.instrument_id)
         } else {
-            // Cancel orders individually via batch cancel (works for all users)
+            // Cancel orders via batch cancel (works for all users)
             let cache = self.core.cache();
             let open_orders = cache.orders_open(None, Some(&cmd.instrument_id), None, None, None);
 
@@ -791,48 +792,144 @@ impl ExecutionClient for OKXExecutionClient {
                 return Ok(());
             }
 
-            let mut payload = Vec::with_capacity(open_orders.len());
-            for order in open_orders {
-                payload.push((
-                    order.instrument_id(),
-                    Some(order.client_order_id()),
-                    order.venue_order_id(),
-                ));
+            let mut regular_payload = Vec::new();
+            let mut algo_orders: Vec<(
+                InstrumentId,
+                ClientOrderId,
+                Option<VenueOrderId>,
+                TraderId,
+                StrategyId,
+            )> = Vec::new();
+
+            for order in &open_orders {
+                // Triggered stop orders become regular orders on OKX
+                let is_pending_algo = self.is_conditional_order(order.order_type())
+                    && order.is_triggered() != Some(true);
+
+                if is_pending_algo {
+                    algo_orders.push((
+                        order.instrument_id(),
+                        order.client_order_id(),
+                        order.venue_order_id(),
+                        order.trader_id(),
+                        order.strategy_id(),
+                    ));
+                } else {
+                    regular_payload.push((
+                        order.instrument_id(),
+                        Some(order.client_order_id()),
+                        order.venue_order_id(),
+                    ));
+                }
             }
             drop(cache);
 
             log::debug!(
-                "Canceling {} open orders for {} via batch cancel",
-                payload.len(),
+                "Canceling {} regular orders and {} algo orders for {}",
+                regular_payload.len(),
+                algo_orders.len(),
                 cmd.instrument_id
             );
 
-            let ws_private = self.ws_private.clone();
-            self.spawn_task("batch_cancel_orders", async move {
-                ws_private.batch_cancel_orders(payload).await?;
-                Ok(())
-            });
+            if !regular_payload.is_empty() {
+                let ws_private = self.ws_private.clone();
+                self.spawn_task("batch_cancel_orders", async move {
+                    ws_private.batch_cancel_orders(regular_payload).await?;
+                    Ok(())
+                });
+            }
+
+            // OKX doesn't support algo cancel via private WebSocket, must use HTTP
+            if !algo_orders.is_empty() {
+                let http_client = self.http_client.clone();
+                let requests: Vec<OKXCancelAlgoOrderRequest> = algo_orders
+                    .into_iter()
+                    .map(
+                        |(
+                            instrument_id,
+                            client_order_id,
+                            venue_order_id,
+                            _trader_id,
+                            _strategy_id,
+                        )| {
+                            OKXCancelAlgoOrderRequest {
+                                inst_id: instrument_id.symbol.to_string(),
+                                inst_id_code: None,
+                                algo_id: venue_order_id.map(|id| id.to_string()),
+                                algo_cl_ord_id: if venue_order_id.is_none() {
+                                    Some(client_order_id.to_string())
+                                } else {
+                                    None
+                                },
+                            }
+                        },
+                    )
+                    .collect();
+
+                self.spawn_task("cancel_algo_orders", async move {
+                    http_client.cancel_algo_orders(requests).await?;
+                    Ok(())
+                });
+            }
 
             Ok(())
         }
     }
 
     fn batch_cancel_orders(&self, cmd: &BatchCancelOrders) -> anyhow::Result<()> {
-        let mut payload = Vec::with_capacity(cmd.cancels.len());
+        let cache = self.core.cache();
+
+        let mut regular_payload = Vec::new();
+        let mut algo_orders = Vec::new();
 
         for cancel in &cmd.cancels {
-            payload.push((
-                cancel.instrument_id,
-                Some(cancel.client_order_id),
-                cancel.venue_order_id,
-            ));
+            // Triggered stop orders become regular orders on OKX
+            let is_pending_algo = cache.order(&cancel.client_order_id).is_some_and(|o| {
+                self.is_conditional_order(o.order_type()) && o.is_triggered() != Some(true)
+            });
+
+            if is_pending_algo {
+                algo_orders.push(cancel.clone());
+            } else {
+                regular_payload.push((
+                    cancel.instrument_id,
+                    Some(cancel.client_order_id),
+                    cancel.venue_order_id,
+                ));
+            }
+        }
+        drop(cache);
+
+        if !regular_payload.is_empty() {
+            let ws_private = self.ws_private.clone();
+            self.spawn_task("batch_cancel_orders", async move {
+                ws_private.batch_cancel_orders(regular_payload).await?;
+                Ok(())
+            });
         }
 
-        let ws_private = self.ws_private.clone();
-        self.spawn_task("batch_cancel_orders", async move {
-            ws_private.batch_cancel_orders(payload).await?;
-            Ok(())
-        });
+        // OKX doesn't support algo cancel via private WebSocket, must use HTTP
+        if !algo_orders.is_empty() {
+            let http_client = self.http_client.clone();
+            let requests: Vec<OKXCancelAlgoOrderRequest> = algo_orders
+                .into_iter()
+                .map(|cancel| OKXCancelAlgoOrderRequest {
+                    inst_id: cancel.instrument_id.symbol.to_string(),
+                    inst_id_code: None,
+                    algo_id: cancel.venue_order_id.map(|id| id.to_string()),
+                    algo_cl_ord_id: if cancel.venue_order_id.is_none() {
+                        Some(cancel.client_order_id.to_string())
+                    } else {
+                        None
+                    },
+                })
+                .collect();
+
+            self.spawn_task("cancel_algo_orders", async move {
+                http_client.cancel_algo_orders(requests).await?;
+                Ok(())
+            });
+        }
 
         Ok(())
     }

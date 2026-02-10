@@ -1316,8 +1316,7 @@ impl DeribitWsFeedHandler {
                                         );
 
                                         // Convert to OrderStatusReport
-                                        let instrument_name_ustr =
-                                            Ustr::from(order_msg.instrument_name.as_str());
+                                        let instrument_name_ustr = order_msg.instrument_name;
                                         if let Some(instrument) =
                                             self.instruments_cache.get(&instrument_name_ustr)
                                         {
@@ -1487,15 +1486,20 @@ impl DeribitWsFeedHandler {
                                 && let Some(instrument) =
                                     self.instruments_cache.get(&ticker_msg.instrument_name)
                             {
-                                let mark_price =
-                                    parse_ticker_to_mark_price(&ticker_msg, instrument, ts_init);
-                                let index_price =
-                                    parse_ticker_to_index_price(&ticker_msg, instrument, ts_init);
-
-                                return Some(NautilusWsMessage::Data(vec![
-                                    Data::MarkPriceUpdate(mark_price),
-                                    Data::IndexPriceUpdate(index_price),
-                                ]));
+                                match (
+                                    parse_ticker_to_mark_price(&ticker_msg, instrument, ts_init),
+                                    parse_ticker_to_index_price(&ticker_msg, instrument, ts_init),
+                                ) {
+                                    (Ok(mark_price), Ok(index_price)) => {
+                                        return Some(NautilusWsMessage::Data(vec![
+                                            Data::MarkPriceUpdate(mark_price),
+                                            Data::IndexPriceUpdate(index_price),
+                                        ]));
+                                    }
+                                    (Err(e), _) | (_, Err(e)) => {
+                                        log::warn!("Failed to parse ticker prices: {e}");
+                                    }
+                                }
                             }
                         }
                         DeribitWsChannel::Perpetual => {
@@ -1685,8 +1689,7 @@ impl DeribitWsFeedHandler {
                                         let venue_order_id_str = &order.order_id;
                                         let venue_order_id =
                                             VenueOrderId::new(venue_order_id_str.as_str());
-                                        let instrument_name =
-                                            Ustr::from(order.instrument_name.as_str());
+                                        let instrument_name = order.instrument_name;
 
                                         let Some(instrument) =
                                             self.instruments_cache.get(&instrument_name)
@@ -1908,8 +1911,7 @@ impl DeribitWsFeedHandler {
 
                                     let mut reports = Vec::with_capacity(trades.len());
                                     for trade in &trades {
-                                        let instrument_name =
-                                            Ustr::from(trade.instrument_name.as_str());
+                                        let instrument_name = trade.instrument_name;
                                         if let Some(instrument) =
                                             self.instruments_cache.get(&instrument_name)
                                         {

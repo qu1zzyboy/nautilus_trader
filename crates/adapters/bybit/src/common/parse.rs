@@ -19,23 +19,24 @@ use std::{convert::TryFrom, str::FromStr};
 
 use anyhow::Context;
 pub use nautilus_core::serialization::{
-    deserialize_decimal_or_zero, deserialize_optional_decimal,
-    deserialize_optional_decimal_or_zero, deserialize_string_to_u8,
+    deserialize_decimal_or_zero, deserialize_optional_decimal_or_zero,
+    deserialize_optional_decimal_str, deserialize_string_to_u8,
 };
 use nautilus_core::{UUID4, datetime::NANOSECONDS_IN_MILLISECOND, nanos::UnixNanos};
 use nautilus_model::{
-    data::{Bar, BarType, BookOrder, OrderBookDelta, OrderBookDeltas, TradeTick},
+    data::{
+        Bar, BarType, BookOrder, FundingRateUpdate, OrderBookDelta, OrderBookDeltas, TradeTick,
+    },
     enums::{
-        AccountType, AggressorSide, AssetClass, BarAggregation, BookAction, LiquiditySide,
-        OptionKind, OrderSide, OrderStatus, OrderType, PositionSideSpecified, RecordFlag,
-        TimeInForce, TriggerType,
+        AccountType, AggressorSide, BarAggregation, BookAction, LiquiditySide, OptionKind,
+        OrderSide, OrderStatus, OrderType, PositionSideSpecified, RecordFlag, TimeInForce,
+        TriggerType,
     },
     events::account::state::AccountState,
     identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol, TradeId, Venue, VenueOrderId},
     instruments::{
-        Instrument, any::InstrumentAny, crypto_future::CryptoFuture,
+        Instrument, any::InstrumentAny, crypto_future::CryptoFuture, crypto_option::CryptoOption,
         crypto_perpetual::CryptoPerpetual, currency_pair::CurrencyPair,
-        option_contract::OptionContract,
     },
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
@@ -53,14 +54,13 @@ use crate::{
         symbol::BybitSymbol,
     },
     http::models::{
-        BybitExecution, BybitFeeRate, BybitInstrumentInverse, BybitInstrumentLinear,
+        BybitExecution, BybitFeeRate, BybitFunding, BybitInstrumentInverse, BybitInstrumentLinear,
         BybitInstrumentOption, BybitInstrumentSpot, BybitKline, BybitOrderbookResult,
         BybitPosition, BybitTrade, BybitWalletBalance,
     },
     websocket::parse::parse_millis_i64,
 };
 
-const BYBIT_MINUTE_INTERVALS: &[u64] = &[1, 3, 5, 15, 30, 60, 120, 240, 360, 720];
 const BYBIT_HOUR_INTERVALS: &[u64] = &[1, 2, 4, 6, 12];
 
 /// Extracts the raw symbol from a Bybit symbol by removing the product type suffix.
@@ -84,6 +84,29 @@ pub fn make_bybit_symbol<S: AsRef<str>>(raw_symbol: S, product_type: BybitProduc
     Ustr::from(&format!("{raw}{suffix}"))
 }
 
+/// Converts a Bybit kline interval string to a Nautilus bar aggregation and step.
+///
+/// Bybit interval strings: 1, 3, 5, 15, 30, 60, 120, 240, 360, 720 (minutes/hours), D, W, M
+#[must_use]
+pub fn bybit_interval_to_bar_spec(interval: &str) -> Option<(usize, BarAggregation)> {
+    match interval {
+        "1" => Some((1, BarAggregation::Minute)),
+        "3" => Some((3, BarAggregation::Minute)),
+        "5" => Some((5, BarAggregation::Minute)),
+        "15" => Some((15, BarAggregation::Minute)),
+        "30" => Some((30, BarAggregation::Minute)),
+        "60" => Some((1, BarAggregation::Hour)),
+        "120" => Some((2, BarAggregation::Hour)),
+        "240" => Some((4, BarAggregation::Hour)),
+        "360" => Some((6, BarAggregation::Hour)),
+        "720" => Some((12, BarAggregation::Hour)),
+        "D" => Some((1, BarAggregation::Day)),
+        "W" => Some((1, BarAggregation::Week)),
+        "M" => Some((1, BarAggregation::Month)),
+        _ => None,
+    }
+}
+
 /// Converts a Nautilus bar aggregation and step to a Bybit kline interval.
 ///
 /// Bybit supported intervals: 1, 3, 5, 15, 30, 60, 120, 240, 360, 720 (minutes), D, W, M
@@ -102,14 +125,8 @@ pub fn bar_spec_to_bybit_interval(
             5 => Ok(BybitKlineInterval::Minute5),
             15 => Ok(BybitKlineInterval::Minute15),
             30 => Ok(BybitKlineInterval::Minute30),
-            // Bybit normalizes minute intervals ≥60 to hour intervals
-            60 => Ok(BybitKlineInterval::Hour1),
-            120 => Ok(BybitKlineInterval::Hour2),
-            240 => Ok(BybitKlineInterval::Hour4),
-            360 => Ok(BybitKlineInterval::Hour6),
-            720 => Ok(BybitKlineInterval::Hour12),
             _ => anyhow::bail!(
-                "Bybit only supports the following minute intervals: {BYBIT_MINUTE_INTERVALS:?}"
+                "Bybit only supports minute intervals 1, 3, 5, 15, 30 (use HOUR for >= 60)"
             ),
         },
         BarAggregation::Hour => match step {
@@ -462,17 +479,20 @@ pub fn parse_inverse_instrument(
     }
 }
 
-/// Parses a Bybit option contract definition into a Nautilus option instrument.
+/// Parses a Bybit option contract definition into a Nautilus [`CryptoOption`].
 pub fn parse_option_instrument(
     definition: &BybitInstrumentOption,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
-    let quote_currency = get_currency(definition.quote_coin.as_str());
-
     let symbol = BybitSymbol::new(format!("{}-OPTION", definition.symbol))?;
     let instrument_id = symbol.to_instrument_id();
     let raw_symbol = Symbol::new(symbol.raw_symbol());
+    let underlying = get_currency(definition.base_coin.as_str());
+    let quote_currency = get_currency(definition.quote_coin.as_str());
+    let settlement_currency = get_currency(definition.settle_coin.as_str());
+    // Bybit Options are linear contracts — they are margined and settled in stablecoins
+    let is_inverse = false;
 
     let price_increment = parse_price(&definition.price_filter.tick_size, "priceFilter.tickSize")?;
     let max_price = Some(parse_price(
@@ -505,23 +525,27 @@ pub fn parse_option_instrument(
     let activation_ns = parse_millis_timestamp(&definition.launch_time, "launchTime")?;
     let expiration_ns = parse_millis_timestamp(&definition.delivery_time, "deliveryTime")?;
 
-    let instrument = OptionContract::new(
+    let instrument = CryptoOption::new(
         instrument_id,
         raw_symbol,
-        AssetClass::Cryptocurrency,
-        None,
-        definition.base_coin,
+        underlying,
+        quote_currency,
+        settlement_currency,
+        is_inverse,
         option_kind,
         strike_price,
-        quote_currency,
         activation_ns,
         expiration_ns,
         price_increment.precision,
+        lot_size.precision,
         price_increment,
-        Quantity::from(1_u32),
-        lot_size,
+        lot_size,                    // Lot size represents size increment.
+        Some(Quantity::from(1_u32)), // multiplier
+        Some(lot_size),
         max_quantity,
         min_quantity,
+        None,
+        None,
         max_price,
         min_price,
         Some(Decimal::ZERO),
@@ -532,14 +556,14 @@ pub fn parse_option_instrument(
         ts_init,
     );
 
-    Ok(InstrumentAny::OptionContract(instrument))
+    Ok(InstrumentAny::CryptoOption(instrument))
 }
 
 /// Parses a REST trade payload into a [`TradeTick`].
 pub fn parse_trade_tick(
     trade: &BybitTrade,
     instrument: &InstrumentAny,
-    ts_init: UnixNanos,
+    ts_init: Option<UnixNanos>,
 ) -> anyhow::Result<TradeTick> {
     let price =
         parse_price_with_precision(&trade.price, instrument.price_precision(), "trade.price")?;
@@ -549,6 +573,7 @@ pub fn parse_trade_tick(
     let trade_id = TradeId::new_checked(trade.exec_id.as_str())
         .context("invalid exec_id in Bybit trade payload")?;
     let ts_event = parse_millis_timestamp(&trade.time, "trade.time")?;
+    let ts_init = ts_init.unwrap_or(ts_event);
 
     TradeTick::new_checked(
         instrument.id(),
@@ -562,13 +587,31 @@ pub fn parse_trade_tick(
     .context("failed to construct TradeTick from Bybit trade payload")
 }
 
+/// Parses a REST funding payload into a [`FundingRateUpdate`].
+pub fn parse_funding_rate(
+    funding: &BybitFunding,
+    instrument: &InstrumentAny,
+) -> anyhow::Result<FundingRateUpdate> {
+    let rate = parse_decimal(&funding.funding_rate, "funding.rate")?;
+    let ts_event = parse_millis_timestamp(&funding.funding_rate_timestamp, "funding.timestamp")?;
+
+    Ok(FundingRateUpdate::new(
+        instrument.id(),
+        rate,
+        None, // next_funding_ns not provided with historical funding rates
+        ts_event,
+        ts_event,
+    ))
+}
+
 /// Parses an order book response into [`OrderBookDeltas`].
 pub fn parse_orderbook(
     result: &BybitOrderbookResult,
     instrument: &InstrumentAny,
-    ts_init: UnixNanos,
+    ts_init: Option<UnixNanos>,
 ) -> anyhow::Result<OrderBookDeltas> {
     let ts_event = parse_millis_i64(result.ts, "orderbook.timestamp")?;
+    let ts_init = ts_init.unwrap_or(ts_event);
 
     let instrument_id = instrument.id();
     let price_precision = instrument.price_precision();
@@ -647,7 +690,7 @@ pub fn parse_kline_bar(
     instrument: &InstrumentAny,
     bar_type: BarType,
     timestamp_on_close: bool,
-    ts_init: UnixNanos,
+    ts_init: Option<UnixNanos>,
 ) -> anyhow::Result<Bar> {
     let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
@@ -673,7 +716,7 @@ pub fn parse_kline_bar(
             .context("bar timestamp overflowed when adjusting to close time")?;
         ts_event = UnixNanos::from(updated);
     }
-    let ts_init = if ts_init.is_zero() { ts_event } else { ts_init };
+    let ts_init = ts_init.unwrap_or(ts_event);
 
     Bar::new_checked(bar_type, open, high, low, close, volume, ts_event, ts_init)
         .context("failed to construct Bar from Bybit kline entry")
@@ -712,13 +755,17 @@ pub fn parse_fill_report(
         "execution.execQty",
     )?;
 
-    // Parse commission (Bybit returns positive fee, Nautilus uses negative for costs)
-    let fee_f64 = execution
+    let fee_decimal: Decimal = execution
         .exec_fee
-        .parse::<f64>()
+        .parse()
         .with_context(|| format!("Failed to parse execFee='{}'", execution.exec_fee))?;
     let currency = get_currency(&execution.fee_currency);
-    let commission = Money::new(-fee_f64, currency);
+    let commission = Money::from_decimal(fee_decimal, currency).with_context(|| {
+        format!(
+            "Failed to create commission from execFee='{}'",
+            execution.exec_fee
+        )
+    })?;
 
     // Determine liquidity side from is_maker flag
     let liquidity_side = if execution.is_maker {
@@ -1271,17 +1318,24 @@ mod tests {
     }
 
     #[rstest]
-    fn parse_option_instrument_builds_option_contract() {
+    fn parse_option_instrument_builds_crypto_option() {
         let json = load_test_json("http_get_instruments_option.json");
         let response: BybitInstrumentOptionResponse = serde_json::from_str(&json).unwrap();
         let instrument = &response.result.list[0];
 
         let parsed = parse_option_instrument(instrument, TS, TS).unwrap();
         match parsed {
-            InstrumentAny::OptionContract(option) => {
+            InstrumentAny::CryptoOption(option) => {
                 assert_eq!(option.id.to_string(), "ETH-26JUN26-16000-P-OPTION.BYBIT");
+                assert_eq!(option.underlying.code.as_str(), "ETH");
+                assert_eq!(option.quote_currency.code.as_str(), "USDC");
+                assert_eq!(option.settlement_currency.code.as_str(), "USDC");
+                assert!(!option.is_inverse);
                 assert_eq!(option.option_kind, OptionKind::Put);
+                assert_eq!(option.price_precision, 1);
                 assert_eq!(option.price_increment, Price::from_str("0.1").unwrap());
+                assert_eq!(option.size_precision, 0);
+                assert_eq!(option.size_increment, Quantity::from_str("1").unwrap());
                 assert_eq!(option.lot_size, Quantity::from_str("1").unwrap());
             }
             other => panic!("unexpected instrument variant: {other:?}"),
@@ -1295,7 +1349,7 @@ mod tests {
         let response: BybitTradesResponse = serde_json::from_str(&json).unwrap();
         let trade = &response.result.list[0];
 
-        let tick = parse_trade_tick(trade, &instrument, TS).unwrap();
+        let tick = parse_trade_tick(trade, &instrument, Some(TS)).unwrap();
 
         assert_eq!(tick.instrument_id, instrument.id());
         assert_eq!(tick.price, instrument.make_price(27450.50));
@@ -1321,7 +1375,7 @@ mod tests {
             AggregationSource::External,
         );
 
-        let bar = parse_kline_bar(kline, &instrument, bar_type, false, TS).unwrap();
+        let bar = parse_kline_bar(kline, &instrument, bar_type, false, Some(TS)).unwrap();
 
         assert_eq!(bar.bar_type.to_string(), bar_type.to_string());
         assert_eq!(bar.open, instrument.make_price(27450.0));
@@ -1394,11 +1448,6 @@ mod tests {
     #[case(BarAggregation::Minute, 5, BybitKlineInterval::Minute5)]
     #[case(BarAggregation::Minute, 15, BybitKlineInterval::Minute15)]
     #[case(BarAggregation::Minute, 30, BybitKlineInterval::Minute30)]
-    #[case(BarAggregation::Minute, 60, BybitKlineInterval::Hour1)]
-    #[case(BarAggregation::Minute, 120, BybitKlineInterval::Hour2)]
-    #[case(BarAggregation::Minute, 240, BybitKlineInterval::Hour4)]
-    #[case(BarAggregation::Minute, 360, BybitKlineInterval::Hour6)]
-    #[case(BarAggregation::Minute, 720, BybitKlineInterval::Hour12)]
     fn test_bar_spec_to_bybit_interval_minutes(
         #[case] aggregation: BarAggregation,
         #[case] step: u64,
@@ -1456,5 +1505,59 @@ mod tests {
     fn test_bar_spec_to_bybit_interval_unsupported_aggregation() {
         let result = bar_spec_to_bybit_interval(BarAggregation::Second, 1);
         assert!(result.is_err());
+    }
+
+    #[rstest]
+    #[case("1", 1, BarAggregation::Minute)]
+    #[case("3", 3, BarAggregation::Minute)]
+    #[case("5", 5, BarAggregation::Minute)]
+    #[case("15", 15, BarAggregation::Minute)]
+    #[case("30", 30, BarAggregation::Minute)]
+    fn test_bybit_interval_to_bar_spec_minutes(
+        #[case] interval: &str,
+        #[case] expected_step: usize,
+        #[case] expected_aggregation: BarAggregation,
+    ) {
+        let result = bybit_interval_to_bar_spec(interval).unwrap();
+        assert_eq!(result, (expected_step, expected_aggregation));
+    }
+
+    #[rstest]
+    #[case("60", 1, BarAggregation::Hour)]
+    #[case("120", 2, BarAggregation::Hour)]
+    #[case("240", 4, BarAggregation::Hour)]
+    #[case("360", 6, BarAggregation::Hour)]
+    #[case("720", 12, BarAggregation::Hour)]
+    fn test_bybit_interval_to_bar_spec_hours(
+        #[case] interval: &str,
+        #[case] expected_step: usize,
+        #[case] expected_aggregation: BarAggregation,
+    ) {
+        let result = bybit_interval_to_bar_spec(interval).unwrap();
+        assert_eq!(result, (expected_step, expected_aggregation));
+    }
+
+    #[rstest]
+    #[case("D", 1, BarAggregation::Day)]
+    #[case("W", 1, BarAggregation::Week)]
+    #[case("M", 1, BarAggregation::Month)]
+    fn test_bybit_interval_to_bar_spec_day_week_month(
+        #[case] interval: &str,
+        #[case] expected_step: usize,
+        #[case] expected_aggregation: BarAggregation,
+    ) {
+        let result = bybit_interval_to_bar_spec(interval).unwrap();
+        assert_eq!(result, (expected_step, expected_aggregation));
+    }
+
+    #[rstest]
+    #[case("2")]
+    #[case("10")]
+    #[case("100")]
+    #[case("invalid")]
+    #[case("")]
+    fn test_bybit_interval_to_bar_spec_unsupported(#[case] interval: &str) {
+        let result = bybit_interval_to_bar_spec(interval);
+        assert!(result.is_none());
     }
 }

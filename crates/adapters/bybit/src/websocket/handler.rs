@@ -17,7 +17,6 @@
 
 use std::{
     collections::VecDeque,
-    num::NonZero,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -29,8 +28,7 @@ use dashmap::DashMap;
 use nautilus_common::cache::quote::QuoteCache;
 use nautilus_core::{UUID4, nanos::UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_model::{
-    data::{BarSpecification, BarType, Data},
-    enums::{AggregationSource, BarAggregation, PriceType},
+    data::{BarType, Data},
     events::{OrderCancelRejected, OrderModifyRejected, OrderRejected},
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
@@ -50,8 +48,10 @@ use super::{
         BybitWsResponse, BybitWsSubscriptionMsg, NautilusWsMessage,
     },
     parse::{
-        parse_kline_topic, parse_millis_i64, parse_orderbook_deltas, parse_orderbook_quote,
-        parse_ticker_linear_funding, parse_ws_account_state, parse_ws_fill_report,
+        parse_millis_i64, parse_orderbook_deltas, parse_orderbook_quote,
+        parse_ticker_linear_funding, parse_ticker_linear_index_price,
+        parse_ticker_linear_mark_price, parse_ticker_option_index_price,
+        parse_ticker_option_mark_price, parse_ws_account_state, parse_ws_fill_report,
         parse_ws_kline_bar, parse_ws_order_status_report, parse_ws_position_status_report,
         parse_ws_trade_tick,
     },
@@ -173,6 +173,7 @@ pub(super) struct FeedHandler {
     bars_timestamp_on_close: bool,
     quote_cache: QuoteCache,
     funding_cache: FundingCache,
+    bar_types_cache: Arc<DashMap<String, BarType>>,
     retry_manager: RetryManager<BybitWsError>,
     pending_place_requests: DashMap<String, PlaceRequestData>,
     pending_cancel_requests: DashMap<String, CancelRequestData>,
@@ -197,6 +198,7 @@ impl FeedHandler {
         auth_tracker: AuthTracker,
         subscriptions: SubscriptionState,
         funding_cache: FundingCache,
+        bar_types_cache: Arc<DashMap<String, BarType>>,
     ) -> Self {
         Self {
             signal,
@@ -213,6 +215,7 @@ impl FeedHandler {
             bars_timestamp_on_close,
             quote_cache: QuoteCache::new(),
             funding_cache,
+            bar_types_cache,
             retry_manager: create_websocket_retry_manager(),
             pending_place_requests: DashMap::new(),
             pending_cancel_requests: DashMap::new(),
@@ -835,62 +838,45 @@ impl FeedHandler {
                 }
             }
             BybitWsMessage::Kline(msg) => {
-                let (interval_str, raw_symbol) = match parse_kline_topic(&msg.topic) {
-                    Ok(parts) => parts,
-                    Err(e) => {
-                        log::warn!("Failed to parse kline topic: {e}");
+                let bar_type = match self.bar_types_cache.get(msg.topic.as_str()) {
+                    Some(bt) => *bt,
+                    None => {
+                        log::debug!("No bar type subscription found for topic: {}", msg.topic);
                         return result;
                     }
                 };
 
-                let symbol = product_type
-                    .map_or_else(|| raw_symbol.into(), |pt| make_bybit_symbol(raw_symbol, pt));
-
-                if let Some(instrument) = instruments.get(&symbol) {
-                    let (step, aggregation) = match interval_str.parse::<usize>() {
-                        Ok(minutes) if minutes > 0 => (minutes, BarAggregation::Minute),
-                        _ => {
-                            log::warn!("Unsupported kline interval: {interval_str}");
-                            return result;
-                        }
-                    };
-
-                    if let Some(non_zero_step) = NonZero::new(step) {
-                        let bar_spec = BarSpecification {
-                            step: non_zero_step,
-                            aggregation,
-                            price_type: PriceType::Last,
-                        };
-                        let bar_type =
-                            BarType::new(instrument.id(), bar_spec, AggregationSource::External);
-
-                        let mut data_vec = Vec::new();
-                        for kline in &msg.data {
-                            // Only process confirmed bars (not partial/building bars)
-                            if !kline.confirm {
-                                continue;
-                            }
-                            match parse_ws_kline_bar(
-                                kline,
-                                instrument,
-                                bar_type,
-                                self.bars_timestamp_on_close,
-                                ts_init,
-                            ) {
-                                Ok(bar) => data_vec.push(Data::Bar(bar)),
-                                Err(e) => log::error!("Error parsing kline to bar: {e}"),
-                            }
-                        }
-                        if !data_vec.is_empty() {
-                            result.push(NautilusWsMessage::Data(data_vec));
-                        }
-                    } else {
-                        log::error!("Invalid step value: {step}");
+                let symbol = Ustr::from(bar_type.instrument_id().symbol.as_str());
+                let instrument = match instruments.get(&symbol) {
+                    Some(inst) => inst,
+                    None => {
+                        log::debug!(
+                            "No instrument found for bar type: {}",
+                            bar_type.instrument_id()
+                        );
+                        return result;
                     }
-                } else {
-                    log::debug!(
-                        "No instrument found for symbol in Kline message: raw_symbol={raw_symbol}, full_symbol={symbol}"
-                    );
+                };
+
+                let mut data_vec = Vec::new();
+                for kline in &msg.data {
+                    // Only process confirmed bars (not partial/building bars)
+                    if !kline.confirm {
+                        continue;
+                    }
+                    match parse_ws_kline_bar(
+                        kline,
+                        instrument,
+                        bar_type,
+                        self.bars_timestamp_on_close,
+                        ts_init,
+                    ) {
+                        Ok(bar) => data_vec.push(Data::Bar(bar)),
+                        Err(e) => log::error!("Error parsing kline to bar: {e}"),
+                    }
+                }
+                if !data_vec.is_empty() {
+                    result.push(NautilusWsMessage::Data(data_vec));
                 }
             }
             BybitWsMessage::TickerLinear(msg) => {
@@ -962,7 +948,6 @@ impl FeedHandler {
                         }
                     }
 
-                    // Extract funding rate if available
                     if msg.data.funding_rate.is_some() && msg.data.next_funding_time.is_some() {
                         let should_publish = {
                             let cache = funding_cache.read().await;
@@ -994,6 +979,32 @@ impl FeedHandler {
                                 Err(e) => {
                                     log::debug!("Skipping funding rate update: {e}");
                                 }
+                            }
+                        }
+                    }
+
+                    if msg.data.mark_price.is_some() {
+                        match parse_ticker_linear_mark_price(
+                            &msg.data, instrument, ts_event, ts_init,
+                        ) {
+                            Ok(mark_price) => {
+                                result.push(NautilusWsMessage::MarkPrices(vec![mark_price]));
+                            }
+                            Err(e) => {
+                                log::debug!("Skipping mark price update: {e}");
+                            }
+                        }
+                    }
+
+                    if msg.data.index_price.is_some() {
+                        match parse_ticker_linear_index_price(
+                            &msg.data, instrument, ts_event, ts_init,
+                        ) {
+                            Ok(index_price) => {
+                                result.push(NautilusWsMessage::IndexPrices(vec![index_price]));
+                            }
+                            Err(e) => {
+                                log::debug!("Skipping index price update: {e}");
                             }
                         }
                     }
@@ -1067,6 +1078,24 @@ impl FeedHandler {
                             log::warn!(
                                 "Failed to parse ticker fields, skipping update, raw_data: {raw_data}"
                             );
+                        }
+                    }
+
+                    match parse_ticker_option_mark_price(&msg, instrument, ts_init) {
+                        Ok(mark_price) => {
+                            result.push(NautilusWsMessage::MarkPrices(vec![mark_price]));
+                        }
+                        Err(e) => {
+                            log::debug!("Skipping option mark price update: {e}");
+                        }
+                    }
+
+                    match parse_ticker_option_index_price(&msg, instrument, ts_init) {
+                        Ok(index_price) => {
+                            result.push(NautilusWsMessage::IndexPrices(vec![index_price]));
+                        }
+                        Err(e) => {
+                            log::debug!("Skipping option index price update: {e}");
                         }
                     }
                 } else {
@@ -1569,6 +1598,7 @@ mod tests {
         let auth_tracker = AuthTracker::new();
         let subscriptions = SubscriptionState::new(BYBIT_WS_TOPIC_DELIMITER);
         let funding_cache = Arc::new(tokio::sync::RwLock::new(AHashMap::new()));
+        let bar_types_cache = Arc::new(DashMap::new());
 
         FeedHandler::new(
             signal,
@@ -1582,6 +1612,7 @@ mod tests {
             auth_tracker,
             subscriptions,
             funding_cache,
+            bar_types_cache,
         )
     }
 

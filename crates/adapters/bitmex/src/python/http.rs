@@ -19,7 +19,7 @@ use chrono::{DateTime, Utc};
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
 use nautilus_model::{
     data::BarType,
-    enums::{ContingencyType, OrderSide, OrderType, TimeInForce, TriggerType},
+    enums::{ContingencyType, OrderSide, OrderType, TimeInForce, TrailingOffsetType, TriggerType},
     identifiers::{AccountId, ClientOrderId, InstrumentId, OrderListId, VenueOrderId},
     python::instruments::{instrument_any_to_pyobject, pyobject_to_instrument_any},
     types::{Price, Quantity},
@@ -273,7 +273,7 @@ impl BitmexHttpClient {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let reports = client
-                .request_order_status_reports(instrument_id, open_only, limit)
+                .request_order_status_reports(instrument_id, open_only, None, None, limit)
                 .await
                 .map_err(to_pyvalue_err)?;
 
@@ -300,7 +300,7 @@ impl BitmexHttpClient {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let reports = client
-                .request_fill_reports(instrument_id, limit)
+                .request_fill_reports(instrument_id, None, None, limit)
                 .await
                 .map_err(to_pyvalue_err)?;
 
@@ -350,6 +350,8 @@ impl BitmexHttpClient {
         price = None,
         trigger_price = None,
         trigger_type = None,
+        trailing_offset = None,
+        trailing_offset_type = None,
         display_qty = None,
         post_only = false,
         reduce_only = false,
@@ -369,6 +371,8 @@ impl BitmexHttpClient {
         price: Option<Price>,
         trigger_price: Option<Price>,
         trigger_type: Option<TriggerType>,
+        trailing_offset: Option<f64>,
+        trailing_offset_type: Option<TrailingOffsetType>,
         display_qty: Option<Quantity>,
         post_only: bool,
         reduce_only: bool,
@@ -389,6 +393,8 @@ impl BitmexHttpClient {
                     price,
                     trigger_price,
                     trigger_type,
+                    trailing_offset,
+                    trailing_offset_type,
                     display_qty,
                     post_only,
                     reduce_only,
@@ -540,6 +546,21 @@ impl BitmexHttpClient {
                 // Create a simple Python object with just the account field we need
                 // We can expand this if more fields are needed
                 let account = margin.account;
+                account.into_py_any(py)
+            })
+        })
+    }
+
+    #[pyo3(name = "get_account_number")]
+    fn py_get_account_number<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let margins = client.get_all_margins().await.map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                // Return the account number from any margin (all have the same account)
+                let account = margins.first().map(|m| m.account);
                 account.into_py_any(py)
             })
         })

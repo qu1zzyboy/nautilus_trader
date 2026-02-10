@@ -55,7 +55,10 @@ use super::{
     },
 };
 use crate::{
-    common::{enums::BitmexExecType, parse::parse_contracts_quantity},
+    common::{
+        enums::{BitmexExecType, BitmexOrderType, BitmexPegPriceType},
+        parse::parse_contracts_quantity,
+    },
     http::parse::{InstrumentParseResult, parse_instrument_any},
 };
 
@@ -262,6 +265,8 @@ impl FeedHandler {
             match event {
                 BitmexWsMessage::Reconnected => {
                     self.quote_cache.clear();
+                    self.order_type_cache.clear();
+                    self.order_symbol_cache.clear();
                     return Some(NautilusWsMessage::Reconnected);
                 }
                 BitmexWsMessage::Subscription {
@@ -533,7 +538,7 @@ impl FeedHandler {
 
     fn handle_quote(
         &mut self,
-        mut data: Vec<BitmexQuoteMsg>,
+        data: Vec<BitmexQuoteMsg>,
         ts_init: UnixNanos,
     ) -> Option<NautilusWsMessage> {
         // Index symbols may return empty quote data
@@ -541,43 +546,52 @@ impl FeedHandler {
             return None;
         }
 
-        let msg = data.remove(0);
-        let Some(instrument) = Self::get_instrument(&self.instruments_cache, &msg.symbol) else {
-            log::error!(
-                "Instrument cache miss: quote message dropped for symbol={}",
-                msg.symbol
-            );
-            return None;
-        };
+        let mut quotes = Vec::with_capacity(data.len());
 
-        let instrument_id = instrument.id();
-        let price_precision = instrument.price_precision();
+        for msg in data {
+            let Some(instrument) = Self::get_instrument(&self.instruments_cache, &msg.symbol)
+            else {
+                log::error!(
+                    "Instrument cache miss: quote message dropped for symbol={}",
+                    msg.symbol
+                );
+                continue;
+            };
 
-        let bid_price = msg.bid_price.map(|p| Price::new(p, price_precision));
-        let ask_price = msg.ask_price.map(|p| Price::new(p, price_precision));
-        let bid_size = msg
-            .bid_size
-            .map(|s| parse_contracts_quantity(s, &instrument));
-        let ask_size = msg
-            .ask_size
-            .map(|s| parse_contracts_quantity(s, &instrument));
-        let ts_event = UnixNanos::from(msg.timestamp);
+            let instrument_id = instrument.id();
+            let price_precision = instrument.price_precision();
 
-        match self.quote_cache.process(
-            instrument_id,
-            bid_price,
-            ask_price,
-            bid_size,
-            ask_size,
-            ts_event,
-            ts_init,
-        ) {
-            Ok(quote) => Some(NautilusWsMessage::Data(vec![Data::Quote(quote)])),
-            Err(e) => {
-                log::warn!("Failed to process quote: {e}");
-                None
+            let bid_price = msg.bid_price.map(|p| Price::new(p, price_precision));
+            let ask_price = msg.ask_price.map(|p| Price::new(p, price_precision));
+            let bid_size = msg
+                .bid_size
+                .map(|s| parse_contracts_quantity(s, &instrument));
+            let ask_size = msg
+                .ask_size
+                .map(|s| parse_contracts_quantity(s, &instrument));
+            let ts_event = UnixNanos::from(msg.timestamp);
+
+            match self.quote_cache.process(
+                instrument_id,
+                bid_price,
+                ask_price,
+                bid_size,
+                ask_size,
+                ts_event,
+                ts_init,
+            ) {
+                Ok(quote) => quotes.push(Data::Quote(quote)),
+                Err(e) => {
+                    log::warn!("Failed to process quote for {}: {e}", msg.symbol);
+                }
             }
         }
+
+        if quotes.is_empty() {
+            return None;
+        }
+
+        Some(NautilusWsMessage::Data(quotes))
     }
 
     fn handle_trade(
@@ -631,7 +645,20 @@ impl FeedHandler {
                                 let client_order_id = ClientOrderId::new(client_order_id);
 
                                 if let Some(ord_type) = &order_msg.ord_type {
-                                    let order_type: OrderType = (*ord_type).into();
+                                    // Pegged orders with TrailingStopPeg are trailing stop orders
+                                    let order_type: OrderType = if *ord_type
+                                        == BitmexOrderType::Pegged
+                                        && order_msg.peg_price_type
+                                            == Some(BitmexPegPriceType::TrailingStopPeg)
+                                    {
+                                        if order_msg.price.is_some() {
+                                            OrderType::TrailingStopLimit
+                                        } else {
+                                            OrderType::TrailingStopMarket
+                                        }
+                                    } else {
+                                        (*ord_type).into()
+                                    };
                                     self.order_type_cache.insert(client_order_id, order_type);
                                 }
 
@@ -682,7 +709,7 @@ impl FeedHandler {
 
                     if let Some(event) = parse_order_update_msg(&msg, &instrument, self.account_id)
                     {
-                        return Some(NautilusWsMessage::OrderUpdated(event));
+                        return Some(NautilusWsMessage::OrderUpdated(Box::new(event)));
                     } else {
                         log::warn!(
                             "Skipped order update message (insufficient data): \
@@ -790,7 +817,13 @@ impl FeedHandler {
     }
 
     fn handle_position(&self, data: Vec<BitmexPositionMsg>) -> Option<NautilusWsMessage> {
-        if let Some(pos_msg) = data.into_iter().next() {
+        if data.is_empty() {
+            return None;
+        }
+
+        let mut reports = Vec::with_capacity(data.len());
+
+        for pos_msg in data {
             let Some(instrument) = Self::get_instrument(&self.instruments_cache, &pos_msg.symbol)
             else {
                 log::error!(
@@ -798,13 +831,16 @@ impl FeedHandler {
                     pos_msg.symbol,
                     pos_msg.account
                 );
-                return None;
+                continue;
             };
-            let report = parse_position_msg(pos_msg, &instrument);
-            Some(NautilusWsMessage::PositionStatusReport(report))
-        } else {
-            None
+            reports.push(parse_position_msg(pos_msg, &instrument));
         }
+
+        if reports.is_empty() {
+            return None;
+        }
+
+        Some(NautilusWsMessage::PositionStatusReports(reports))
     }
 
     fn handle_wallet(
@@ -812,12 +848,16 @@ impl FeedHandler {
         data: Vec<BitmexWalletMsg>,
         ts_init: UnixNanos,
     ) -> Option<NautilusWsMessage> {
-        if let Some(wallet_msg) = data.into_iter().next() {
-            let account_state = parse_wallet_msg(wallet_msg, ts_init);
-            Some(NautilusWsMessage::AccountState(account_state))
-        } else {
-            None
+        if data.is_empty() {
+            return None;
         }
+
+        let states: Vec<_> = data
+            .into_iter()
+            .map(|wallet_msg| parse_wallet_msg(wallet_msg, ts_init))
+            .collect();
+
+        Some(NautilusWsMessage::AccountStates(states))
     }
 
     fn handle_instrument(

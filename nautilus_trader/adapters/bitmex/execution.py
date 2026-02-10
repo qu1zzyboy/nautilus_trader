@@ -49,6 +49,7 @@ from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import ContingencyType
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.enums import OrderStatus
+from nautilus_trader.model.enums import OrderType
 from nautilus_trader.model.events import AccountState
 from nautilus_trader.model.events import OrderCancelRejected
 from nautilus_trader.model.events import OrderModifyRejected
@@ -58,10 +59,12 @@ from nautilus_trader.model.functions import contingency_type_to_pyo3
 from nautilus_trader.model.functions import order_side_to_pyo3
 from nautilus_trader.model.functions import order_type_to_pyo3
 from nautilus_trader.model.functions import time_in_force_to_pyo3
+from nautilus_trader.model.functions import trailing_offset_type_to_pyo3
 from nautilus_trader.model.functions import trigger_type_to_pyo3
 from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import ClientOrderId
+from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.orders import Order
 
@@ -271,10 +274,9 @@ class BitmexExecutionClient(LiveExecutionClient):
             self._log.error(f"Failed to subscribe to authenticated channels: {e}")
 
     async def _update_account_state(self) -> None:
-        # First get the margin data to extract the actual account number
-        account_number = await self._http_client.get_margin("XBt")
-
         # Update account ID with actual account number from BitMEX
+        account_number = await self._http_client.get_account_number()
+
         if account_number:
             actual_account_id = AccountId(f"{self._account_id_prefix}-{account_number}")
             self._set_account_id(actual_account_id)
@@ -360,8 +362,8 @@ class BitmexExecutionClient(LiveExecutionClient):
             )
 
             return reports
-        except Exception as e:
-            self._log.error(f"Failed to generate order status reports: {e}")
+        except (asyncio.CancelledError, Exception) as e:
+            self._log_report_error(e, "OrderStatusReports")
             return []
 
     async def generate_order_status_report(
@@ -390,8 +392,8 @@ class BitmexExecutionClient(LiveExecutionClient):
             self._log_report_receipt(len(reports), "FillReport", LogLevel.INFO)
 
             return reports
-        except Exception as e:
-            self._log.error(f"Failed to generate fill reports: {e}")
+        except (asyncio.CancelledError, Exception) as e:
+            self._log_report_error(e, "FillReports")
             return []
 
     async def generate_position_status_reports(
@@ -413,8 +415,8 @@ class BitmexExecutionClient(LiveExecutionClient):
             )
 
             return reports
-        except Exception as e:
-            self._log.error(f"Failed to generate position status reports: {e}")
+        except (asyncio.CancelledError, Exception) as e:
+            self._log_report_error(e, "PositionStatusReports")
             return []
 
     async def _submit_order(self, command: SubmitOrder) -> None:
@@ -458,16 +460,27 @@ class BitmexExecutionClient(LiveExecutionClient):
             if order.has_trigger_price
             else None
         )
+        # Trigger type applies to stop orders (via trigger_price) and trailing stops
+        has_trigger = order.has_trigger_price or order.order_type in (
+            OrderType.TRAILING_STOP_MARKET,
+            OrderType.TRAILING_STOP_LIMIT,
+        )
         pyo3_trigger_type = (
             trigger_type_to_pyo3(order.trigger_type)
-            if order.has_trigger_price and hasattr(order, "trigger_type")
+            if has_trigger and order.trigger_type is not None
             else None
         )
+        display_qty = getattr(order, "display_qty", None)
         pyo3_display_qty = (
-            nautilus_pyo3.Quantity.from_str(str(order.display_qty))
-            if hasattr(order, "display_qty") and order.display_qty
-            else None
+            nautilus_pyo3.Quantity.from_str(str(display_qty)) if display_qty is not None else None
         )
+
+        trailing_offset = None
+        pyo3_trailing_offset_type = None
+        if order.order_type in (OrderType.TRAILING_STOP_MARKET, OrderType.TRAILING_STOP_LIMIT):
+            if order.trailing_offset is not None:
+                trailing_offset = float(order.trailing_offset)
+            pyo3_trailing_offset_type = trailing_offset_type_to_pyo3(order.trailing_offset_type)
 
         pyo3_contingency_type = None
         pyo3_order_list_id = None
@@ -492,6 +505,8 @@ class BitmexExecutionClient(LiveExecutionClient):
                     price=pyo3_price,
                     trigger_price=pyo3_trigger_price,
                     trigger_type=pyo3_trigger_type,
+                    trailing_offset=trailing_offset,
+                    trailing_offset_type=pyo3_trailing_offset_type,
                     display_qty=pyo3_display_qty,
                     post_only=order.is_post_only,
                     reduce_only=order.is_reduce_only,
@@ -510,6 +525,8 @@ class BitmexExecutionClient(LiveExecutionClient):
                     price=pyo3_price,
                     trigger_price=pyo3_trigger_price,
                     trigger_type=pyo3_trigger_type,
+                    trailing_offset=trailing_offset,
+                    trailing_offset_type=pyo3_trailing_offset_type,
                     display_qty=pyo3_display_qty,
                     post_only=order.is_post_only,
                     reduce_only=order.is_reduce_only,
@@ -517,11 +534,22 @@ class BitmexExecutionClient(LiveExecutionClient):
                     contingency_type=pyo3_contingency_type,
                 )
         except Exception as e:
+            error_msg = str(e)
+
+            # If all transports returned "Duplicate clOrdID", the order likely exists
+            # but the success response was lost. Wait for WebSocket confirmation.
+            if "IDEMPOTENT_DUPLICATE" in error_msg:
+                self._log.warning(
+                    f"Order {order.client_order_id} may exist (duplicate clOrdID from all transports), "
+                    "awaiting WebSocket confirmation",
+                )
+                return
+
             self.generate_order_rejected(
                 strategy_id=order.strategy_id,
                 instrument_id=order.instrument_id,
                 client_order_id=order.client_order_id,
-                reason=str(e),
+                reason=error_msg,
                 ts_event=self._clock.timestamp_ns(),
             )
 
@@ -790,6 +818,8 @@ class BitmexExecutionClient(LiveExecutionClient):
 
     def _handle_instrument_update(self, pyo3_instrument: BitmexInstrument) -> None:
         self._http_client.cache_instrument(pyo3_instrument)
+        self._submitter.cache_instrument(pyo3_instrument)
+        self._canceller.cache_instrument(pyo3_instrument)
 
         if self._ws_client is not None:
             self._ws_client.cache_instrument(pyo3_instrument)
@@ -822,17 +852,32 @@ class BitmexExecutionClient(LiveExecutionClient):
     ) -> None:
         client_order_id = ClientOrderId(pyo3_event.client_order_id.value)
 
+        # For EXTERNAL orders (no clOrdID from BitMEX), look up by venue_order_id
+        if client_order_id.value == "EXTERNAL" and pyo3_event.venue_order_id:
+            venue_order_id = VenueOrderId(pyo3_event.venue_order_id.value)
+            indexed_client_order_id = self._cache.client_order_id(venue_order_id)
+            if indexed_client_order_id:
+                client_order_id = indexed_client_order_id
+
         order = self._cache.order(client_order_id)
         if not order:
-            self._log.warning(
-                f"Cannot find order for client_order_id {client_order_id} with "
-                f"venue_order_id {pyo3_event.venue_order_id}, ignoring update",
-            )
+            # Log at debug for EXTERNAL orders (often internal BitMEX system entries)
+            if pyo3_event.client_order_id.value == "EXTERNAL":
+                self._log.debug(
+                    f"Cannot find order for external update with "
+                    f"venue_order_id {pyo3_event.venue_order_id}, ignoring",
+                )
+            else:
+                self._log.warning(
+                    f"Cannot find order for client_order_id {client_order_id} with "
+                    f"venue_order_id {pyo3_event.venue_order_id}, ignoring update",
+                )
             return
 
         event_dict = pyo3_event.to_dict()
         event_dict["trader_id"] = order.trader_id.value
         event_dict["strategy_id"] = order.strategy_id.value
+        event_dict["client_order_id"] = client_order_id.value
 
         # We use zero as a sentinel indicating no quantity change
         event_qty = Quantity.from_str(event_dict["quantity"])
