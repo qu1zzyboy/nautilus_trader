@@ -26,10 +26,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
-    data::{
-        Bar, BarType, BookOrder, Data, OrderBookDelta, OrderBookDeltas, TradeTick,
-        bar::get_bar_interval_ns,
-    },
+    data::{Bar, BarType, BookOrder, Data, OrderBookDelta, OrderBookDeltas, TradeTick},
     enums::{AggressorSide, BookAction, OrderSide, OrderStatus, RecordFlag},
     identifiers::{AccountId, InstrumentId, TradeId},
     instruments::{Instrument, InstrumentAny},
@@ -40,7 +37,10 @@ use rust_decimal::Decimal;
 
 use super::{DydxWsError, DydxWsResult};
 use crate::{
-    common::{enums::DydxOrderStatus, instrument_cache::InstrumentCache},
+    common::{
+        enums::{DydxOrderStatus, DydxTickerType},
+        instrument_cache::InstrumentCache,
+    },
     execution::{encoder::ClientOrderIdEncoder, types::OrderContext},
     http::{
         models::{Fill, Order, PerpetualPosition},
@@ -149,23 +149,6 @@ pub fn parse_ws_order_report(
     // enum mapping.
     if matches!(ws_order.status, DydxOrderStatus::Untriggered) && ws_order.trigger_price.is_some() {
         report.order_status = OrderStatus::PendingUpdate;
-    }
-
-    // Clean up order context and encoder mapping when order reaches terminal state
-    if let Some(client_id) = dydx_client_id
-        && !report.order_status.is_open()
-    {
-        log::info!(
-            "[WS_ORDER_RECV] TERMINAL STATE: dYdX u32={} meta={:#x} status={:?} -> cleaning up mappings",
-            client_id,
-            dydx_client_metadata,
-            report.order_status
-        );
-        if order_contexts.remove(&client_id).is_some() {
-            log::info!("[WS_ORDER_RECV] Cleaned up order_contexts for dYdX client_id={client_id}");
-        }
-        // Also clean up encoder mapping using both client_id and client_metadata
-        encoder.remove(client_id, dydx_client_metadata);
     }
 
     Ok(report)
@@ -284,7 +267,8 @@ fn convert_ws_order_to_http(
 /// Parses a WebSocket fill update into a FillReport.
 ///
 /// Converts the WebSocket fill format to the HTTP Fill format, then delegates
-/// to the existing HTTP parser for consistency.
+/// to the existing HTTP parser for consistency. Correlates the fill back to the
+/// originating order using the `order_id_map` (built from WS order updates).
 ///
 /// # Errors
 ///
@@ -295,6 +279,9 @@ fn convert_ws_order_to_http(
 pub fn parse_ws_fill_report(
     ws_fill: &DydxWsFillSubaccountMessageContents,
     instrument_cache: &InstrumentCache,
+    order_id_map: &DashMap<String, (u32, u32)>,
+    order_contexts: &DashMap<u32, OrderContext>,
+    encoder: &ClientOrderIdEncoder,
     account_id: AccountId,
     ts_init: UnixNanos,
 ) -> anyhow::Result<FillReport> {
@@ -314,7 +301,29 @@ pub fn parse_ws_fill_report(
         })?;
 
     let http_fill = convert_ws_fill_to_http(ws_fill)?;
-    parse_fill_report(&http_fill, &instrument, account_id, ts_init)
+    let mut report = parse_fill_report(&http_fill, &instrument, account_id, ts_init)?;
+
+    // Correlate fill to order via order_id → (client_id, client_metadata) → client_order_id
+    if let Some(ref order_id) = ws_fill.order_id {
+        if let Some(entry) = order_id_map.get(order_id) {
+            let (client_id, client_metadata) = *entry.value();
+            if let Some(ctx) = order_contexts.get(&client_id) {
+                report.client_order_id = Some(ctx.client_order_id);
+            } else if let Some(client_order_id) = encoder.decode(client_id, client_metadata) {
+                report.client_order_id = Some(client_order_id);
+            } else {
+                log::warn!(
+                    "[WS_FILL_RECV] DECODE FAILED: order_id={order_id} -> client_id={client_id} meta={client_metadata:#x} not decodable",
+                );
+            }
+        } else {
+            log::warn!(
+                "[WS_FILL_RECV] No order_id mapping for '{order_id}', fill cannot be correlated",
+            );
+        }
+    }
+
+    Ok(report)
 }
 
 /// Converts a WebSocket fill message to HTTP Fill format.
@@ -357,7 +366,7 @@ fn convert_ws_fill_to_http(ws_fill: &DydxWsFillSubaccountMessageContents) -> any
         liquidity: ws_fill.liquidity,
         fill_type: ws_fill.fill_type,
         market: ws_fill.market,
-        market_type: ws_fill.market_type,
+        market_type: ws_fill.market_type.unwrap_or(DydxTickerType::Perpetual),
         price,
         size,
         fee,
@@ -763,6 +772,9 @@ pub fn parse_trade_ticks(
 
 /// Parses a single candle into a [`Bar`].
 ///
+/// When `timestamp_on_close` is true, `ts_event` is set to bar close time
+/// (started_at + interval). When false, uses the venue-native open time.
+///
 /// # Errors
 ///
 /// Returns an error if OHLCV/timestamp parsing fails.
@@ -770,6 +782,7 @@ pub fn parse_candle_bar(
     bar_type: BarType,
     instrument: &InstrumentAny,
     candle: &DydxCandle,
+    timestamp_on_close: bool,
     ts_init: UnixNanos,
 ) -> DydxWsResult<Bar> {
     let open = Decimal::from_str(&candle.open)
@@ -780,8 +793,13 @@ pub fn parse_candle_bar(
         .map_err(|e| DydxWsError::Parse(format!("Failed to parse low: {e}")))?;
     let close = Decimal::from_str(&candle.close)
         .map_err(|e| DydxWsError::Parse(format!("Failed to parse close: {e}")))?;
-    let volume = Decimal::from_str(&candle.base_token_volume)
-        .map_err(|e| DydxWsError::Parse(format!("Failed to parse volume: {e}")))?;
+    let volume = candle
+        .base_token_volume
+        .as_deref()
+        .map(Decimal::from_str)
+        .transpose()
+        .map_err(|e| DydxWsError::Parse(format!("Failed to parse volume: {e}")))?
+        .unwrap_or(Decimal::ZERO);
 
     let started_at_nanos = candle.started_at.timestamp_nanos_opt().ok_or_else(|| {
         DydxWsError::Parse(format!(
@@ -789,8 +807,20 @@ pub fn parse_candle_bar(
             candle.started_at
         ))
     })?;
-    let interval_nanos = get_bar_interval_ns(&bar_type);
-    let ts_event = UnixNanos::from(started_at_nanos as u64) + interval_nanos;
+    let mut ts_event = UnixNanos::from(started_at_nanos as u64);
+    if timestamp_on_close {
+        let interval_ns = bar_type
+            .spec()
+            .timedelta()
+            .num_nanoseconds()
+            .ok_or_else(|| DydxWsError::Parse("Bar interval overflow".to_string()))?;
+        let updated = (started_at_nanos as u64)
+            .checked_add(interval_ns as u64)
+            .ok_or_else(|| {
+                DydxWsError::Parse("Bar timestamp overflowed adjusting to close time".to_string())
+            })?;
+        ts_event = UnixNanos::from(updated);
+    }
 
     let bar = Bar::new(
         bar_type,
@@ -820,8 +850,14 @@ pub fn parse_candle_bar(
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use nautilus_model::{
-        enums::{LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSideSpecified},
+        data::{BarType, Data},
+        enums::{
+            AggressorSide, BookAction, LiquiditySide, OrderSide, OrderStatus, OrderType,
+            PositionSideSpecified,
+        },
         identifiers::{AccountId, InstrumentId, Symbol, Venue},
         instruments::{CryptoPerpetual, InstrumentAny},
         types::{Currency, Price, Quantity},
@@ -832,9 +868,12 @@ mod tests {
 
     use super::*;
     use crate::{
-        common::enums::{
-            DydxFillType, DydxLiquidity, DydxMarketStatus, DydxOrderStatus, DydxOrderType,
-            DydxPositionSide, DydxPositionStatus, DydxTickerType, DydxTimeInForce,
+        common::{
+            enums::{
+                DydxFillType, DydxLiquidity, DydxMarketStatus, DydxOrderStatus, DydxOrderType,
+                DydxPositionSide, DydxPositionStatus, DydxTickerType, DydxTimeInForce,
+            },
+            testing::load_json_fixture,
         },
         http::models::PerpetualMarket,
         websocket::messages::{DydxPerpetualPosition, DydxWsFillSubaccountMessageContents},
@@ -1056,7 +1095,7 @@ mod tests {
             liquidity: DydxLiquidity::Maker,
             fill_type: DydxFillType::Limit,
             market: "BTC-USD".into(),
-            market_type: DydxTickerType::Perpetual,
+            market_type: Some(DydxTickerType::Perpetual),
             price: "50000.5".to_string(),
             size: "0.1".to_string(),
             fee: "-2.5".to_string(), // Negative for maker rebate
@@ -1095,7 +1134,7 @@ mod tests {
             liquidity: DydxLiquidity::Taker,
             fill_type: DydxFillType::Limit,
             market: "BTC-USD".into(),
-            market_type: DydxTickerType::Perpetual,
+            market_type: Some(DydxTickerType::Perpetual),
             price: "49500.0".to_string(),
             size: "0.5".to_string(),
             fee: "12.375".to_string(), // Positive for taker fee
@@ -1107,8 +1146,19 @@ mod tests {
 
         let account_id = AccountId::new("DYDX-001");
         let ts_init = UnixNanos::default();
+        let order_id_map = DashMap::new();
+        let order_contexts = DashMap::new();
+        let encoder = ClientOrderIdEncoder::new();
 
-        let result = parse_ws_fill_report(&ws_fill, &instrument_cache, account_id, ts_init);
+        let result = parse_ws_fill_report(
+            &ws_fill,
+            &instrument_cache,
+            &order_id_map,
+            &order_contexts,
+            &encoder,
+            account_id,
+            ts_init,
+        );
         assert!(result.is_ok());
 
         let fill_report = result.unwrap();
@@ -1116,8 +1166,7 @@ mod tests {
         assert_eq!(fill_report.venue_order_id.as_str(), "order999");
         assert_eq!(fill_report.last_qty.as_f64(), 0.5);
         assert_eq!(fill_report.last_px.as_f64(), 49500.0);
-        // Commission should be negative (cost to trader) after negating positive fee
-        assert!((fill_report.commission.as_f64() + 12.38).abs() < 0.01);
+        assert_eq!(fill_report.commission.as_decimal(), dec!(12.38));
     }
 
     #[rstest]
@@ -1131,7 +1180,7 @@ mod tests {
             liquidity: DydxLiquidity::Maker,
             fill_type: DydxFillType::Limit,
             market: "ETH-USD-PERP".into(),
-            market_type: DydxTickerType::Perpetual,
+            market_type: Some(DydxTickerType::Perpetual),
             price: "3000.0".to_string(),
             size: "1.0".to_string(),
             fee: "-1.5".to_string(),
@@ -1143,8 +1192,19 @@ mod tests {
 
         let account_id = AccountId::new("DYDX-001");
         let ts_init = UnixNanos::default();
+        let order_id_map = DashMap::new();
+        let order_contexts = DashMap::new();
+        let encoder = ClientOrderIdEncoder::new();
 
-        let result = parse_ws_fill_report(&ws_fill, &instrument_cache, account_id, ts_init);
+        let result = parse_ws_fill_report(
+            &ws_fill,
+            &instrument_cache,
+            &order_id_map,
+            &order_contexts,
+            &encoder,
+            account_id,
+            ts_init,
+        );
         assert!(result.is_err());
         assert!(
             result
@@ -1563,7 +1623,7 @@ mod tests {
             liquidity: DydxLiquidity::Maker,
             fill_type: DydxFillType::Limit,
             market: "BTC-USD".into(),
-            market_type: DydxTickerType::Perpetual,
+            market_type: Some(DydxTickerType::Perpetual),
             price: "50000.0".to_string(),
             size: "1.0".to_string(),
             fee: "-15.0".to_string(), // Negative fee = rebate
@@ -1575,14 +1635,24 @@ mod tests {
 
         let account_id = AccountId::new("DYDX-001");
         let ts_init = UnixNanos::default();
+        let order_id_map = DashMap::new();
+        let order_contexts = DashMap::new();
+        let encoder = ClientOrderIdEncoder::new();
 
-        let result = parse_ws_fill_report(&ws_fill, &instrument_cache, account_id, ts_init);
+        let result = parse_ws_fill_report(
+            &ws_fill,
+            &instrument_cache,
+            &order_id_map,
+            &order_contexts,
+            &encoder,
+            account_id,
+            ts_init,
+        );
         assert!(result.is_ok());
 
         let fill_report = result.unwrap();
         assert_eq!(fill_report.liquidity_side, LiquiditySide::Maker);
-        // Commission should be positive (rebate) after negating dYdX's negative fee
-        assert!(fill_report.commission.as_f64() > 0.0);
+        assert!(fill_report.commission.as_decimal() < dec!(0));
     }
 
     #[rstest]
@@ -1596,7 +1666,7 @@ mod tests {
             liquidity: DydxLiquidity::Taker,
             fill_type: DydxFillType::Limit,
             market: "BTC-USD".into(),
-            market_type: DydxTickerType::Perpetual,
+            market_type: Some(DydxTickerType::Perpetual),
             price: "49800.0".to_string(),
             size: "0.75".to_string(),
             fee: "18.675".to_string(), // Positive fee for taker
@@ -1608,14 +1678,148 @@ mod tests {
 
         let account_id = AccountId::new("DYDX-001");
         let ts_init = UnixNanos::default();
+        let order_id_map = DashMap::new();
+        let order_contexts = DashMap::new();
+        let encoder = ClientOrderIdEncoder::new();
 
-        let result = parse_ws_fill_report(&ws_fill, &instrument_cache, account_id, ts_init);
+        let result = parse_ws_fill_report(
+            &ws_fill,
+            &instrument_cache,
+            &order_id_map,
+            &order_contexts,
+            &encoder,
+            account_id,
+            ts_init,
+        );
         assert!(result.is_ok());
 
         let fill_report = result.unwrap();
         assert_eq!(fill_report.liquidity_side, LiquiditySide::Taker);
         assert_eq!(fill_report.order_side, OrderSide::Sell);
-        // Commission should be negative (cost to trader) after negating positive fee
-        assert!(fill_report.commission.as_f64() < 0.0);
+        assert!(fill_report.commission.as_decimal() > dec!(0));
+    }
+
+    #[rstest]
+    fn test_parse_orderbook_snapshot() {
+        let json = load_json_fixture("ws_orderbook_subscribed.json");
+        let contents: DydxOrderbookSnapshotContents =
+            serde_json::from_value(json["contents"].clone())
+                .expect("Failed to parse orderbook snapshot contents");
+
+        let instrument_id = InstrumentId::from("BTC-USD-PERP.DYDX");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let deltas = parse_orderbook_snapshot(&instrument_id, &contents, 2, 8, ts_init)
+            .expect("Failed to parse orderbook snapshot");
+
+        // 1 clear + 3 bids + 3 asks = 7 deltas
+        assert_eq!(deltas.deltas.len(), 7);
+
+        assert_eq!(deltas.deltas[0].action, BookAction::Clear);
+        assert_eq!(deltas.deltas[1].action, BookAction::Add);
+        assert_eq!(deltas.deltas[1].order.side, OrderSide::Buy);
+        assert_eq!(deltas.deltas[1].order.price.to_string(), "43240.00");
+        assert_eq!(deltas.deltas[1].order.size.to_string(), "1.50000000");
+
+        assert_eq!(deltas.deltas[4].action, BookAction::Add);
+        assert_eq!(deltas.deltas[4].order.side, OrderSide::Sell);
+        assert_eq!(deltas.deltas[4].order.price.to_string(), "43250.00");
+        assert_eq!(deltas.deltas[4].order.size.to_string(), "1.20000000");
+
+        let last = deltas.deltas.last().unwrap();
+        assert_ne!(last.flags, 0);
+    }
+
+    #[rstest]
+    fn test_parse_orderbook_deltas_update() {
+        let json = load_json_fixture("ws_orderbook_update.json");
+        let contents: DydxOrderbookContents = serde_json::from_value(json["contents"].clone())
+            .expect("Failed to parse orderbook update contents");
+
+        let instrument_id = InstrumentId::from("BTC-USD-PERP.DYDX");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let deltas = parse_orderbook_deltas(&instrument_id, &contents, 2, 8, ts_init)
+            .expect("Failed to parse orderbook deltas");
+
+        // 2 bids + 2 asks = 4 deltas
+        assert_eq!(deltas.deltas.len(), 4);
+
+        assert_eq!(deltas.deltas[0].action, BookAction::Update);
+        assert_eq!(deltas.deltas[0].order.side, OrderSide::Buy);
+        assert_eq!(deltas.deltas[0].order.price.to_string(), "43240.00");
+
+        // First ask with size 0.0 should be a Delete
+        assert_eq!(deltas.deltas[2].action, BookAction::Delete);
+        assert_eq!(deltas.deltas[2].order.side, OrderSide::Sell);
+        assert_eq!(deltas.deltas[2].order.price.to_string(), "43250.00");
+
+        assert_eq!(deltas.deltas[3].action, BookAction::Update);
+        assert_eq!(deltas.deltas[3].order.side, OrderSide::Sell);
+    }
+
+    #[rstest]
+    fn test_parse_trade_ticks_ws() {
+        let json = load_json_fixture("ws_trades_subscribed.json");
+        let contents: DydxTradeContents = serde_json::from_value(json["contents"].clone())
+            .expect("Failed to parse trade contents");
+
+        let instrument = create_test_instrument();
+        let instrument_id = instrument.id();
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let ticks = parse_trade_ticks(instrument_id, &instrument, &contents, ts_init)
+            .expect("Failed to parse trade ticks");
+
+        assert_eq!(ticks.len(), 1);
+        if let Data::Trade(tick) = &ticks[0] {
+            assert_eq!(tick.instrument_id, instrument_id);
+            assert_eq!(tick.price.to_string(), "43250.00");
+            assert_eq!(tick.size.to_string(), "0.50000000");
+            assert_eq!(tick.aggressor_side, AggressorSide::Buyer);
+            assert_eq!(tick.trade_id.to_string(), "trade-001");
+        } else {
+            panic!("Expected Trade data");
+        }
+    }
+
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn test_parse_candle_bar_timestamp_on_close(#[case] timestamp_on_close: bool) {
+        let json = load_json_fixture("ws_candles_subscribed.json");
+        let candles_value = &json["contents"]["candles"];
+        let candles: Vec<DydxCandle> =
+            serde_json::from_value(candles_value.clone()).expect("Failed to parse candle array");
+
+        let instrument = create_test_instrument();
+        let bar_type = BarType::from_str("BTC-USD-PERP.DYDX-1-MINUTE-LAST-EXTERNAL")
+            .expect("Failed to parse bar type");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let bar = parse_candle_bar(
+            bar_type,
+            &instrument,
+            &candles[0],
+            timestamp_on_close,
+            ts_init,
+        )
+        .expect("Failed to parse candle bar");
+
+        assert_eq!(bar.bar_type, bar_type);
+        assert_eq!(bar.open.to_string(), "43100.00");
+        assert_eq!(bar.high.to_string(), "43500.00");
+        assert_eq!(bar.low.to_string(), "43000.00");
+        assert_eq!(bar.close.to_string(), "43400.00");
+        assert_eq!(bar.volume.to_string(), "12.34500000");
+
+        // 2024-01-01T00:00:00.000Z = 1_704_067_200_000_000_000 ns
+        let started_at_ns = 1_704_067_200_000_000_000u64;
+        let one_min_ns = 60_000_000_000u64;
+        if timestamp_on_close {
+            assert_eq!(bar.ts_event.as_u64(), started_at_ns + one_min_ns);
+        } else {
+            assert_eq!(bar.ts_event.as_u64(), started_at_ns);
+        }
     }
 }

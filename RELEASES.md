@@ -8,6 +8,9 @@ This will be the final release with support for the dYdX v3 (legacy) API. Future
 - Added `bulk_read_batch_size` option to `CacheConfig` for batched Redis bulk reads, thanks @shzhng
 - Added sandbox execution adapter in Rust
 - Added multi-account execution support (#3194), thanks @faysou
+- Added NASDAQ ITCH 5.0 parser
+- Added `OrderBookDeltas` historical request support (#3438), thanks @faysou
+- Added `market_exit()` method for `Strategy` with configurable `market_exit_time_in_force` and `market_exit_reduce_only` options (supports venues requiring IOC for market orders)
 - Added `manage_stop` config option to `StrategyConfig` for automatic market exit on stop
 - Added matching engine `queue_position` tracking heuristic for backtests
 - Added tracing subscriber for external Rust library logs (`use_tracing=True` in `LoggingConfig`, filter with `RUST_LOG` env var)
@@ -16,11 +19,17 @@ This will be the final release with support for the dYdX v3 (legacy) API. Future
 - Added `request_funding_rates` and `FundingRateUpdate` Arrow serialization (#3467), thanks @dxwil
 - Added `optimize_file_loading` as BacktestDataConfig parameter (#3518), thanks @faysou
 - Added `bulk_read_batch_size` option to `CacheConfig` for batched Redis bulk reads (#3535), thanks @shzhng
+- Added Ichimoku Cloud indicator (#3552), thanks @faysou
 - Added Betfair RCM parsing for TPD race data
+- Added Betfair `BetfairOrderVoided` custom data type for VAR voids
 - Added `BetfairOrderVoided` custom data type for VAR voids
+- Added Binance `BinanceEnvironment` enum with `LIVE`, `TESTNET`, `DEMO` variants for explicit environment selection
+- Added Binance `environment` config field to `BinanceDataClientConfig` and `BinanceExecClientConfig`
+- Added Binance Demo environment support with `BINANCE_DEMO_API_KEY`/`BINANCE_DEMO_API_SECRET` env vars
 - Added BitMEX trailing stop support
 - Added Bybit mark price subscriptions support
 - Added Bybit index price subscriptions support
+- Added Databento bulk subscription and historical request support (#3490), thanks @shzhng
 - Added Interactive Brokers subscribe index price functionality (#3514), thanks @Murph24
 - Added OKX batch cancel support for conditional (algo) orders
 - Added Polymarket data loader event-level API support (#3484), thanks @jsemldonado
@@ -35,18 +44,24 @@ This will be the final release with support for the dYdX v3 (legacy) API. Future
 - Removed `AddAssign`, `SubAssign`, `MulAssign` trait implementations from `Price`, `Quantity`, and `Money` types (Rust); use `x = x + y` instead of `x += y`
 - Removed `add_assign` and `sub_assign` cdef methods from `Price`, `Quantity`, and `Money` types (Cython); use `x = x + y` instead
 - Renamed `subscribed_order_book_snapshots` to `subscribed_order_book_depth` for consistency with data engine routing
+- Removed `listen_key_ping_max_failures` from `BinanceExecClientConfig` (listenKey flow replaced by WebSocket API)
 - Changed `Price`, `Quantity`, and `Money` arithmetic to use max precision instead of panicking on precision mismatch
 - Changed `Quantity + Quantity`, `Quantity - Quantity`, `Price + Price`, `Price - Price`, `Money + Money`, and `Money - Money` Python operators to return the same type instead of `Decimal` (`Quantity - Quantity` raises `ValueError` if result would be negative)
 - Changed `trade_execution` default from `False` to `True` for consistency with `bar_execution`; users who want to isolate execution to L1 book data only must now explicitly set `trade_execution=False`
 - Changed price-protected market orders to no longer emit `OrderAccepted` by default; set `use_market_order_acks=True` to restore previous behavior
-- Adapter implementations should now override `_subscribe_order_book_depth` and `_unsubscribe_order_book_depth` for `OrderBookDepth10` subscriptions
+- Changed adapter implementations should now override `_subscribe_order_book_depth` and `_unsubscribe_order_book_depth` for `OrderBookDepth10` subscriptions
+- Changed Binance execution clients now use WebSocket API authentication instead of listenKey REST API; both HMAC and Ed25519 keys are auto-detected from the `api_secret` format (no `key_type` config needed). Note: Futures with HMAC keys automatically fall back to REST listenKey management (Binance Futures WS API only supports Ed25519 for `session.logon`)
+- Changed Binance execution clients now source credentials from the standard `BINANCE_API_KEY`/`BINANCE_API_SECRET` environment variables (or testnet equivalents)
+- Changed Polymarket instrument provider config from `instrument_provider` to `instrument_config` on `PolymarketDataClientConfig` and `PolymarketExecClientConfig`; use `PolymarketInstrumentProviderConfig` instead of `InstrumentProviderConfig`
 
 ### Security
 - Upgraded `arc-swap` to 1.8.1 fixing potential use-after-free in debt mechanism (memory ordering fix)
 - Fixed `CVec::empty()` to use dangling pointer instead of null, avoiding undefined behavior in `Vec::from_raw_parts`
+- Fixed credential and auth header leaks in trace logging
 - Masked Binance listen keys in execution client logs
 - Refactored supply chain security checks and update dependencies
 - Improved TLS cert loading and socket suffix validation
+- Hardened Postgres SQL and credential security
 
 ### Fixes
 - Fixed matching engine liquidity consumption using cumulative book quantity
@@ -56,6 +71,7 @@ This will be the final release with support for the dYdX v3 (legacy) API. Future
 - Fixed matching engine trade ticks updating L1 book and triggering fills when `trade_execution=False`
 - Fixed matching engine MAKER limit orders over-filling on L1 books when `liquidity_consumption=True`
 - Fixed inverse instrument `base_currency` access across accounting
+- Fixed `Position` spot base currency commission sign (#3546), thanks for reporting @gaye746560359
 - Fixed `Position` flat detection for floating-point edge cases
 - Fixed `UnsubscribeInstrumentClose` message handler routing
 - Fixed order cancel not releasing locked balance in backtest (#3525), thanks for reporting @dennisnissle
@@ -63,6 +79,8 @@ This will be the final release with support for the dYdX v3 (legacy) API. Future
 - Fixed `MarketIfTouchedOrder` (MIT) filling at bar extremes instead of trigger price during backtesting (#3461, #3462), thanks @HaakonFlaaronning
 - Fixed OTO child order sizing with rapid parent fills (#3435), thanks for reporting @dxwil
 - Fixed `ExecAlgorithm` spawn quantity accounting (will now restore quantity from denied/rejected spawned orders)
+- Fixed `GreeksCalculator` to use index price for index instruments (#3541), thanks @shzhng
+- Fixed `itm_prob` calculation to use N(d2) instead of normalized delta (#3554), thanks @shzhng
 - Fixed reconciliation `venue_order_id` indexing and validation
 - Fixed analyzer epoch timestamp from empty shell positions
 - Fixed backtest clock monotonicity with time alerts (#3384), thanks @draphi
@@ -79,6 +97,8 @@ This will be the final release with support for the dYdX v3 (legacy) API. Future
 - Fixed `request_order_book_snapshot` and add Bybit support (#3416), thanks @dxwil
 - Fixed Arrow serialization encoding for custom Nautilus types (#3515), thanks @dennisnissle
 - Fixed Redis cache buffer flushing during idle periods (#3426), thanks for reporting @santivazq
+- Fixed Redis cache flush no-op and harden close lifecycle
+- Fixed cache loading when flush_on_start set to True (#3551), thanks @HaakonFlaaronning
 - Fixed Betfair dropped fills from premature cache update
 - Fixed Betfair duplicate cancel event race condition(s)
 - Fixed Betfair stream batch handling and modify/cancel edge cases
@@ -111,17 +131,22 @@ This will be the final release with support for the dYdX v3 (legacy) API. Future
 - Fixed Interactive Brokers position reconciliation double-counting partial fills from open orders (#3476), thanks @shzhng
 - Fixed Interactive Brokers future chain building for index instruments (#3483), thanks @davidsblom
 - Fixed Interactive Brokers options missing `^` prefix on index underlying symbols with simplified symbology (#3540), thanks @shzhng
+- Fixed Interactive Brokers contract for ESTX50 IND contract (#3556), thanks @davidsblom
+- Fixed Interactive Brokers parsing options for Stoxx50 (#3562), thanks @davidsblom
 - Fixed Kraken spot instrument fee/margin parsing where parameters were incorrectly swapped
 - Fixed Kraken spot XBT to BTC symbol normalization (#3509), thanks for reporting @chester0
+- Fixed Polymarket cancel-rejection loop for done orders
 - Fixed Polymarket order state race condition where `PLACEMENT` events could arrive late
 - Fixed Polymarket duplicate WebSocket subscriptions (#3403), thanks for reporting @santivazq
 - Fixed Polymarket duplicate trade_id for multi-order fills (#3450), thanks for reporting @santivazq
 - Fixed Polymarket `load_all_async` ignoring time-based filters (#3475), thanks @Coyote-Den
 - Fixed Tardis deltas snapshot boundaries with CLEAR (#3530), thanks @Arandott
+- Fixed `itm_prob` calculation to use N(d2) instead of normalized delta, thanks @shzhng
 
 ### Internal Improvements
 - Added support for setting cache database adapter in cache and `LiveNode` (#3401), thanks @filipmacek
 - Added `ts_init` normalization option to `convert_stream_to_data` (#3433), thanks @faysou
+- Added metadata validation for parquet file consolidation to improve handling of mixed precision instruments
 - Added Binance `listenKeyExpired` event handling (#3387), thanks @Johnkhk
 - Added Deribit data client (#3368), thanks @filipmacek
 - Added Deribit order submission (#3408), thanks @filipmacek
@@ -141,6 +166,8 @@ This will be the final release with support for the dYdX v3 (legacy) API. Future
 - Refactored Deribit WS client to use standard Nautilus method names (#3418), thanks @filipmacek
 - Refactored dYdX v4 execution client in Rust (#3477), thanks @filipmacek
 - Refactored dYdX v4 adapter (#3521), thanks @filipmacek
+- Refactored dYdX v4 data client (#3547), thanks @filipmacek
+- Refactored dYdX v4 execution client (#3557), thanks @filipmacek
 - Refactored Kraken spot quotes to use dedicated Ticker channel
 - Refactored Polymarket WebSocket to multi-client pool pattern
 - Improved `cancel_all_orders` to include inflight orders
@@ -164,6 +191,9 @@ This will be the final release with support for the dYdX v3 (legacy) API. Future
 - Refined `OptionExerciseModule` (#3423), thanks @faysou
 - Refined instrument `is_spread()` method (#3434), thanks @faysou
 - Refined `OrderBookDeltas.batch` (#3437), thanks @faysou
+- Optimized `Price::from_decimal` with integer arithmetic
+- Optimized `Quantity::from_decimal` with integer arithmetic
+- Optimized `Money::from_decimal` with integer arithmetic
 - Optimized message bus publish with thread-local `SmallVec` buffers in Rust
 - Optimized message bus pattern matching with greedy algorithm
 - Upgraded Interactive Brokers adapter to `ibapi` 10.37.2 (#3427), thanks @faysou
@@ -177,9 +207,17 @@ This will be the final release with support for the dYdX v3 (legacy) API. Future
 - Upgraded `tokio` crate to v1.49.0
 
 ### Documentation Updates
+- Added related guides sections to concepts
+- Added developer guide for test dataset standards
+- Added AX Exchange adapter integration guides
+- Added Deribit adapter integration guides
+- Split dYdX v3/v4 adapter integration guides
 
 ### Deprecations
 - Deprecated Betfair legacy `customer_order_ref` truncation (first 32 characters); the adapter now uses last 32 characters for better entropy. Legacy truncation support during startup reconciliation will be removed in a future version.
+- Deprecated Binance `key_type` config field; key type is now auto-detected (only needed if explicitly using RSA keys)
+- Deprecated Binance `testnet` config field; use `environment=BinanceEnvironment.TESTNET` instead
+- Deprecated Binance `BINANCE_ED25519_*` and `BINANCE_*_ED25519_*` environment variables; migrate to the standard `BINANCE_API_KEY`/`BINANCE_API_SECRET` variables
 
 ---
 

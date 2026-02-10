@@ -449,6 +449,7 @@ pub struct ExecTester {
     config: ExecTesterConfig,
     instrument: Option<InstrumentAny>,
     price_offset: Option<f64>,
+    preinitialized_market_data: bool,
 
     // Order tracking
     buy_order: Option<OrderAny>,
@@ -484,7 +485,7 @@ impl DataActor for ExecTester {
         };
 
         if let Some(inst) = instrument {
-            self.initialize_with_instrument(inst)?;
+            self.initialize_with_instrument(inst, true)?;
         } else {
             log::info!("Instrument {instrument_id} not in cache, subscribing...");
             self.subscribe_instrument(instrument_id, client_id, None);
@@ -497,6 +498,8 @@ impl DataActor for ExecTester {
             if self.config.subscribe_trades {
                 self.subscribe_trades(instrument_id, client_id, None);
             }
+            self.preinitialized_market_data =
+                self.config.subscribe_quotes || self.config.subscribe_trades;
         }
 
         Ok(())
@@ -506,7 +509,7 @@ impl DataActor for ExecTester {
         if instrument.id() == self.config.instrument_id && self.instrument.is_none() {
             let id = instrument.id();
             log::info!("Received instrument {id}, initializing...");
-            self.initialize_with_instrument(instrument.clone())?;
+            self.initialize_with_instrument(instrument.clone(), !self.preinitialized_market_data)?;
         }
         Ok(())
     }
@@ -696,6 +699,7 @@ impl ExecTester {
             config,
             instrument: None,
             price_offset: None,
+            preinitialized_market_data: false,
             buy_order: None,
             sell_order: None,
             buy_stop_order: None,
@@ -703,18 +707,22 @@ impl ExecTester {
         }
     }
 
-    fn initialize_with_instrument(&mut self, instrument: InstrumentAny) -> anyhow::Result<()> {
+    fn initialize_with_instrument(
+        &mut self,
+        instrument: InstrumentAny,
+        subscribe_market_data: bool,
+    ) -> anyhow::Result<()> {
         let instrument_id = self.config.instrument_id;
         let client_id = self.config.client_id;
 
         self.price_offset = Some(self.get_price_offset(&instrument));
         self.instrument = Some(instrument);
 
-        if self.config.subscribe_quotes {
+        if subscribe_market_data && self.config.subscribe_quotes {
             self.subscribe_quotes(instrument_id, client_id, None);
         }
 
-        if self.config.subscribe_trades {
+        if subscribe_market_data && self.config.subscribe_trades {
             self.subscribe_trades(instrument_id, client_id, None);
         }
 
@@ -1341,7 +1349,7 @@ impl ExecTester {
             anyhow::bail!("Strategy not registered: OrderFactory missing");
         };
 
-        let order_list = factory.bracket(
+        let orders = factory.bracket(
             self.config.instrument_id,
             order_side,
             quantity,
@@ -1362,7 +1370,7 @@ impl ExecTester {
             None, // tags
         );
 
-        if let Some(entry_order) = order_list.orders.first() {
+        if let Some(entry_order) = orders.first() {
             if order_side == OrderSide::Buy {
                 self.buy_order = Some(entry_order.clone());
             } else {
@@ -1372,9 +1380,9 @@ impl ExecTester {
 
         let client_id = self.config.client_id;
         if let Some(params) = &self.config.order_params {
-            self.submit_order_list_with_params(order_list, None, client_id, params.clone())
+            self.submit_order_list_with_params(orders, None, client_id, params.clone())
         } else {
-            self.submit_order_list(order_list, None, client_id)
+            self.submit_order_list(orders, None, client_id)
         }
     }
 

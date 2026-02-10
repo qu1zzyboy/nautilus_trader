@@ -15,8 +15,11 @@
 
 //! Enumerations that model Ax string enums across HTTP and WebSocket payloads.
 
-use nautilus_model::enums::{
-    AggressorSide, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
+use nautilus_model::{
+    data::BarSpecification,
+    enums::{
+        AggressorSide, BarAggregation, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
+    },
 };
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display, EnumIter, EnumString};
@@ -103,7 +106,7 @@ impl AxEnvironment {
 /// Instrument state as returned by the AX Exchange API.
 ///
 /// # References
-/// - <https://docs.sandbox.x.architect.co/api-reference/symbols-instruments/get-instruments>
+/// - <https://docs.architect.exchange/api-reference/symbols-instruments/get-instruments>
 #[derive(
     Clone,
     Copy,
@@ -140,7 +143,7 @@ pub enum AxInstrumentState {
 /// Order side for trading operations.
 ///
 /// # References
-/// - <https://docs.sandbox.x.architect.co/api-reference/order-management/place-order>
+/// - <https://docs.architect.exchange/api-reference/order-management/place-order>
 #[derive(
     Clone,
     Copy,
@@ -161,11 +164,11 @@ pub enum AxInstrumentState {
 )]
 pub enum AxOrderSide {
     /// Buy order.
-    #[serde(rename = "B")]
+    #[serde(rename = "B", alias = "Buy")]
     #[strum(serialize = "B")]
     Buy,
     /// Sell order.
-    #[serde(rename = "S")]
+    #[serde(rename = "S", alias = "Sell")]
     #[strum(serialize = "S")]
     Sell,
 }
@@ -212,7 +215,7 @@ impl TryFrom<OrderSide> for AxOrderSide {
 /// Order status as returned by the AX Exchange API.
 ///
 /// # References
-/// - <https://docs.sandbox.x.architect.co/api-reference/order-management/get-open-orders>
+/// - <https://docs.architect.exchange/api-reference/order-management/get-open-orders>
 #[derive(
     Clone,
     Copy,
@@ -288,7 +291,7 @@ impl From<AxOrderStatus> for OrderStatus {
 /// Time in force for order validity.
 ///
 /// # References
-/// - <https://docs.sandbox.x.architect.co/api-reference/order-management/place-order>
+/// - <https://docs.architect.exchange/api-reference/order-management/place-order>
 #[derive(
     Clone,
     Copy,
@@ -420,7 +423,7 @@ impl TryFrom<OrderType> for AxOrderType {
 /// Market data subscription level.
 ///
 /// # References
-/// - <https://docs.sandbox.x.architect.co/api-reference/marketdata/md-ws>
+/// - <https://docs.architect.exchange/api-reference/marketdata/md-ws>
 #[derive(
     Clone,
     Copy,
@@ -464,7 +467,7 @@ pub enum AxMarketDataLevel {
 /// Candle/bar width for market data subscriptions.
 ///
 /// # References
-/// - <https://docs.sandbox.x.architect.co/api-reference/marketdata/md-ws>
+/// - <https://docs.architect.exchange/api-reference/marketdata/md-ws>
 #[derive(
     Clone,
     Copy,
@@ -478,10 +481,6 @@ pub enum AxMarketDataLevel {
     EnumString,
     Serialize,
     Deserialize,
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.architect")
 )]
 pub enum AxCandleWidth {
     /// 1-second candles.
@@ -514,10 +513,101 @@ pub enum AxCandleWidth {
     Days1,
 }
 
+impl TryFrom<&BarSpecification> for AxCandleWidth {
+    type Error = anyhow::Error;
+
+    fn try_from(spec: &BarSpecification) -> Result<Self, Self::Error> {
+        let step = spec.step.get();
+        match (step, spec.aggregation) {
+            (1, BarAggregation::Second) => Ok(Self::Seconds1),
+            (5, BarAggregation::Second) => Ok(Self::Seconds5),
+            (1, BarAggregation::Minute) => Ok(Self::Minutes1),
+            (5, BarAggregation::Minute) => Ok(Self::Minutes5),
+            (15, BarAggregation::Minute) => Ok(Self::Minutes15),
+            (1, BarAggregation::Hour) => Ok(Self::Hours1),
+            (1, BarAggregation::Day) => Ok(Self::Days1),
+            _ => anyhow::bail!(
+                "Unsupported bar specification for AX: {step}-{:?}",
+                spec.aggregation,
+            ),
+        }
+    }
+}
+
+/// WebSocket market data request type (client to server).
+///
+/// # References
+/// - <https://docs.architect.exchange/api-reference/marketdata/md-ws>
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Display,
+    Eq,
+    PartialEq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+pub enum AxMdRequestType {
+    /// Subscribe to market data for a symbol.
+    #[serde(rename = "subscribe")]
+    #[strum(serialize = "subscribe")]
+    Subscribe,
+    /// Unsubscribe from market data for a symbol.
+    #[serde(rename = "unsubscribe")]
+    #[strum(serialize = "unsubscribe")]
+    Unsubscribe,
+    /// Subscribe to candle data for a symbol.
+    #[serde(rename = "subscribe_candles")]
+    #[strum(serialize = "subscribe_candles")]
+    SubscribeCandles,
+    /// Unsubscribe from candle data for a symbol.
+    #[serde(rename = "unsubscribe_candles")]
+    #[strum(serialize = "unsubscribe_candles")]
+    UnsubscribeCandles,
+}
+
+/// WebSocket order request type (client to server).
+///
+/// # References
+/// - <https://docs.architect.exchange/api-reference/order-management/orders-ws>
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Display,
+    Eq,
+    PartialEq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+pub enum AxOrderRequestType {
+    /// Place a new order.
+    #[serde(rename = "p")]
+    #[strum(serialize = "p")]
+    PlaceOrder,
+    /// Cancel an existing order.
+    #[serde(rename = "x")]
+    #[strum(serialize = "x")]
+    CancelOrder,
+    /// Get open orders.
+    #[serde(rename = "o")]
+    #[strum(serialize = "o")]
+    GetOpenOrders,
+}
+
 /// WebSocket market data message type (server to client).
 ///
 /// # References
-/// - <https://docs.sandbox.x.architect.co/api-reference/marketdata/md-ws>
+/// - <https://docs.architect.exchange/api-reference/marketdata/md-ws>
 #[derive(
     Clone,
     Copy,
@@ -570,7 +660,7 @@ pub enum AxMdWsMessageType {
 /// WebSocket order message type (server to client).
 ///
 /// # References
-/// - <https://docs.sandbox.x.architect.co/api-reference/order-management/orders-ws>
+/// - <https://docs.architect.exchange/api-reference/order-management/orders-ws>
 #[derive(
     Clone,
     Copy,
@@ -635,7 +725,7 @@ pub enum AxOrderWsMessageType {
 /// Reason for order cancellation.
 ///
 /// # References
-/// - <https://docs.sandbox.x.architect.co/api-reference/order-management/orders-ws>
+/// - <https://docs.architect.exchange/api-reference/order-management/orders-ws>
 #[derive(
     Clone,
     Copy,
@@ -659,12 +749,15 @@ pub enum AxOrderWsMessageType {
 pub enum AxCancelReason {
     /// User requested cancellation.
     UserRequested,
+    /// Unrecognized or empty reason from the server.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Reason for cancel rejection.
 ///
 /// # References
-/// - <https://docs.sandbox.x.architect.co/api-reference/order-management/orders-ws>
+/// - <https://docs.architect.exchange/api-reference/order-management/orders-ws>
 #[derive(
     Clone,
     Copy,
@@ -688,6 +781,9 @@ pub enum AxCancelReason {
 pub enum AxCancelRejectionReason {
     /// Order not found or already canceled.
     OrderNotFound,
+    /// Unrecognized reason from the server.
+    #[serde(other)]
+    Unknown,
 }
 
 #[cfg(test)]
@@ -833,5 +929,36 @@ mod tests {
 
         let parsed: AxOrderWsMessageType = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, msg_type);
+    }
+
+    #[rstest]
+    #[case(AxMdRequestType::Subscribe, "\"subscribe\"")]
+    #[case(AxMdRequestType::Unsubscribe, "\"unsubscribe\"")]
+    #[case(AxMdRequestType::SubscribeCandles, "\"subscribe_candles\"")]
+    #[case(AxMdRequestType::UnsubscribeCandles, "\"unsubscribe_candles\"")]
+    fn test_md_request_type_serialization(
+        #[case] request_type: AxMdRequestType,
+        #[case] expected: &str,
+    ) {
+        let json = serde_json::to_string(&request_type).unwrap();
+        assert_eq!(json, expected);
+
+        let parsed: AxMdRequestType = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, request_type);
+    }
+
+    #[rstest]
+    #[case(AxOrderRequestType::PlaceOrder, "\"p\"")]
+    #[case(AxOrderRequestType::CancelOrder, "\"x\"")]
+    #[case(AxOrderRequestType::GetOpenOrders, "\"o\"")]
+    fn test_order_request_type_serialization(
+        #[case] request_type: AxOrderRequestType,
+        #[case] expected: &str,
+    ) {
+        let json = serde_json::to_string(&request_type).unwrap();
+        assert_eq!(json, expected);
+
+        let parsed: AxOrderRequestType = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, request_type);
     }
 }

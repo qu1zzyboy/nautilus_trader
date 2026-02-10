@@ -18,7 +18,7 @@
 use anyhow::Context;
 use nautilus_core::{UUID4, nanos::UnixNanos};
 use nautilus_model::{
-    data::{Bar, BarSpecification, BarType},
+    data::{Bar, BarSpecification, BarType, FundingRateUpdate},
     enums::{
         AccountType, AggregationSource, BarAggregation, CurrencyType, LiquiditySide, OrderSide,
         OrderType, PositionSideSpecified, PriceType,
@@ -31,8 +31,10 @@ use nautilus_model::{
 };
 use rust_decimal::Decimal;
 
-use super::models::{AxBalancesResponse, AxCandle, AxFill, AxInstrument, AxOpenOrder, AxPosition};
-use crate::common::{consts::AX_VENUE, enums::AxCandleWidth};
+use super::models::{
+    AxBalancesResponse, AxCandle, AxFill, AxFundingRate, AxInstrument, AxOpenOrder, AxPosition,
+};
+use crate::common::{consts::AX_VENUE, enums::AxCandleWidth, parse::cid_to_client_order_id};
 
 fn decimal_to_price(value: Decimal, field_name: &str) -> anyhow::Result<Price> {
     Price::from_decimal(value)
@@ -109,13 +111,29 @@ pub fn parse_bar(
     // Ax provides volume as i64 contracts
     let volume = Quantity::new(candle.volume as f64, size_precision);
 
-    let ts_event = UnixNanos::from(candle.tn.timestamp_nanos_opt().unwrap_or(0) as u64);
+    let ts_event = UnixNanos::from((candle.ts as u64) * 1_000_000_000);
 
     let bar_spec = candle_width_to_bar_spec(candle.width);
     let bar_type = BarType::new(instrument.id(), bar_spec, AggregationSource::External);
 
     Bar::new_checked(bar_type, open, high, low, close, volume, ts_event, ts_init)
         .context("Failed to construct Bar from Ax candle")
+}
+
+/// Parses an Ax funding rate into a Nautilus [`FundingRateUpdate`].
+#[must_use]
+pub fn parse_funding_rate(
+    ax_rate: &AxFundingRate,
+    instrument_id: InstrumentId,
+    ts_init: UnixNanos,
+) -> FundingRateUpdate {
+    FundingRateUpdate::new(
+        instrument_id,
+        ax_rate.funding_rate,
+        None, // AX doesn't provide next funding time
+        UnixNanos::from(ax_rate.timestamp_ns as u64),
+        ts_init,
+    )
 }
 
 /// Parses an Ax perpetual futures instrument into a Nautilus CryptoPerpetual.
@@ -206,7 +224,7 @@ pub fn parse_account_state(
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<AccountState> {
-    let mut balances = Vec::new();
+    let mut balances = Vec::with_capacity(response.balances.len());
 
     for balance in &response.balances {
         let symbol_str = balance.symbol.as_str().trim();
@@ -246,17 +264,25 @@ pub fn parse_account_state(
 
 /// Parses an Ax open order into a Nautilus [`OrderStatusReport`].
 ///
+/// The `cid_resolver` parameter is an optional function that resolves a `cid` (u64)
+/// to a `ClientOrderId`. This is needed because orders submitted via WebSocket use
+/// a hashed `cid` for correlation rather than storing the full `ClientOrderId` in the tag.
+///
 /// # Errors
 ///
 /// Returns an error if:
 /// - Price or quantity fields cannot be parsed.
 /// - Timestamp conversion fails.
-pub fn parse_order_status_report(
+pub fn parse_order_status_report<F>(
     order: &AxOpenOrder,
     account_id: AccountId,
     instrument: &InstrumentAny,
     ts_init: UnixNanos,
-) -> anyhow::Result<OrderStatusReport> {
+    cid_resolver: Option<F>,
+) -> anyhow::Result<OrderStatusReport>
+where
+    F: Fn(u64) -> Option<ClientOrderId>,
+{
     let instrument_id = instrument.id();
     let venue_order_id = VenueOrderId::new(&order.oid);
     let order_side = order.d.into();
@@ -293,11 +319,12 @@ pub fn parse_order_status_report(
         Some(UUID4::new()),
     );
 
-    // Add client order ID if tag is present
-    if let Some(ref tag) = order.tag
-        && !tag.is_empty()
-    {
-        report = report.with_client_order_id(ClientOrderId::new(tag.as_str()));
+    if let Some(cid) = order.cid {
+        let client_order_id = cid_resolver
+            .as_ref()
+            .and_then(|resolver| resolver(cid))
+            .unwrap_or_else(|| cid_to_client_order_id(cid));
+        report = report.with_client_order_id(client_order_id);
     }
 
     report = report.with_price(price);
@@ -336,9 +363,8 @@ pub fn parse_fill_report(
     let last_px = decimal_to_price_dp(fill.price, instrument.price_precision(), "fill.price")?;
     let last_qty = Quantity::new(fill.quantity as f64, instrument.size_precision());
 
-    // Parse fee (Ax returns positive fee, Nautilus uses negative for costs)
     let currency = Currency::USD();
-    let commission = Money::from_decimal(-fill.fee, currency)
+    let commission = Money::from_decimal(fill.fee, currency)
         .context("Failed to convert fill.fee Decimal to Money")?;
 
     let liquidity_side = if fill.is_taker {
@@ -409,9 +435,10 @@ pub fn parse_position_status_report(
     };
 
     // Calculate average entry price from notional / quantity
+    // Both signed_notional and signed_quantity are negative for shorts
     let avg_px_open = if position.signed_quantity != 0 {
         let qty_dec = Decimal::from(position.signed_quantity.abs());
-        Some(position.signed_notional / qty_dec)
+        Some(position.signed_notional.abs() / qty_dec)
     } else {
         None
     };
@@ -445,7 +472,10 @@ mod tests {
     use ustr::Ustr;
 
     use super::*;
-    use crate::{common::enums::AxInstrumentState, http::models::AxInstrumentsResponse};
+    use crate::{
+        common::enums::AxInstrumentState,
+        http::models::{AxFundingRatesResponse, AxInstrumentsResponse},
+    };
 
     fn create_test_instrument() -> AxInstrument {
         AxInstrument {
@@ -581,5 +611,27 @@ mod tests {
                 result.err()
             );
         }
+    }
+
+    #[rstest]
+    fn test_deserialize_and_parse_funding_rates() {
+        let test_data = include_str!("../../test_data/http_get_funding_rates.json");
+        let response: AxFundingRatesResponse =
+            serde_json::from_str(test_data).expect("Failed to deserialize test data");
+
+        assert_eq!(response.funding_rates.len(), 2);
+        assert_eq!(response.funding_rates[0].symbol.as_str(), "JPYUSD-PERP");
+        assert_eq!(response.funding_rates[0].funding_rate, dec!(0.001234560000));
+
+        let instrument_id = InstrumentId::new(Symbol::new("JPYUSD-PERP"), *AX_VENUE);
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let update = parse_funding_rate(&response.funding_rates[1], instrument_id, ts_init);
+
+        assert_eq!(update.instrument_id, instrument_id);
+        assert_eq!(update.rate, dec!(0.003558290026));
+        assert_eq!(update.next_funding_ns, None);
+        assert_eq!(update.ts_event, UnixNanos::from(1770393600000000000u64));
+        assert_eq!(update.ts_init, ts_init);
     }
 }

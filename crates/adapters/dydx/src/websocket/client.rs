@@ -72,7 +72,10 @@ use super::{
     handler::{FeedHandler, HandlerCommand},
     messages::DydxSubscription,
 };
-use crate::common::{credential::DydxCredential, instrument_cache::InstrumentCache};
+use crate::{
+    common::{credential::DydxCredential, instrument_cache::InstrumentCache},
+    execution::encoder::ClientOrderIdEncoder,
+};
 
 /// WebSocket client for dYdX v4 market data and account streams.
 ///
@@ -132,6 +135,10 @@ pub struct DydxWebSocketClient {
     out_rx: Option<tokio::sync::mpsc::UnboundedReceiver<NautilusWsMessage>>,
     /// Background handler task handle.
     handler_task: Option<tokio::task::JoinHandle<()>>,
+    /// Whether to timestamp bars at close time (open + interval).
+    bars_timestamp_on_close: bool,
+    /// Shared client order ID encoder for bidirectional mapping.
+    encoder: Arc<ClientOrderIdEncoder>,
 }
 
 impl Clone for DydxWebSocketClient {
@@ -150,6 +157,8 @@ impl Clone for DydxWebSocketClient {
             cmd_tx: self.cmd_tx.clone(),
             out_rx: None,       // Cannot clone receiver - only one owner allowed
             handler_task: None, // Cannot clone task handle
+            bars_timestamp_on_close: self.bars_timestamp_on_close,
+            encoder: self.encoder.clone(),
         }
     }
 }
@@ -192,6 +201,8 @@ impl DydxWebSocketClient {
             cmd_tx: Arc::new(tokio::sync::RwLock::new(cmd_tx)),
             out_rx: None,
             handler_task: None,
+            bars_timestamp_on_close: true,
+            encoder: Arc::new(ClientOrderIdEncoder::new()),
         }
     }
 
@@ -245,6 +256,8 @@ impl DydxWebSocketClient {
             cmd_tx: Arc::new(tokio::sync::RwLock::new(cmd_tx)),
             out_rx: None,
             handler_task: None,
+            bars_timestamp_on_close: true,
+            encoder: Arc::new(ClientOrderIdEncoder::new()),
         }
     }
 
@@ -279,6 +292,11 @@ impl DydxWebSocketClient {
         self.connection_mode.clone()
     }
 
+    /// Sets whether to timestamp bars at close time (open + interval).
+    pub fn set_bars_timestamp_on_close(&mut self, value: bool) {
+        self.bars_timestamp_on_close = value;
+    }
+
     /// Sets the account ID for account message parsing.
     pub fn set_account_id(&mut self, account_id: AccountId) {
         self.account_id = Some(account_id);
@@ -288,6 +306,15 @@ impl DydxWebSocketClient {
     #[must_use]
     pub fn account_id(&self) -> Option<AccountId> {
         self.account_id
+    }
+
+    /// Replaces the instrument cache with an externally shared one.
+    ///
+    /// Use this to share the HTTP client's cache (which includes CLOB pair ID
+    /// and market ticker indices) with the WebSocket client. Must be called
+    /// before `connect()`.
+    pub fn set_instrument_cache(&mut self, cache: Arc<InstrumentCache>) {
+        self.instrument_cache = cache;
     }
 
     /// Caches a single instrument.
@@ -333,6 +360,12 @@ impl DydxWebSocketClient {
     #[must_use]
     pub fn instrument_cache(&self) -> &Arc<InstrumentCache> {
         &self.instrument_cache
+    }
+
+    /// Returns a reference to the shared client order ID encoder.
+    #[must_use]
+    pub fn encoder(&self) -> &Arc<ClientOrderIdEncoder> {
+        &self.encoder
     }
 
     /// Returns all cached instruments.
@@ -472,6 +505,7 @@ impl DydxWebSocketClient {
         let account_id = self.account_id;
         let signal = self.signal.clone();
         let subscriptions = self.subscriptions.clone();
+        let bars_timestamp_on_close = self.bars_timestamp_on_close;
 
         let handler_task = get_runtime().spawn(async move {
             let mut handler = FeedHandler::new(
@@ -482,6 +516,7 @@ impl DydxWebSocketClient {
                 client,
                 signal,
                 subscriptions,
+                bars_timestamp_on_close,
             );
             handler.run().await;
         });

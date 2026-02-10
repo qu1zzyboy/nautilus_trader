@@ -122,6 +122,8 @@ pub struct FeedHandler {
     book_sequence: AHashMap<String, u64>,
     /// Pending (incomplete) bars per candle topic for emit-on-next logic.
     pending_bars: AHashMap<String, Bar>,
+    /// Whether to timestamp bars at close time (open + interval).
+    bars_timestamp_on_close: bool,
 }
 
 impl Debug for FeedHandler {
@@ -137,6 +139,7 @@ impl Debug for FeedHandler {
 impl FeedHandler {
     /// Creates a new [`FeedHandler`].
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         account_id: Option<AccountId>,
         cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
@@ -145,6 +148,7 @@ impl FeedHandler {
         client: WebSocketClient,
         signal: Arc<AtomicBool>,
         subscriptions: SubscriptionState,
+        bars_timestamp_on_close: bool,
     ) -> Self {
         Self {
             account_id,
@@ -161,6 +165,7 @@ impl FeedHandler {
             message_buffer: VecDeque::new(),
             book_sequence: AHashMap::new(),
             pending_bars: AHashMap::new(),
+            bars_timestamp_on_close,
         }
     }
 
@@ -259,8 +264,18 @@ impl FeedHandler {
                 }
 
                 // Hot path: zero-copy parse for feed messages (orderbook/trades/candles)
-                if let Ok(feed_msg) = serde_json::from_str::<DydxWsFeedMessage>(&txt) {
-                    return self.handle_feed_message(feed_msg);
+                match serde_json::from_str::<DydxWsFeedMessage>(&txt) {
+                    Ok(feed_msg) => {
+                        return self.handle_feed_message(feed_msg);
+                    }
+                    Err(e) => {
+                        // Log subaccounts channel failures at warn level for diagnosis
+                        if txt.contains("v4_subaccounts") {
+                            log::warn!(
+                                "[WS_DESER] Failed to parse v4_subaccounts as DydxWsFeedMessage: {e}\nRaw: {txt}"
+                            );
+                        }
+                    }
                 }
 
                 // Cold path: infrequent control messages (connected/subscribed/error)
@@ -475,12 +490,15 @@ impl FeedHandler {
     }
 
     /// Handles candles channel messages.
+    ///
+    /// Subscribed contents is `{"candles": [...]}` (array wrapper), while
+    /// channel_data contents is a single candle object.
     fn handle_candles_feed(&mut self, msg: DydxWsCandlesMessage) -> Vec<NautilusWsMessage> {
         match msg {
             DydxWsCandlesMessage::Subscribed(data) => {
                 let topic = self.topic_from_msg(&DydxWsChannel::Candles, &data.id);
                 self.subscriptions.confirm_subscribe(&topic);
-                self.parse_candles_from_data(&data)
+                vec![]
             }
             DydxWsCandlesMessage::ChannelData(data) => self.parse_candles_from_data(&data),
             DydxWsCandlesMessage::Unsubscribed(data) => {
@@ -633,7 +651,7 @@ impl FeedHandler {
         }
     }
 
-    /// Parses candles from channel data message.
+    /// Parses candles from channel data message (single candle object).
     fn parse_candles_from_data(&mut self, data: &DydxWsChannelDataMsg) -> Vec<NautilusWsMessage> {
         match self.parse_candles(data) {
             Ok(msgs) => msgs,
@@ -945,7 +963,13 @@ impl FeedHandler {
         let instrument = self.get_instrument(&instrument_id)?;
 
         let ts_init = get_atomic_clock_realtime().get_time_ns();
-        let bar = ws_parse::parse_candle_bar(bar_type, instrument, &candle, ts_init)?;
+        let bar = ws_parse::parse_candle_bar(
+            bar_type,
+            instrument,
+            &candle,
+            self.bars_timestamp_on_close,
+            ts_init,
+        )?;
 
         // Emit-on-next: only emit a bar when a new candle period arrives,
         // confirming the previous bar is closed
@@ -1009,18 +1033,26 @@ impl FeedHandler {
             }
         }
 
-        // Parse trading data → FundingRateUpdate
+        // Parse trading data → FundingRateUpdate (and detect new instruments)
         if let Some(trading) = &contents.trading {
             for (symbol_str, trading_data) in trading {
-                let Some(rate_str) = &trading_data.next_funding_rate else {
-                    continue;
-                };
                 let Ok(instrument_id) = self.parse_instrument_id(symbol_str) else {
                     continue;
                 };
+
+                // Check if this is a new instrument not in our cache
                 if !self.instruments.contains_key(&instrument_id.symbol.inner()) {
+                    log::info!("New instrument discovered via WebSocket: {symbol_str}");
+                    messages.push(NautilusWsMessage::NewInstrumentDiscovered {
+                        ticker: symbol_str.clone(),
+                    });
                     continue;
                 }
+
+                // Existing instrument - emit funding rate if available
+                let Some(rate_str) = &trading_data.next_funding_rate else {
+                    continue;
+                };
                 let Ok(rate) = rate_str.parse::<Decimal>() else {
                     log::error!(
                         "Failed to parse funding rate: market={symbol_str}, rate={rate_str}"

@@ -185,7 +185,7 @@ impl DeribitExecutionClient {
                     if order.expire_time().is_some() {
                         log::warn!(
                             "Deribit GTD orders expire at 8:00 UTC only - custom expire_time is ignored. \
-                            For custom expiry times, use managed GTD with emulation_trigger."
+                            For custom expiry times, use managed GTD with emulation_trigger"
                         );
                     }
                     "good_til_day"
@@ -721,21 +721,23 @@ impl ExecutionClient for DeribitExecutionClient {
     }
 
     fn submit_order_list(&self, cmd: &SubmitOrderList) -> anyhow::Result<()> {
-        if cmd.order_list.orders.is_empty() {
+        if cmd.order_list.client_order_ids.is_empty() {
             log::debug!("submit_order_list called with empty order list");
             return Ok(());
         }
 
+        let orders = self.core.get_orders_for_list(&cmd.order_list)?;
+
         log::info!(
             "Submitting order list {} with {} orders for instrument={}",
             cmd.order_list.id,
-            cmd.order_list.orders.len(),
+            orders.len(),
             cmd.instrument_id
         );
 
         // Deribit doesn't have native batch order submission
         // Loop through and submit each order individually using shared helper
-        for order in &cmd.order_list.orders {
+        for order in &orders {
             self.submit_single_order(order, "submit_order_list_item")?;
         }
 
