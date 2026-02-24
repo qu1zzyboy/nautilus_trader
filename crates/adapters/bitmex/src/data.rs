@@ -229,6 +229,7 @@ impl BitmexDataClient {
             }
             NautilusWsMessage::OrderStatusReports(_)
             | NautilusWsMessage::OrderUpdated(_)
+            | NautilusWsMessage::OrderUpdates(_)
             | NautilusWsMessage::FillReports(_)
             | NautilusWsMessage::PositionStatusReports(_)
             | NautilusWsMessage::AccountStates(_) => {
@@ -265,6 +266,15 @@ impl BitmexDataClient {
 
         for instrument in &instruments {
             self.http_client.cache_instrument(instrument.clone());
+            if let Err(e) = self
+                .data_sender
+                .send(DataEvent::Instrument(instrument.clone()))
+            {
+                log::warn!(
+                    "Failed to send instrument event for {}: {e}",
+                    instrument.id()
+                );
+            }
         }
 
         Ok(instruments)
@@ -397,12 +407,13 @@ impl DataClient for BitmexDataClient {
         }
 
         if self.ws_client.is_none() {
-            let ws = BitmexWebSocketClient::new(
+            let ws = BitmexWebSocketClient::new_with_env(
                 Some(self.config.ws_url()),
                 self.config.api_key.clone(),
                 self.config.api_secret.clone(),
                 None,
                 self.config.heartbeat_interval_secs,
+                self.config.use_testnet,
             )
             .context("failed to construct BitMEX websocket client")?;
             self.ws_client = Some(ws);

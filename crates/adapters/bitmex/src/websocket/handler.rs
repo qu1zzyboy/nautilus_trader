@@ -15,15 +15,18 @@
 
 //! WebSocket message handler for BitMEX.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use ahash::AHashMap;
 use dashmap::DashMap;
 use nautilus_common::cache::quote::QuoteCache;
-use nautilus_core::{UnixNanos, time::get_atomic_clock_realtime};
+use nautilus_core::{AtomicTime, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_model::{
     data::Data,
     enums::{OrderStatus, OrderType},
@@ -86,6 +89,7 @@ pub enum HandlerCommand {
 }
 
 pub(super) struct FeedHandler {
+    clock: &'static AtomicTime,
     account_id: AccountId,
     signal: Arc<AtomicBool>,
     client: Option<WebSocketClient>,
@@ -99,6 +103,7 @@ pub(super) struct FeedHandler {
     order_type_cache: Arc<DashMap<ClientOrderId, OrderType>>,
     order_symbol_cache: Arc<DashMap<ClientOrderId, Ustr>>,
     quote_cache: QuoteCache,
+    pending_msgs: VecDeque<NautilusWsMessage>,
 }
 
 impl FeedHandler {
@@ -116,6 +121,7 @@ impl FeedHandler {
         order_symbol_cache: Arc<DashMap<ClientOrderId, Ustr>>,
     ) -> Self {
         Self {
+            clock: get_atomic_clock_realtime(),
             account_id,
             signal,
             client: None,
@@ -129,6 +135,7 @@ impl FeedHandler {
             order_type_cache,
             order_symbol_cache,
             quote_cache: QuoteCache::new(),
+            pending_msgs: VecDeque::new(),
         }
     }
 
@@ -173,7 +180,11 @@ impl FeedHandler {
     }
 
     pub(super) async fn next(&mut self) -> Option<NautilusWsMessage> {
-        let clock = get_atomic_clock_realtime();
+        if let Some(msg) = self.pending_msgs.pop_front() {
+            return Some(msg);
+        }
+
+        let clock = self.clock;
 
         loop {
             tokio::select! {
@@ -220,8 +231,6 @@ impl FeedHandler {
                             self.instruments_cache.insert(inst.symbol().inner(), inst);
                         }
                     }
-                    // Continue processing following command
-                    continue;
                 }
 
                 () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
@@ -229,7 +238,6 @@ impl FeedHandler {
                         log::debug!("Stop signal received during idle period");
                         return None;
                     }
-                    continue;
                 }
 
                 msg = self.raw_rx.recv() => {
@@ -283,7 +291,6 @@ impl FeedHandler {
                     ) {
                         return Some(msg);
                     }
-                    continue;
                 }
                 BitmexWsMessage::Table(table_msg) => {
                     let ts_init = clock.get_time_ns();
@@ -320,13 +327,21 @@ impl FeedHandler {
                         // Note: BitMEX may send duplicate order status updates for the same order
                         // (e.g., immediate response + stream update). This is expected behavior.
                         BitmexTableMessage::Order { data, .. } => {
-                            self.handle_order(data)
+                            let mut msgs = self.handle_order(data, ts_init);
+                            if msgs.is_empty() {
+                                None
+                            } else {
+                                // Buffer overflow messages for subsequent next() calls
+                                let first = msgs.remove(0);
+                                self.pending_msgs.extend(msgs);
+                                Some(first)
+                            }
                         }
                         BitmexTableMessage::Execution { data, .. } => {
-                            self.handle_execution(data)
+                            self.handle_execution(data, ts_init)
                         }
                         BitmexTableMessage::Position { data, .. } => {
-                            self.handle_position(data)
+                            self.handle_position(data, ts_init)
                         }
                         BitmexTableMessage::Wallet { data, .. } => {
                             self.handle_wallet(data, ts_init)
@@ -352,9 +367,8 @@ impl FeedHandler {
                     if let Some(msg) = msg {
                         return Some(msg);
                     }
-                    continue;
                 }
-                BitmexWsMessage::Welcome { .. } | BitmexWsMessage::Error { .. } => continue,
+                BitmexWsMessage::Welcome { .. } | BitmexWsMessage::Error { .. } => {}
             }
                 }
 
@@ -620,9 +634,9 @@ impl FeedHandler {
         Some(NautilusWsMessage::Data(data))
     }
 
-    fn handle_order(&mut self, data: Vec<OrderData>) -> Option<NautilusWsMessage> {
-        // Process all orders in the message
+    fn handle_order(&mut self, data: Vec<OrderData>, ts_init: UnixNanos) -> Vec<NautilusWsMessage> {
         let mut reports = Vec::with_capacity(data.len());
+        let mut updates = Vec::new();
 
         for order_data in data {
             match order_data {
@@ -638,7 +652,8 @@ impl FeedHandler {
                         continue;
                     };
 
-                    match parse_order_msg(&order_msg, &instrument, &self.order_type_cache) {
+                    match parse_order_msg(&order_msg, &instrument, &self.order_type_cache, ts_init)
+                    {
                         Ok(report) => {
                             // Cache the order type and symbol AFTER successful parse
                             if let Some(client_order_id) = &order_msg.cl_ord_id {
@@ -685,7 +700,6 @@ impl FeedHandler {
                                 order_msg.time_in_force,
                             );
                             // TODO: Add metric counter for parse failures
-                            continue;
                         }
                     }
                 }
@@ -701,15 +715,16 @@ impl FeedHandler {
                         continue;
                     };
 
-                    // Populate cache for execution message routing (handles edge case where update arrives before full snapshot)
+                    // Populate cache for execution message routing
                     if let Some(cl_ord_id) = &msg.cl_ord_id {
                         let client_order_id = ClientOrderId::new(cl_ord_id);
                         self.order_symbol_cache.insert(client_order_id, msg.symbol);
                     }
 
-                    if let Some(event) = parse_order_update_msg(&msg, &instrument, self.account_id)
+                    if let Some(event) =
+                        parse_order_update_msg(&msg, &instrument, self.account_id, ts_init)
                     {
-                        return Some(NautilusWsMessage::OrderUpdated(Box::new(event)));
+                        updates.push(event);
                     } else {
                         log::warn!(
                             "Skipped order update message (insufficient data): \
@@ -722,14 +737,24 @@ impl FeedHandler {
             }
         }
 
-        if reports.is_empty() {
-            return None;
+        let mut msgs = Vec::new();
+
+        if !reports.is_empty() {
+            msgs.push(NautilusWsMessage::OrderStatusReports(reports));
         }
 
-        Some(NautilusWsMessage::OrderStatusReports(reports))
+        if !updates.is_empty() {
+            msgs.push(NautilusWsMessage::OrderUpdates(updates));
+        }
+
+        msgs
     }
 
-    fn handle_execution(&mut self, data: Vec<BitmexExecutionMsg>) -> Option<NautilusWsMessage> {
+    fn handle_execution(
+        &mut self,
+        data: Vec<BitmexExecutionMsg>,
+        ts_init: UnixNanos,
+    ) -> Option<NautilusWsMessage> {
         let mut fills = Vec::with_capacity(data.len());
 
         for exec_msg in data {
@@ -805,7 +830,7 @@ impl FeedHandler {
                 continue;
             };
 
-            if let Some(fill) = parse_execution_msg(exec_msg, &instrument) {
+            if let Some(fill) = parse_execution_msg(exec_msg, &instrument, ts_init) {
                 fills.push(fill);
             }
         }
@@ -816,7 +841,11 @@ impl FeedHandler {
         Some(NautilusWsMessage::FillReports(fills))
     }
 
-    fn handle_position(&self, data: Vec<BitmexPositionMsg>) -> Option<NautilusWsMessage> {
+    fn handle_position(
+        &self,
+        data: Vec<BitmexPositionMsg>,
+        ts_init: UnixNanos,
+    ) -> Option<NautilusWsMessage> {
         if data.is_empty() {
             return None;
         }
@@ -833,7 +862,7 @@ impl FeedHandler {
                 );
                 continue;
             };
-            reports.push(parse_position_msg(pos_msg, &instrument));
+            reports.push(parse_position_msg(pos_msg, &instrument, ts_init));
         }
 
         if reports.is_empty() {

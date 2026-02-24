@@ -567,7 +567,11 @@ class InteractiveBrokersInstrumentProvider(InstrumentProvider):
         ) or (self._build_futures_chain or self._build_options_chain):
             # Return Underlying contract details with Future Chains
             future_chain_details = await self.get_future_chain_details(qualified.contract)
-            details.extend(future_chain_details)
+
+            if future_chain_details is not None:
+                details.extend(future_chain_details)
+            else:
+                self._log.warning(f"Failed to fetch future chain details for {qualified.contract}")
 
         if (
             contract.secType in ["STK", "CONTFUT", "FUT", "IND"] and contract.build_options_chain
@@ -673,7 +677,14 @@ class InteractiveBrokersInstrumentProvider(InstrumentProvider):
             )
             return []
 
-        option_details = [d for d in option_details if d.underConId == underlying.conId]  # type: ignore[assignment]
+        # These are raw ibapi ContractDetails (not yet converted to IBContractDetails).
+        # ibapi 10.43's protobuf decoder writes "underConid" (lowercase 'i') instead of
+        # the legacy "underConId" (uppercase 'I'), so we check both attribute names.
+        option_details = [  # type: ignore[assignment]
+            d
+            for d in option_details
+            if (d.underConId or getattr(d, "underConid", 0)) == underlying.conId
+        ]
         self._log.info(
             f"Received {len(option_details)} Option Contracts for "
             f"{underlying.symbol}.{underlying.primaryExchange or underlying.exchange} expiring on {last_trading_date}",
@@ -759,11 +770,10 @@ class InteractiveBrokersInstrumentProvider(InstrumentProvider):
         """
         processed_instrument_ids = []
         for details in copy.deepcopy(contract_details):
-            if not isinstance(details.contract, IBContract):
-                details.contract = IBContract(**details.contract.__dict__)
-
             if not isinstance(details, IBContractDetails):
-                details = IBContractDetails(**details.__dict__)
+                details = IBContractDetails.from_contract_details(details)
+            elif not isinstance(details.contract, IBContract):
+                details.contract = IBContract(**details.contract.__dict__)
 
             sec_type = details.contract.secType
             if self._is_filtered_sec_type(sec_type):

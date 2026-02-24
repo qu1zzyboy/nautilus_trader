@@ -26,7 +26,10 @@ use nautilus_model::{
 };
 use pyo3::{conversion::IntoPyObjectExt, prelude::*, types::PyList};
 
-use crate::http::{client::BitmexHttpClient, error::BitmexHttpError};
+use crate::{
+    common::{credential::credential_env_vars, enums::BitmexPegPriceType},
+    http::{client::BitmexHttpClient, error::BitmexHttpError},
+};
 
 #[pymethods]
 impl BitmexHttpClient {
@@ -52,11 +55,7 @@ impl BitmexHttpClient {
         // If credentials not provided, try to load from environment
         let (final_api_key, final_api_secret) = if api_key.is_none() && api_secret.is_none() {
             // Choose environment variables based on testnet flag
-            let (key_var, secret_var) = if testnet {
-                ("BITMEX_TESTNET_API_KEY", "BITMEX_TESTNET_API_SECRET")
-            } else {
-                ("BITMEX_API_KEY", "BITMEX_API_SECRET")
-            };
+            let (key_var, secret_var) = credential_env_vars(testnet);
 
             let env_key = std::env::var(key_var).ok();
             let env_secret = std::env::var(secret_var).ok();
@@ -356,7 +355,9 @@ impl BitmexHttpClient {
         post_only = false,
         reduce_only = false,
         order_list_id = None,
-        contingency_type = None
+        contingency_type = None,
+        peg_price_type = None,
+        peg_offset_value = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn py_submit_order<'py>(
@@ -378,8 +379,17 @@ impl BitmexHttpClient {
         reduce_only: bool,
         order_list_id: Option<OrderListId>,
         contingency_type: Option<ContingencyType>,
+        peg_price_type: Option<String>,
+        peg_offset_value: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
+
+        let peg_price_type: Option<BitmexPegPriceType> = peg_price_type
+            .map(|s| {
+                s.parse::<BitmexPegPriceType>()
+                    .map_err(|_| to_pyvalue_err(format!("Invalid peg_price_type: {s}")))
+            })
+            .transpose()?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let report = client
@@ -400,6 +410,8 @@ impl BitmexHttpClient {
                     reduce_only,
                     order_list_id,
                     contingency_type,
+                    peg_price_type,
+                    peg_offset_value,
                 )
                 .await
                 .map_err(to_pyvalue_err)?;
@@ -649,6 +661,24 @@ impl BitmexHttpClient {
                 // }
                 Ok(py_list.into())
             })
+        })
+    }
+
+    #[pyo3(name = "cancel_all_after")]
+    fn py_cancel_all_after<'py>(
+        &self,
+        py: Python<'py>,
+        timeout_ms: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .cancel_all_after(timeout_ms)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Ok(Python::attach(|py| py.None()))
         })
     }
 
