@@ -21,7 +21,6 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use ahash::AHashSet;
 pub use config::StrategyConfig;
-use indexmap::IndexMap;
 use nautilus_common::{
     actor::DataActor,
     component::Component,
@@ -34,7 +33,7 @@ use nautilus_common::{
     msgbus,
     timer::TimeEvent,
 };
-use nautilus_core::UUID4;
+use nautilus_core::{Params, UUID4};
 use nautilus_model::{
     enums::{OrderSide, OrderStatus, PositionSide, TimeInForce, TriggerType},
     events::{
@@ -72,6 +71,12 @@ use ustr::Ustr;
 /// the trading engine. All order and position management methods are provided
 /// as default implementations.
 pub trait Strategy: DataActor {
+    /// Provides access to the internal `StrategyCore`.
+    ///
+    /// This method must be implemented by the user's strategy struct, typically
+    /// by returning a reference to its `StrategyCore` member.
+    fn core(&self) -> &StrategyCore;
+
     /// Provides mutable access to the internal `StrategyCore`.
     ///
     /// This method must be implemented by the user's strategy struct, typically
@@ -97,7 +102,7 @@ pub trait Strategy: DataActor {
         position_id: Option<PositionId>,
         client_id: Option<ClientId>,
     ) -> anyhow::Result<()> {
-        self.submit_order_with_params(order, position_id, client_id, IndexMap::new())
+        self.submit_order_with_params(order, position_id, client_id, Params::new())
     }
 
     /// Submits an order with adapter-specific parameters.
@@ -110,7 +115,7 @@ pub trait Strategy: DataActor {
         order: OrderAny,
         position_id: Option<PositionId>,
         client_id: Option<ClientId>,
-        params: IndexMap<String, String>,
+        params: Params,
     ) -> anyhow::Result<()> {
         let core = self.core_mut();
 
@@ -154,9 +159,7 @@ pub trait Strategy: DataActor {
             ts_init,
         );
 
-        let Some(manager) = &mut core.order_manager else {
-            anyhow::bail!("Strategy not registered: OrderManager missing");
-        };
+        let manager = core.order_manager();
 
         if matches!(order.emulation_trigger(), Some(trigger) if trigger != TriggerType::NoTrigger) {
             manager.send_emulator_command(TradingCommand::SubmitOrder(command));
@@ -205,11 +208,7 @@ pub trait Strategy: DataActor {
         let order_list = if orders.first().is_some_and(|o| o.order_list_id().is_some()) {
             OrderList::from_orders(&orders, ts_init)
         } else {
-            let order_factory = core
-                .order_factory
-                .as_mut()
-                .expect("OrderFactory not initialized");
-            order_factory.create_list(&mut orders, ts_init)
+            core.order_factory().create_list(&mut orders, ts_init)
         };
 
         {
@@ -266,9 +265,7 @@ pub trait Strategy: DataActor {
                 || o.is_emulated()
         });
 
-        let Some(manager) = &mut core.order_manager else {
-            anyhow::bail!("Strategy not registered: OrderManager missing");
-        };
+        let manager = core.order_manager();
 
         if has_emulated_order {
             manager.send_emulator_command(TradingCommand::SubmitOrderList(command));
@@ -297,7 +294,7 @@ pub trait Strategy: DataActor {
         mut orders: Vec<OrderAny>,
         position_id: Option<PositionId>,
         client_id: Option<ClientId>,
-        params: IndexMap<String, String>,
+        params: Params,
     ) -> anyhow::Result<()> {
         let should_deny = {
             let core = self.core_mut();
@@ -323,11 +320,7 @@ pub trait Strategy: DataActor {
         let order_list = if orders.first().is_some_and(|o| o.order_list_id().is_some()) {
             OrderList::from_orders(&orders, ts_init)
         } else {
-            let order_factory = core
-                .order_factory
-                .as_mut()
-                .expect("OrderFactory not initialized");
-            order_factory.create_list(&mut orders, ts_init)
+            core.order_factory().create_list(&mut orders, ts_init)
         };
 
         {
@@ -390,9 +383,7 @@ pub trait Strategy: DataActor {
                 || o.is_emulated()
         });
 
-        let Some(manager) = &mut core.order_manager else {
-            anyhow::bail!("Strategy not registered: OrderManager missing");
-        };
+        let manager = core.order_manager();
 
         if has_emulated_order {
             manager.send_emulator_command(TradingCommand::SubmitOrderList(command));
@@ -429,7 +420,7 @@ pub trait Strategy: DataActor {
             price,
             trigger_price,
             client_id,
-            IndexMap::new(),
+            Params::new(),
         )
     }
 
@@ -445,7 +436,7 @@ pub trait Strategy: DataActor {
         price: Option<Price>,
         trigger_price: Option<Price>,
         client_id: Option<ClientId>,
-        params: IndexMap<String, String>,
+        params: Params,
     ) -> anyhow::Result<()> {
         let core = self.core_mut();
 
@@ -474,9 +465,7 @@ pub trait Strategy: DataActor {
             params,
         );
 
-        let Some(manager) = &mut core.order_manager else {
-            anyhow::bail!("Strategy not registered: OrderManager missing");
-        };
+        let manager = core.order_manager();
 
         if matches!(order.emulation_trigger(), Some(trigger) if trigger != TriggerType::NoTrigger) {
             manager.send_emulator_command(TradingCommand::ModifyOrder(command));
@@ -494,7 +483,7 @@ pub trait Strategy: DataActor {
     ///
     /// Returns an error if the strategy is not registered or order cancellation fails.
     fn cancel_order(&mut self, order: OrderAny, client_id: Option<ClientId>) -> anyhow::Result<()> {
-        self.cancel_order_with_params(order, client_id, IndexMap::new())
+        self.cancel_order_with_params(order, client_id, Params::new())
     }
 
     /// Cancels an order with adapter-specific parameters.
@@ -506,7 +495,7 @@ pub trait Strategy: DataActor {
         &mut self,
         order: OrderAny,
         client_id: Option<ClientId>,
-        params: IndexMap<String, String>,
+        params: Params,
     ) -> anyhow::Result<()> {
         let core = self.core_mut();
 
@@ -532,9 +521,7 @@ pub trait Strategy: DataActor {
             params,
         );
 
-        let Some(manager) = &mut core.order_manager else {
-            anyhow::bail!("Strategy not registered: OrderManager missing");
-        };
+        let manager = core.order_manager();
 
         if matches!(order.emulation_trigger(), Some(trigger) if trigger != TriggerType::NoTrigger)
             || order.is_emulated()
@@ -559,7 +546,7 @@ pub trait Strategy: DataActor {
         &mut self,
         mut orders: Vec<OrderAny>,
         client_id: Option<ClientId>,
-        params: Option<IndexMap<String, String>>,
+        params: Option<Params>,
     ) -> anyhow::Result<()> {
         if orders.is_empty() {
             anyhow::bail!("Cannot batch cancel empty order list");
@@ -570,9 +557,7 @@ pub trait Strategy: DataActor {
         let strategy_id = StrategyId::from(core.actor_id().inner().as_str());
         let ts_init = core.clock().timestamp_ns();
 
-        let Some(manager) = &mut core.order_manager else {
-            anyhow::bail!("Strategy not registered: OrderManager missing");
-        };
+        let manager = core.order_manager();
 
         let first = orders.remove(0);
         let instrument_id = first.instrument_id();
@@ -646,7 +631,7 @@ pub trait Strategy: DataActor {
         order_side: Option<OrderSide>,
         client_id: Option<ClientId>,
     ) -> anyhow::Result<()> {
-        self.cancel_all_orders_with_params(instrument_id, order_side, client_id, IndexMap::new())
+        self.cancel_all_orders_with_params(instrument_id, order_side, client_id, Params::new())
     }
 
     /// Cancels all open orders for the given instrument with adapter-specific parameters.
@@ -659,7 +644,7 @@ pub trait Strategy: DataActor {
         instrument_id: InstrumentId,
         order_side: Option<OrderSide>,
         client_id: Option<ClientId>,
-        params: IndexMap<String, String>,
+        params: Params,
     ) -> anyhow::Result<()> {
         let params = if params.is_empty() {
             None
@@ -725,9 +710,7 @@ pub trait Strategy: DataActor {
             return Ok(());
         }
 
-        let Some(manager) = &mut core.order_manager else {
-            anyhow::bail!("Strategy not registered: OrderManager missing");
-        };
+        let manager = core.order_manager();
 
         let side_str = order_side.map(|s| format!(" {s}")).unwrap_or_default();
 
@@ -804,9 +787,6 @@ pub trait Strategy: DataActor {
         quote_quantity: Option<bool>,
     ) -> anyhow::Result<()> {
         let core = self.core_mut();
-        let Some(order_factory) = &mut core.order_factory else {
-            anyhow::bail!("Strategy not registered: OrderFactory missing");
-        };
 
         if position.is_closed() {
             log::warn!("Cannot close position (already closed): {}", position.id);
@@ -815,7 +795,7 @@ pub trait Strategy: DataActor {
 
         let closing_side = OrderCore::closing_side(position.side);
 
-        let order = order_factory.market(
+        let order = core.order_factory().market(
             position.instrument_id,
             closing_side,
             position.quantity,
@@ -885,12 +865,8 @@ pub trait Strategy: DataActor {
             }
 
             let core = self.core_mut();
-            let Some(order_factory) = &mut core.order_factory else {
-                anyhow::bail!("Strategy not registered: OrderFactory missing");
-            };
-
             let closing_side = OrderCore::closing_side(pos_side);
-            let order = order_factory.market(
+            let order = core.order_factory().market(
                 pos_instrument_id,
                 closing_side,
                 pos_quantity,
@@ -929,11 +905,8 @@ pub trait Strategy: DataActor {
 
         let command = QueryAccount::new(trader_id, client_id, account_id, UUID4::new(), ts_init);
 
-        let Some(manager) = &mut core.order_manager else {
-            anyhow::bail!("Strategy not registered: OrderManager missing");
-        };
-
-        manager.send_exec_command(TradingCommand::QueryAccount(command));
+        core.order_manager()
+            .send_exec_command(TradingCommand::QueryAccount(command));
         Ok(())
     }
 
@@ -963,11 +936,8 @@ pub trait Strategy: DataActor {
             ts_init,
         );
 
-        let Some(manager) = &mut core.order_manager else {
-            anyhow::bail!("Strategy not registered: OrderManager missing");
-        };
-
-        manager.send_exec_command(TradingCommand::QueryOrder(command));
+        core.order_manager()
+            .send_exec_command(TradingCommand::QueryOrder(command));
         Ok(())
     }
 
@@ -1211,7 +1181,9 @@ pub trait Strategy: DataActor {
     /// Returns whether the strategy is currently executing a market exit.
     ///
     /// Strategies can check this to avoid submitting new orders during exit.
-    fn is_exiting(&self) -> bool;
+    fn is_exiting(&self) -> bool {
+        self.core().is_exiting
+    }
 
     /// Initiates an iterative market exit for the strategy.
     ///
@@ -1387,16 +1359,11 @@ pub trait Strategy: DataActor {
                 }
 
                 let core = self.core_mut();
-                let Some(order_factory) = &mut core.order_factory else {
-                    log::error!("OrderFactory missing during market exit");
-                    continue;
-                };
-
                 let time_in_force = core.config.market_exit_time_in_force;
                 let reduce_only = core.config.market_exit_reduce_only;
                 let market_exit_tag = core.market_exit_tag;
                 let closing_side = OrderCore::closing_side(side);
-                let order = order_factory.market(
+                let order = core.order_factory().market(
                     instrument_id,
                     closing_side,
                     quantity,
@@ -1781,25 +1748,25 @@ mod tests {
     impl Deref for TestStrategy {
         type Target = DataActorCore;
         fn deref(&self) -> &Self::Target {
-            &self.core.actor
+            &self.core
         }
     }
 
     impl DerefMut for TestStrategy {
         fn deref_mut(&mut self) -> &mut Self::Target {
-            &mut self.core.actor
+            &mut self.core
         }
     }
 
     impl DataActor for TestStrategy {}
 
     impl Strategy for TestStrategy {
-        fn core_mut(&mut self) -> &mut StrategyCore {
-            &mut self.core
+        fn core(&self) -> &StrategyCore {
+            &self.core
         }
 
-        fn is_exiting(&self) -> bool {
-            self.core.is_exiting
+        fn core_mut(&mut self) -> &mut StrategyCore {
+            &mut self.core
         }
 
         fn on_order_rejected(&mut self, _event: OrderRejected) {
@@ -1874,9 +1841,9 @@ mod tests {
             client_order_id: ClientOrderId::from("O-001"),
             account_id: AccountId::from("ACC-001"),
             reason: "Test rejection".into(),
-            event_id: Default::default(),
-            ts_event: Default::default(),
-            ts_init: Default::default(),
+            event_id: UUID4::default(),
+            ts_event: UnixNanos::default(),
+            ts_init: UnixNanos::default(),
             reconciliation: 0,
             due_post_only: 0,
         });
@@ -1901,14 +1868,14 @@ mod tests {
             entry: OrderSide::Buy,
             side: PositionSide::Long,
             signed_qty: 1.0,
-            quantity: Default::default(),
-            last_qty: Default::default(),
-            last_px: Default::default(),
+            quantity: Quantity::default(),
+            last_qty: Quantity::default(),
+            last_px: Price::default(),
             currency: Currency::from("USD"),
             avg_px_open: 0.0,
-            event_id: Default::default(),
-            ts_event: Default::default(),
-            ts_init: Default::default(),
+            event_id: UUID4::default(),
+            ts_event: UnixNanos::default(),
+            ts_init: UnixNanos::default(),
         });
 
         strategy.handle_position_event(event);
@@ -1920,20 +1887,20 @@ mod tests {
     fn test_strategy_default_handlers_do_not_panic() {
         let mut strategy = create_test_strategy();
 
-        strategy.on_order_initialized(Default::default());
-        strategy.on_order_denied(Default::default());
-        strategy.on_order_emulated(Default::default());
-        strategy.on_order_released(Default::default());
-        strategy.on_order_submitted(Default::default());
-        strategy.on_order_rejected(Default::default());
-        let _ = DataActor::on_order_canceled(&mut strategy, &Default::default());
-        strategy.on_order_expired(Default::default());
-        strategy.on_order_triggered(Default::default());
-        strategy.on_order_pending_update(Default::default());
-        strategy.on_order_pending_cancel(Default::default());
-        strategy.on_order_modify_rejected(Default::default());
-        strategy.on_order_cancel_rejected(Default::default());
-        strategy.on_order_updated(Default::default());
+        strategy.on_order_initialized(OrderInitialized::default());
+        strategy.on_order_denied(OrderDenied::default());
+        strategy.on_order_emulated(OrderEmulated::default());
+        strategy.on_order_released(OrderReleased::default());
+        strategy.on_order_submitted(OrderSubmitted::default());
+        strategy.on_order_rejected(OrderRejected::default());
+        let _ = DataActor::on_order_canceled(&mut strategy, &OrderCanceled::default());
+        strategy.on_order_expired(OrderExpired::default());
+        strategy.on_order_triggered(OrderTriggered::default());
+        strategy.on_order_pending_update(OrderPendingUpdate::default());
+        strategy.on_order_pending_cancel(OrderPendingCancel::default());
+        strategy.on_order_modify_rejected(OrderModifyRejected::default());
+        strategy.on_order_cancel_rejected(OrderCancelRejected::default());
+        strategy.on_order_updated(OrderUpdated::default());
     }
 
     // -- GTD EXPIRY TESTS ----------------------------------------------------------------------------
@@ -2009,13 +1976,13 @@ mod tests {
             position_id: None,
             order_side: OrderSide::Buy,
             order_type: OrderType::Market,
-            last_qty: Default::default(),
-            last_px: Default::default(),
+            last_qty: Quantity::default(),
+            last_px: Price::default(),
             currency: Currency::from("USD"),
             liquidity_side: LiquiditySide::Taker,
-            event_id: Default::default(),
-            ts_event: Default::default(),
-            ts_init: Default::default(),
+            event_id: UUID4::default(),
+            ts_event: UnixNanos::default(),
+            ts_init: UnixNanos::default(),
             reconciliation: false,
             commission: None,
         });
@@ -2040,11 +2007,11 @@ mod tests {
             strategy_id: StrategyId::from("TEST-001"),
             instrument_id: InstrumentId::from("BTCUSDT.BINANCE"),
             client_order_id,
-            venue_order_id: Default::default(),
+            venue_order_id: Option::default(),
             account_id: Some(AccountId::from("ACC-001")),
-            event_id: Default::default(),
-            ts_event: Default::default(),
-            ts_init: Default::default(),
+            event_id: UUID4::default(),
+            ts_event: UnixNanos::default(),
+            ts_init: UnixNanos::default(),
             reconciliation: 0,
         });
         strategy.handle_order_event(event);
@@ -2070,9 +2037,9 @@ mod tests {
             client_order_id,
             account_id: AccountId::from("ACC-001"),
             reason: "Test rejection".into(),
-            event_id: Default::default(),
-            ts_event: Default::default(),
-            ts_init: Default::default(),
+            event_id: UUID4::default(),
+            ts_event: UnixNanos::default(),
+            ts_init: UnixNanos::default(),
             reconciliation: 0,
             due_post_only: 0,
         });
@@ -2097,11 +2064,11 @@ mod tests {
             strategy_id: StrategyId::from("TEST-001"),
             instrument_id: InstrumentId::from("BTCUSDT.BINANCE"),
             client_order_id,
-            venue_order_id: Default::default(),
+            venue_order_id: Option::default(),
             account_id: Some(AccountId::from("ACC-001")),
-            event_id: Default::default(),
-            ts_event: Default::default(),
-            ts_init: Default::default(),
+            event_id: UUID4::default(),
+            ts_event: UnixNanos::default(),
+            ts_init: UnixNanos::default(),
             reconciliation: 0,
         });
         strategy.handle_order_event(event);
@@ -2332,25 +2299,25 @@ mod tests {
     impl Deref for MarketExitHookTrackingStrategy {
         type Target = DataActorCore;
         fn deref(&self) -> &Self::Target {
-            &self.core.actor
+            &self.core
         }
     }
 
     impl DerefMut for MarketExitHookTrackingStrategy {
         fn deref_mut(&mut self) -> &mut Self::Target {
-            &mut self.core.actor
+            &mut self.core
         }
     }
 
     impl DataActor for MarketExitHookTrackingStrategy {}
 
     impl Strategy for MarketExitHookTrackingStrategy {
-        fn core_mut(&mut self) -> &mut StrategyCore {
-            &mut self.core
+        fn core(&self) -> &StrategyCore {
+            &self.core
         }
 
-        fn is_exiting(&self) -> bool {
-            self.core.is_exiting
+        fn core_mut(&mut self) -> &mut StrategyCore {
+            &mut self.core
         }
 
         fn on_market_exit(&mut self) {
@@ -2435,25 +2402,25 @@ mod tests {
     impl Deref for FailingPostExitStrategy {
         type Target = DataActorCore;
         fn deref(&self) -> &Self::Target {
-            &self.core.actor
+            &self.core
         }
     }
 
     impl DerefMut for FailingPostExitStrategy {
         fn deref_mut(&mut self) -> &mut Self::Target {
-            &mut self.core.actor
+            &mut self.core
         }
     }
 
     impl DataActor for FailingPostExitStrategy {}
 
     impl Strategy for FailingPostExitStrategy {
-        fn core_mut(&mut self) -> &mut StrategyCore {
-            &mut self.core
+        fn core(&self) -> &StrategyCore {
+            &self.core
         }
 
-        fn is_exiting(&self) -> bool {
-            self.core.is_exiting
+        fn core_mut(&mut self) -> &mut StrategyCore {
+            &mut self.core
         }
 
         fn post_market_exit(&mut self) {
@@ -2505,8 +2472,8 @@ mod tests {
         let event = TimeEvent::new(
             Ustr::from("MARKET_EXIT_CHECK:TEST-001"),
             UUID4::new(),
-            Default::default(),
-            Default::default(),
+            UnixNanos::default(),
+            UnixNanos::default(),
         );
         strategy.check_market_exit(event);
 
@@ -2534,8 +2501,8 @@ mod tests {
         let event = TimeEvent::new(
             Ustr::from("MARKET_EXIT_CHECK:TEST-001"),
             UUID4::new(),
-            Default::default(),
-            Default::default(),
+            UnixNanos::default(),
+            UnixNanos::default(),
         );
         strategy.check_market_exit(event);
 
@@ -2554,8 +2521,8 @@ mod tests {
         let event = TimeEvent::new(
             Ustr::from("MARKET_EXIT_CHECK:TEST-001"),
             UUID4::new(),
-            Default::default(),
-            Default::default(),
+            UnixNanos::default(),
+            UnixNanos::default(),
         );
         strategy.check_market_exit(event);
 

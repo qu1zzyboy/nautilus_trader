@@ -40,7 +40,7 @@ use nautilus_core::{
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{AccountType, OmsType, OrderType},
+    enums::{AccountType, OmsType, OrderSide, OrderType, TimeInForce},
     events::OrderEventAny,
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
@@ -52,7 +52,9 @@ use nautilus_model::{
 use tokio::task::JoinHandle;
 
 use crate::{
-    common::{consts::AX_VENUE, enums::AxOrderSide, parse::quantity_to_contracts},
+    common::{
+        consts::AX_VENUE, credential::Credential, enums::AxOrderSide, parse::quantity_to_contracts,
+    },
     config::AxExecClientConfig,
     http::{client::AxHttpClient, models::PreviewAggressiveLimitOrderRequest},
     websocket::{AxOrdersWsMessage, NautilusExecWsMessage, orders::AxOrdersWebSocketClient},
@@ -115,22 +117,12 @@ impl AxExecutionClient {
     }
 
     async fn authenticate(&self) -> anyhow::Result<String> {
-        let api_key = self
-            .config
-            .api_key
-            .clone()
-            .or_else(|| std::env::var("AX_API_KEY").ok())
-            .context("AX_API_KEY not configured")?;
-
-        let api_secret = self
-            .config
-            .api_secret
-            .clone()
-            .or_else(|| std::env::var("AX_API_SECRET").ok())
-            .context("AX_API_SECRET not configured")?;
+        let credential =
+            Credential::resolve(self.config.api_key.clone(), self.config.api_secret.clone())
+                .context("API credentials not configured")?;
 
         self.http_client
-            .authenticate(&api_key, &api_secret, 3600)
+            .authenticate(credential.api_key(), credential.api_secret(), 3600)
             .await
             .map_err(|e| anyhow::anyhow!("Authentication failed: {e}"))
     }
@@ -400,6 +392,9 @@ impl ExecutionClient for AxExecutionClient {
             return Ok(());
         }
 
+        // Reset so requests work after a previous disconnect
+        self.http_client.reset_cancellation_token();
+
         if !self.core.instruments_initialized() {
             let instruments = self
                 .http_client
@@ -424,7 +419,11 @@ impl ExecutionClient for AxExecutionClient {
         self.ws_orders.connect(&token).await?;
         log::info!("Connected to orders WebSocket");
 
-        if self.ws_stream_handle.is_none() {
+        let should_spawn = match &self.ws_stream_handle {
+            None => true,
+            Some(handle) => handle.is_finished(),
+        };
+        if should_spawn {
             let stream = self.ws_orders.stream();
             let emitter = self.emitter.clone();
 
@@ -482,10 +481,45 @@ impl ExecutionClient for AxExecutionClient {
     }
 
     fn query_order(&self, cmd: &QueryOrder) -> anyhow::Result<()> {
-        log::debug!(
-            "query_order not implemented for AX execution client (client_order_id={})",
-            cmd.client_order_id
-        );
+        let http_client = self.http_client.clone();
+        let account_id = self.core.account_id;
+        let client_order_id = cmd.client_order_id;
+        let venue_order_id = cmd.venue_order_id;
+        let instrument_id = cmd.instrument_id;
+        let emitter = self.emitter.clone();
+
+        // Read immutable order fields from cache before spawning
+        let (order_side, order_type, time_in_force) = {
+            let cache = self.core.cache();
+            match cache.order(&client_order_id) {
+                Some(order) => (
+                    order.order_side(),
+                    order.order_type(),
+                    order.time_in_force(),
+                ),
+                None => (OrderSide::NoOrderSide, OrderType::Limit, TimeInForce::Gtc),
+            }
+        };
+
+        self.spawn_task("query_order", async move {
+            match http_client
+                .request_order_status(
+                    account_id,
+                    instrument_id,
+                    Some(client_order_id),
+                    venue_order_id,
+                    order_side,
+                    order_type,
+                    time_in_force,
+                )
+                .await
+            {
+                Ok(report) => emitter.send_order_status_report(report),
+                Err(e) => log::error!("AX query order failed: {e}"),
+            }
+            Ok(())
+        });
+
         Ok(())
     }
 
@@ -752,7 +786,7 @@ impl ExecutionClient for AxExecutionClient {
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
         log::info!("Generating ExecutionMassStatus (lookback_mins={lookback_mins:?})");
 
-        let ts_now = get_atomic_clock_realtime().get_time_ns();
+        let ts_now = self.clock.get_time_ns();
 
         let start = lookback_mins.map(|mins| {
             let lookback_ns = mins * 60 * 1_000_000_000;

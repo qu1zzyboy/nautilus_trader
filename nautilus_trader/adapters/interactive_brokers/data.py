@@ -12,6 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
+
 from __future__ import annotations
 
 import asyncio
@@ -110,7 +111,6 @@ class InteractiveBrokersDataClient(LiveMarketDataClient):
         config: InteractiveBrokersDataClientConfig,
         name: str | None = None,
         connection_timeout: int = 300,
-        request_timeout: int = 60,
     ) -> None:
         super().__init__(
             loop=loop,
@@ -123,7 +123,6 @@ class InteractiveBrokersDataClient(LiveMarketDataClient):
             config=config,
         )
         self._connection_timeout = connection_timeout
-        self._request_timeout = request_timeout
         self._client = client
         self._handle_revised_bars = config.handle_revised_bars
         self._use_regular_trading_hours = config.use_regular_trading_hours
@@ -324,7 +323,7 @@ class InteractiveBrokersDataClient(LiveMarketDataClient):
         await self._client.unsubscribe_ticks(command.instrument_id, "AllLast")
 
     async def _unsubscribe_bars(self, command: UnsubscribeBars) -> None:
-        if command.bar_type.spec.timedelta == 5:
+        if command.bar_type.spec.timedelta.total_seconds() == 5:
             await self._client.unsubscribe_realtime_bars(command.bar_type)
         else:
             await self._client.unsubscribe_historical_bars(command.bar_type)
@@ -432,7 +431,7 @@ class InteractiveBrokersDataClient(LiveMarketDataClient):
             end_date_time=end,
             limit=request.limit,
             use_rth=self._use_regular_trading_hours,
-            timeout=self._request_timeout,
+            timeout=self._client._request_timeout_secs,
         )
         if not ticks:
             self._log.warning(f"No quote tick data received for {request.instrument_id}")
@@ -470,7 +469,7 @@ class InteractiveBrokersDataClient(LiveMarketDataClient):
             end_date_time=end,
             limit=request.limit,
             use_rth=self._use_regular_trading_hours,
-            timeout=self._request_timeout,
+            timeout=self._client._request_timeout_secs,
         )
         if not ticks:
             self._log.warning(f"No trades received for {request.instrument_id}")
@@ -622,7 +621,7 @@ class InteractiveBrokersDataClient(LiveMarketDataClient):
             end_date_time=request.end,
             duration=duration_str,
             use_rth=self._use_regular_trading_hours,
-            timeout=self._request_timeout,
+            timeout=self._client._request_timeout_secs,
         )
 
         if bars:

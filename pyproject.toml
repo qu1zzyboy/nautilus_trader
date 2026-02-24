@@ -1,6 +1,6 @@
 [project]
 name = "nautilus_trader"
-version = "1.223.0"
+version = "1.224.0"
 description = "A high-performance algorithmic trading platform and event-driven backtester"
 authors = [{ name = "Nautech Systems", email = "info@nautechsystems.io" }]
 classifiers = [
@@ -76,19 +76,11 @@ generate-setup-file = false
 betfair = ["betfair-parser==0.19.1"] # Pinned to 0.19.1 for stability
 ib = [
   "defusedxml>=0.7.1,<1.0.0; python_version < '3.14'",
-  "nautilus-ibapi==10.37.2; python_version < '3.14'",
+  "nautilus-ibapi==10.43.2; python_version < '3.14'",
+  "protobuf==5.29.5; python_version < '3.14'", # Pinned to 5.29.5 (fixes GHSA-8qvm-5x2c-j2w7)
 ]
 docker = ["docker>=7.1.0,<8.0.0"]
-dydx = [
-  "v4-proto==7.0.5; python_version < '3.14'",
-  "grpcio==1.68.1; python_version < '3.14'",
-  "protobuf==5.29.5; python_version < '3.14'", # Pinned to 5.29.5 (fixes GHSA-8qvm-5x2c-j2w7)
-  "bech32>=1.2.0,<2.0.0; python_version < '3.14'",
-  "ecdsa>=0.19.1,<1.0.0; python_version < '3.14'",
-  "bip-utils>=2.10.0,<3.0.0; python_version < '3.14'",
-  "pycryptodome>=3.20.0,<4.0.0; python_version < '3.14'",
-]
-polymarket = ["py-clob-client>=0.34.5,<1.0.0"]
+polymarket = ["py-clob-client>=0.34.6,<1.0.0"]
 visualization = ["plotly>=6.3.1,<7.0.0"]
 
 [dependency-groups]
@@ -98,7 +90,7 @@ dev = [
   "mypy==1.19.1,<2.0.0", # Pinned to 1.19.1 (keep in line with pre-commit)
   "pandas-stubs>=2.3.3,<3.0.0",
   "pre-commit>=4.5.0,<5.0.0",
-  "ruff==0.15.0", # Pinned to 0.15.0 (keep in line with pre-commit)
+  "ruff==0.15.2", # Pinned to 0.15.2 (keep in line with pre-commit)
   "types-pytz>=2025.2,<2026.0",
   "types-toml>=0.10.2,<1.0.0",
 ]

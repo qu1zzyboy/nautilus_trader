@@ -52,7 +52,7 @@ use nautilus_model::{
         instruments::{instrument_any_to_pyobject, pyobject_to_instrument_any},
     },
 };
-use pyo3::{conversion::IntoPyObjectExt, exceptions::PyRuntimeError, prelude::*};
+use pyo3::{conversion::IntoPyObjectExt, prelude::*};
 
 use crate::websocket::{BitmexWebSocketClient, messages::NautilusWsMessage};
 
@@ -209,6 +209,13 @@ impl BitmexWebSocketClient {
                                 call_python(py, &callback, py_obj);
                             }
                         }
+                        NautilusWsMessage::OrderUpdates(events) => {
+                            for event in events {
+                                if let Ok(py_obj) = event.into_py_any(py) {
+                                    call_python(py, &callback, py_obj);
+                                }
+                            }
+                        }
                         NautilusWsMessage::Reconnected => {}
                         NautilusWsMessage::Authenticated => {}
                     });
@@ -231,7 +238,7 @@ impl BitmexWebSocketClient {
             client
                 .wait_until_active(timeout_secs)
                 .await
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(to_pyruntime_err)?;
             Ok(())
         })
     }
