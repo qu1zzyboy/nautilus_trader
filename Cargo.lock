@@ -5569,7 +5569,7 @@ dependencies = [
 
 [[package]]
 name = "nautilus-mexc"
-version = "0.53.0"
+version = "0.54.0"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
@@ -5602,7 +5602,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
- "strum",
+ "strum 0.28.0",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
