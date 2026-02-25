@@ -4,6 +4,7 @@ Released on TBD (UTC).
 
 ### Enhancements
 - Added matching engine L1 quote-based queue position tracking for backtests
+- Added synthetic book support for binary markets (#3495), thanks @Javdu10
 - Added Betfair batch submit and cancel order support
 - Added BitMEX dead man's switch (cancelAllAfter) support
 - Added BitMEX grid market maker example in Rust
@@ -18,15 +19,19 @@ Released on TBD (UTC).
 ### Fixes
 - Fixed matching engine applying order book deltas for L1 books (#3615), thanks @maksym-mikheienko
 - Fixed pre-commit hooks portability for Windows (#3617), thanks for reporting @powerseed
+- Fixed `CryptoOption` instrument pyo3 transform for (#3626), thanks @davidsblom
+- Fixed Binance Futures algo order serde field renames for WS and HTTP parsing (#3624), thanks @qu1zzyboy
 - Fixed Binance silent HMAC fallback when using encrypted Ed25519 PEM keys (now warns)
 - Fixed Hyperliquid stop/trigger order price derivation (#3611), thanks for reporting @h-tsun3
 - Fixed Hyperliquid price normalization and inner error detection (#3612), thanks for reporting @h-tsun3
-- Fix Interactive Brokers BarType/str comparison in get_historical_bars (#3616), thank you @powerseed
-- Fix Interactive Brokers historical bar processing crash (#3619), thank you @shzhng
+- Fixed Interactive Brokers BarType/str comparison in get_historical_bars (#3616), thank you @powerseed
+- Fixed Interactive Brokers historical bar processing crash (#3619), thank you @shzhng
 
 ### Internal Improvements
+- Added catalog deduplication functionality (#3613), thanks @ms32035
 - Implemented `BacktestNode` with catalog streaming in Rust
 - Improved `OrderBookImbalance` example strategy
+- Improved `BestPriceFillModel` to fill inside bid ask spread (#3428), thanks @faysou
 - Standardized use of atomic clock across adapters
 - Standardized adapter credentials handling and testing
 
