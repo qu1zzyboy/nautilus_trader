@@ -310,14 +310,6 @@ impl BinanceFuturesExecWsFeedHandler {
 
         match order_data.execution_type {
             BinanceExecutionType::New => {
-                // Algo orders emit OrderAccepted via ALGO_UPDATE NEW, skip here to avoid duplicate
-                if self.algo_client_order_ids.contains(&client_order_id) {
-                    log::debug!(
-                        "Skipping OrderAccepted for algo order: client_order_id={client_order_id}"
-                    );
-                    return None;
-                }
-
                 // Move from pending to active on acceptance
                 self.pending_place_requests.remove(&client_order_id);
 
@@ -550,10 +542,11 @@ impl BinanceFuturesExecWsFeedHandler {
         let ts_init = self.clock.get_time_ns();
 
         let client_order_id = ClientOrderId::new(&algo_data.client_algo_id);
-        let venue_order_id = algo_data.actual_order_id.as_ref().map_or_else(
-            || VenueOrderId::new(algo_data.algo_id.to_string()),
-            |id| VenueOrderId::new(id.clone()),
-        );
+        let venue_order_id = algo_data
+            .actual_order_id
+            .as_ref()
+            .filter(|id| !id.is_empty())
+            .map(|id| VenueOrderId::new(id.clone()));
         let (trader_id, strategy_id, instrument_id) =
             self.get_order_context(&client_order_id, algo_data.symbol.as_str());
 
@@ -563,20 +556,9 @@ impl BinanceFuturesExecWsFeedHandler {
                 self.algo_client_order_ids.insert(client_order_id);
                 self.pending_place_requests.remove(&client_order_id);
 
-                let event = OrderAccepted::new(
-                    trader_id,
-                    strategy_id,
-                    instrument_id,
-                    client_order_id,
-                    venue_order_id,
-                    self.account_id,
-                    UUID4::new(),
-                    ts_event,
-                    ts_init,
-                    false,
-                );
-
-                Some(NautilusExecWsMessage::OrderAccepted(event))
+                // Do not emit OrderAccepted here; rely on ORDER_TRADE_UPDATE NEW
+                // (which carries the real venue_order_id when the order reaches the matching engine).
+                None
             }
             BinanceAlgoStatus::Triggering => {
                 log::info!(
@@ -602,9 +584,13 @@ impl BinanceFuturesExecWsFeedHandler {
                     algo_data.symbol
                 );
 
-                let Some(actual_order_id) = &algo_data.actual_order_id else {
+                let Some(actual_order_id) = algo_data
+                    .actual_order_id
+                    .as_ref()
+                    .filter(|s| !s.is_empty())
+                else {
                     log::warn!(
-                        "Algo order triggered but no actual_order_id: client_order_id={client_order_id}"
+                        "Algo order triggered but no valid actual_order_id: client_order_id={client_order_id}"
                     );
                     return None;
                 };
@@ -656,7 +642,7 @@ impl BinanceFuturesExecWsFeedHandler {
                     ts_event,
                     ts_init,
                     false,
-                    Some(venue_order_id),
+                    venue_order_id,
                     Some(self.account_id),
                 );
 
@@ -686,7 +672,7 @@ impl BinanceFuturesExecWsFeedHandler {
                     ts_event,
                     ts_init,
                     false,
-                    Some(venue_order_id),
+                    venue_order_id,
                     Some(self.account_id),
                 );
 
