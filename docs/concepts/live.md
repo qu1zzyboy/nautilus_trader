@@ -10,7 +10,7 @@ node operations, execution reconciliation, and the differences between backtesti
 
 This guide provides an overview of the key aspects of live trading.
 
-:::danger **Jupyter notebooks not recommended for live trading**
+:::danger[Jupyter notebooks not recommended for live trading]
 Running live trading nodes in Jupyter notebooks is **not recommended** due to event loop conflicts and operational risks:
 
 - Jupyter runs its own asyncio event loop, which conflicts with `TradingNode`'s event loop management.
@@ -21,14 +21,14 @@ Running live trading nodes in Jupyter notebooks is **not recommended** due to ev
 Use Jupyter notebooks for backtesting, analysis, and experimentation. For live trading, run your trading nodes as standalone Python scripts or services with proper process management.
 :::
 
-:::warning **One TradingNode per process**
+:::warning[One TradingNode per process]
 Running multiple `TradingNode` instances concurrently in the same process is not supported due to global singleton state.
 Add multiple strategies to a single node, or run additional nodes in separate processes for parallel execution.
 
 See [Processes and threads](architecture.md#processes-and-threads) for details.
 :::
 
-:::warning **Do not block the event loop**
+:::warning[Do not block the event loop]
 User code running on the event loop thread (strategy callbacks, actor handlers, and `on_event`
 methods) should return as quickly as possible. This applies to both Python and Rust implementations.
 Expensive operations such as model inference, heavy calculations, or synchronous I/O can degrade
@@ -36,7 +36,7 @@ performance and compromise correctness (missed fills, stale data, delayed order 
 Offload long-running work to an executor, or to a separate thread/process.
 :::
 
-:::info **Platform differences**
+:::info[Platform differences]
 Windows signal handling differs from Unix-like systems. If you are running on Windows, please read
 the note on [Windows signal handling](#windows-signal-handling) for guidance on graceful shutdown
 behavior and Ctrl+C (SIGINT) support.
@@ -274,6 +274,10 @@ This ensures the trading node maintains a consistent execution state even under 
 | `single_order_query_delay_ms`        | 100&nbsp;ms    | Delay (milliseconds) between single-order queries to prevent rate limit exhaustion. |
 | `reconciliation_startup_delay_secs`  | 10.0&nbsp;s    | Additional delay (seconds) applied *after* startup reconciliation completes before starting continuous reconciliation loop. Provides time for additional system stabilization. |
 | `own_books_audit_interval_secs`      | None           | Sets the interval (in seconds) between audits of own order books against public ones. Verifies synchronization and logs errors for inconsistencies. |
+| `position_check_interval_secs`       | None           | Interval (seconds) between checks for position discrepancies between cache and venue. When a discrepancy is detected, the system queries for missing fills. Set to None to disable. Recommended: 30-60 seconds. |
+| `position_check_lookback_mins`       | 60&nbsp;min    | Lookback window (minutes) for querying fill reports when a position discrepancy is detected. Only fills within this window are requested from the venue. |
+| `position_check_threshold_ms`        | 5,000&nbsp;ms  | Minimum elapsed time (milliseconds) since the position's last local activity before acting on discrepancies. Prevents race conditions with in-flight fills. |
+| `position_check_retries`             | 3&nbsp;retries | Maximum reconciliation attempts for a position discrepancy before the engine stops retrying. Once exceeded, an error is logged and the instrument is no longer actively reconciled until the discrepancy resolves. |
 
 :::warning
 **Important configuration guidelines:**

@@ -812,6 +812,7 @@ impl DataEngine {
             }
             return Ok(());
         }
+
         if let Some(client) = self.get_client(req.client_id(), req.venue()) {
             match req {
                 RequestCommand::Data(req) => client.request_data(req),
@@ -941,10 +942,9 @@ impl DataEngine {
                 return; // Not the last delta for event
             }
 
-            // SAFETY: We know the deltas exists already
             self.buffered_deltas_map
                 .remove(&delta.instrument_id)
-                .unwrap()
+                .expect("buffered deltas exist")
         } else {
             OrderBookDeltas::new(delta.instrument_id, vec![delta])
         };
@@ -971,9 +971,10 @@ impl DataEngine {
                 }
 
                 if RecordFlag::F_LAST.matches(delta.flags) {
-                    // SAFETY: We know the deltas exist already
-                    let deltas_to_publish =
-                        self.buffered_deltas_map.remove(&instrument_id).unwrap();
+                    let deltas_to_publish = self
+                        .buffered_deltas_map
+                        .remove(&instrument_id)
+                        .expect("buffered deltas exist");
                     let topic = switchboard::get_book_deltas_topic(instrument_id);
                     msgbus::publish_deltas(topic, &deltas_to_publish);
                 }
@@ -981,7 +982,7 @@ impl DataEngine {
         } else {
             let topic = switchboard::get_book_deltas_topic(deltas.instrument_id);
             msgbus::publish_deltas(topic, &deltas);
-        };
+        }
     }
 
     fn handle_depth10(&mut self, depth: OrderBookDepth10) {
@@ -1023,6 +1024,7 @@ impl DataEngine {
                 );
                 return; // Bar is out of sequence
             }
+
             if bar.ts_init < last_bar.ts_init {
                 log::warn!(
                     "Bar {bar} was prior to last bar `ts_init` {}",
@@ -1384,6 +1386,7 @@ impl DataEngine {
         if !has_deltas {
             msgbus::unsubscribe_book_deltas(deltas_topic.into(), &deltas_handler);
         }
+
         if !has_depth10 {
             msgbus::unsubscribe_book_depth10(depth_topic.into(), &depth_handler);
         }
@@ -1465,6 +1468,7 @@ impl DataEngine {
 
     fn handle_book_response(&self, book: &OrderBook) {
         log::debug!("Adding order book {} to cache", book.instrument_id);
+
         if let Err(e) = self
             .cache
             .as_ref()

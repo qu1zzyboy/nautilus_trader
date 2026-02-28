@@ -73,10 +73,10 @@ use ustr::Ustr;
 use super::{
     error::OKXHttpError,
     models::{
-        OKXAccount, OKXCancelAlgoOrderRequest, OKXCancelAlgoOrderResponse, OKXFeeRate,
-        OKXIndexTicker, OKXMarkPrice, OKXOrderAlgo, OKXOrderHistory, OKXPlaceAlgoOrderRequest,
-        OKXPlaceAlgoOrderResponse, OKXPosition, OKXPositionHistory, OKXPositionTier, OKXServerTime,
-        OKXTransactionDetail,
+        OKXAccount, OKXAmendAlgoOrderRequest, OKXAmendAlgoOrderResponse, OKXCancelAlgoOrderRequest,
+        OKXCancelAlgoOrderResponse, OKXFeeRate, OKXIndexTicker, OKXMarkPrice, OKXOrderAlgo,
+        OKXOrderHistory, OKXPlaceAlgoOrderRequest, OKXPlaceAlgoOrderResponse, OKXPosition,
+        OKXPositionHistory, OKXPositionTier, OKXServerTime, OKXTransactionDetail,
     },
     query::{
         GetAlgoOrdersParams, GetAlgoOrdersParamsBuilder, GetCandlesticksParams,
@@ -94,8 +94,8 @@ use crate::{
         consts::{OKX_HTTP_URL, OKX_NAUTILUS_BROKER_ID, should_retry_error_code},
         credential::Credential,
         enums::{
-            OKXAlgoOrderType, OKXContractType, OKXInstrumentStatus, OKXInstrumentType,
-            OKXOrderStatus, OKXPositionMode, OKXSide, OKXTradeMode, OKXTriggerType,
+            OKXContractType, OKXInstrumentStatus, OKXInstrumentType, OKXOrderStatus,
+            OKXPositionMode, OKXSide, OKXTradeMode, OKXTriggerType, conditional_order_to_algo_type,
         },
         models::OKXInstrument,
         parse::{
@@ -246,6 +246,10 @@ impl OKXRawHttpClient {
             ),
             (
                 "okx:/api/v5/trade/cancel-algos".to_string(),
+                Quota::per_second(NonZeroU32::new(10).expect("non-zero")).expect("valid constant"),
+            ),
+            (
+                "okx:/api/v5/trade/amend-algos".to_string(),
                 Quota::per_second(NonZeroU32::new(10).expect("non-zero")).expect("valid constant"),
             ),
         ]
@@ -1972,6 +1976,7 @@ impl OKXHttpClient {
         {
             return Ok(Vec::new());
         }
+
         if let Some(e) = end
             && e > now
         {
@@ -2014,6 +2019,7 @@ impl OKXHttpClient {
         // Floor start and ceiling end to bar boundaries for cleaner API requests
         let start_ms = start.map(|s| {
             let ms = s.timestamp_millis();
+
             if slot_ms > 0 {
                 (ms / slot_ms) * slot_ms // Floor to nearest bar boundary
             } else {
@@ -2022,6 +2028,7 @@ impl OKXHttpClient {
         });
         let end_ms = end.map(|e| {
             let ms = e.timestamp_millis();
+
             if slot_ms > 0 {
                 ((ms + slot_ms - 1) / slot_ms) * slot_ms // Ceiling to nearest bar boundary
             } else {
@@ -2079,6 +2086,7 @@ impl OKXHttpClient {
             {
                 break;
             }
+
             if pages >= MAX_PAGES_SOFT {
                 break;
             }
@@ -2132,6 +2140,7 @@ impl OKXHttpClient {
                     if let Some(a) = after_ms {
                         p.after_ms(a);
                     }
+
                     if let Some(b) = before_ms {
                         p.before_ms(b);
                         req_used_before = true;
@@ -2172,6 +2181,7 @@ impl OKXHttpClient {
                         .get_history_candles(params2)
                         .await
                         .map_err(anyhow::Error::new)?;
+
                     if raw2.is_empty() {
                         // Step back one page interval and retry loop
                         let jump = (page_cap as i64).saturating_mul(slot_ms.max(1));
@@ -2207,6 +2217,7 @@ impl OKXHttpClient {
                         self.inner.get_candles(params2).await
                     }
                     .map_err(anyhow::Error::new)?;
+
                     if raw2.is_empty() {
                         break;
                     } else {
@@ -2419,12 +2430,14 @@ impl OKXHttpClient {
             {
                 break;
             }
+
             if let Some(ens) = end_ns
                 && let Some(last) = out.last()
                 && last.ts_event.as_i64() >= ens
             {
                 break;
             }
+
             if let Some(sns) = start_ns
                 && let Some(first) = out.first()
                 && (matches!(mode, Mode::Backward) || forward_prepend_mode)
@@ -2469,6 +2482,7 @@ impl OKXHttpClient {
                 self.inner.get_candles(params).await
             }
             .map_err(anyhow::Error::new)?;
+
             if !raw.is_empty() {
                 let ts_init = self.generate_ts_init();
                 let mut page: Vec<Bar> = Vec::with_capacity(raw.len());
@@ -2512,11 +2526,13 @@ impl OKXHttpClient {
             }
         }
 
+        // Keep the most recent N bars when limit is specified
         if let Some(lim) = limit
             && lim > 0
             && out.len() > lim as usize
         {
-            out.truncate(lim as usize);
+            let start = out.len() - lim as usize;
+            out.drain(..start);
         }
 
         Ok(out)
@@ -2661,6 +2677,7 @@ impl OKXHttpClient {
             {
                 continue;
             }
+
             if let Some(end_ns) = end_ns
                 && report.ts_last > end_ns
             {
@@ -2736,6 +2753,7 @@ impl OKXHttpClient {
             if detail.fill_sz.is_empty() {
                 continue;
             }
+
             if let Ok(qty) = detail.fill_sz.parse::<f64>() {
                 if qty <= 0.0 {
                     continue;
@@ -2867,7 +2885,7 @@ impl OKXHttpClient {
                 Err(e) => {
                     log::error!("Failed to parse position status report: {e}");
                 }
-            };
+            }
         }
 
         Ok(reports)
@@ -2941,7 +2959,7 @@ impl OKXHttpClient {
                             "Failed to parse spot margin position from balance for {ccy_str}: {e}"
                         );
                     }
-                };
+                }
             }
         }
 
@@ -3045,6 +3063,106 @@ impl OKXHttpClient {
             .await
     }
 
+    /// Cancels advance algo orders (trailing stop, iceberg, TWAP) via HTTP.
+    ///
+    /// These order types cannot use the standard `cancel-algos` endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-algo-trading-post-cancel-advance-algo-order>
+    pub async fn cancel_advance_algo_orders(
+        &self,
+        requests: Vec<OKXCancelAlgoOrderRequest>,
+    ) -> Result<Vec<OKXCancelAlgoOrderResponse>, OKXHttpError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let body =
+            serde_json::to_vec(&requests).map_err(|e| OKXHttpError::JsonError(e.to_string()))?;
+
+        self.inner
+            .send_request::<_, ()>(
+                Method::POST,
+                "/api/v5/trade/cancel-advance-algos",
+                None,
+                Some(body),
+                true,
+            )
+            .await
+    }
+
+    /// Amends an algo order via HTTP.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-algo-trading-post-amend-algo-order>
+    pub async fn amend_algo_order(
+        &self,
+        request: OKXAmendAlgoOrderRequest,
+    ) -> Result<OKXAmendAlgoOrderResponse, OKXHttpError> {
+        let body =
+            serde_json::to_vec(&request).map_err(|e| OKXHttpError::JsonError(e.to_string()))?;
+
+        let resp: Vec<OKXAmendAlgoOrderResponse> = self
+            .inner
+            .send_request::<_, ()>(
+                Method::POST,
+                "/api/v5/trade/amend-algos",
+                None,
+                Some(body),
+                true,
+            )
+            .await?;
+
+        resp.into_iter()
+            .next()
+            .ok_or_else(|| OKXHttpError::ValidationError("Empty response".to_string()))
+    }
+
+    /// Amends an algo order using domain types.
+    ///
+    /// This is a convenience method that accepts Nautilus domain types
+    /// and builds the appropriate OKX request structure internally.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn amend_algo_order_with_domain_types(
+        &self,
+        instrument_id: InstrumentId,
+        algo_id: String,
+        new_trigger_price: Option<Price>,
+        new_limit_price: Option<Price>,
+        new_quantity: Option<Quantity>,
+        new_callback_ratio: Option<String>,
+        new_callback_spread: Option<String>,
+        new_activation_price: Option<Price>,
+    ) -> Result<OKXAmendAlgoOrderResponse, OKXHttpError> {
+        let request = OKXAmendAlgoOrderRequest {
+            inst_id: instrument_id.symbol.as_str().to_string(),
+            algo_id,
+            algo_cl_ord_id: None,
+            new_sz: new_quantity.map(|q| q.to_string()),
+            new_trigger_px: new_trigger_price.map(|p| p.to_string()),
+            new_order_px: new_limit_price.map(|p| p.to_string()),
+            new_callback_ratio,
+            new_callback_spread,
+            new_active_px: new_activation_price.map(|p| p.to_string()),
+        };
+
+        self.amend_algo_order(request).await
+    }
+
     /// Places an algo order using domain types.
     ///
     /// This is a convenience method that accepts Nautilus domain types
@@ -3062,10 +3180,13 @@ impl OKXHttpClient {
         order_side: OrderSide,
         order_type: OrderType,
         quantity: Quantity,
-        trigger_price: Price,
+        trigger_price: Option<Price>,
         trigger_type: Option<TriggerType>,
         limit_price: Option<Price>,
         reduce_only: Option<bool>,
+        callback_ratio: Option<String>,
+        callback_spread: Option<String>,
+        activation_price: Option<Price>,
     ) -> Result<OKXPlaceAlgoOrderResponse, OKXHttpError> {
         if !matches!(order_side, OrderSide::Buy | OrderSide::Sell) {
             return Err(OKXHttpError::ValidationError(
@@ -3073,6 +3194,8 @@ impl OKXHttpClient {
             ));
         }
         let okx_side: OKXSide = order_side.into();
+        let algo_type = conditional_order_to_algo_type(order_type)
+            .map_err(|e| OKXHttpError::ValidationError(e.to_string()))?;
 
         // Map trigger type to OKX format
         let trigger_px_type_enum = trigger_type.map_or(OKXTriggerType::Last, Into::into);
@@ -3080,6 +3203,9 @@ impl OKXHttpClient {
         // Determine order price based on order type
         let order_px = if matches!(order_type, OrderType::StopLimit | OrderType::LimitIfTouched) {
             limit_price.map(|p| p.to_string())
+        } else if order_type == OrderType::TrailingStopMarket {
+            // Trailing stops always execute as market when triggered
+            None
         } else {
             // Market orders use -1 to indicate market execution
             Some("-1".to_string())
@@ -3090,17 +3216,20 @@ impl OKXHttpClient {
             inst_id_code: None,
             td_mode,
             side: okx_side,
-            ord_type: OKXAlgoOrderType::Trigger, // All conditional orders use 'trigger' type
+            ord_type: algo_type,
             sz: quantity.to_string(),
             algo_cl_ord_id: Some(client_order_id.as_str().to_string()),
-            trigger_px: Some(trigger_price.to_string()),
+            trigger_px: trigger_price.map(|p| p.to_string()),
             order_px,
             trigger_px_type: Some(trigger_px_type_enum),
-            tgt_ccy: None,  // Let OKX determine based on instrument
-            pos_side: None, // Use default position side
+            tgt_ccy: None,
+            pos_side: None,
             close_position: None,
             tag: Some(OKX_NAUTILUS_BROKER_ID.to_string()),
             reduce_only,
+            callback_ratio,
+            callback_spread,
+            active_px: activation_price.map(|p| p.to_string()),
         };
 
         self.place_algo_order(request).await
@@ -3160,18 +3289,23 @@ impl OKXHttpClient {
 
         let mut params_builder = GetAlgoOrdersParamsBuilder::default();
         params_builder.inst_type(inst_type);
+
         if let Some(inst_id) = instrument_id {
             params_builder.inst_id(inst_id.symbol.inner().to_string());
         }
+
         if let Some(algo_id) = algo_id.as_ref() {
             params_builder.algo_id(algo_id.clone());
         }
+
         if let Some(client_order_id) = algo_client_order_id.as_ref() {
             params_builder.algo_cl_ord_id(client_order_id.as_str().to_string());
         }
+
         if let Some(state) = state {
             params_builder.state(state);
         }
+
         if let Some(limit) = limit {
             params_builder.limit(limit);
         }
@@ -3340,6 +3474,9 @@ fn parse_http_algo_order(
         u_time: order.u_time,
         trigger_time: order.trigger_time.clone(),
         tag: order.tag.clone(),
+        callback_ratio: order.callback_ratio.clone(),
+        callback_spread: order.callback_spread.clone(),
+        active_px: order.active_px.clone(),
     };
 
     parse_algo_order_status_report(&msg, instrument, account_id, ts_init)

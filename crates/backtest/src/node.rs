@@ -42,6 +42,10 @@ use crate::{
 /// `BacktestNode` connects the [`ParquetDataCatalog`] with [`BacktestEngine`] to load
 /// historical data and run backtests. Supports both oneshot and streaming modes.
 #[derive(Debug)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.backtest", unsendable)
+)]
 pub struct BacktestNode {
     configs: Vec<BacktestRunConfig>,
     engines: AHashMap<String, BacktestEngine>,
@@ -314,6 +318,7 @@ fn validate_configs(configs: &[BacktestRunConfig]) -> anyhow::Result<()> {
                 venue_config.book_type(),
                 BookType::L2_MBP | BookType::L3_MBO
             );
+
             if needs_book_data {
                 let venue_name = venue_config.name().to_string();
                 let has_book_data = config.data().iter().any(|dc| {
@@ -321,6 +326,7 @@ fn validate_configs(configs: &[BacktestRunConfig]) -> anyhow::Result<()> {
                         dc.data_type(),
                         NautilusDataType::OrderBookDelta | NautilusDataType::OrderBookDepth10
                     );
+
                     if !is_book_type {
                         return false;
                     }

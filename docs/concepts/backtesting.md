@@ -100,7 +100,10 @@ engine.add_data(all_bars, sort=True)
 
 **Strategy 3: Use streaming API for very large datasets**
 
-For datasets that don't fit in memory, use the streaming API:
+For datasets that don't fit in memory, there are two streaming approaches:
+
+**Automatic chunking** - supply a generator that yields batches. The engine pulls chunks
+lazily during a single `run()` call:
 
 ```python
 def data_generator():
@@ -113,10 +116,28 @@ engine.add_data_iterator(
     data_name="my_data_stream",
     generator=data_generator(),
 )
+
+engine.run()  # Chunks are consumed on-demand
+```
+
+**Manual chunking** - load and run each batch yourself. This is the pattern
+used internally by `BacktestNode` and gives full control over batch boundaries:
+
+```python
+engine.add_strategy(strategy)
+
+for batch in data_batches:
+    engine.add_data(batch)
+    engine.run(streaming=True)
+    engine.clear_data()
+
+engine.end()  # Finalize: flushes remaining timers, stops engines, produces results
 ```
 
 :::note
-The streaming API processes data chunks on-demand during the backtest run, avoiding the need to load all data into memory upfront.
+In streaming mode, timer advancement stops when data exhausts for each batch. Timers scheduled
+past the last data point (e.g. bar aggregation intervals) are deferred until more data arrives
+or `end()` is called, which flushes up to the `end` boundary from the last `run()` call.
 :::
 
 :::tip Performance impact
@@ -376,43 +397,38 @@ For each data point the engine runs three phases:
 
 ```mermaid
 sequenceDiagram
-    participant Loop as Backtest Loop
+    participant BL as Backtest Loop
     participant Exch as SimulatedExchange
     participant ME as MatchingEngine
     participant DE as DataEngine
     participant Stgy as Strategy
-    participant Settle as Settle Venues
 
-    Loop->>Loop: next data point (ts=T)
+    BL->>BL: next data point (ts=T)
 
     rect rgb(240, 248, 255)
-    note right of Loop: Phase 1 — Exchange processes data
-    Loop->>Exch: process_quote_tick / process_bar / ...
+    note right of BL: Phase 1 - Exchange processes data
+    BL->>Exch: process_quote_tick / process_bar
     Exch->>ME: update book + iterate()
     note right of ME: Matches existing orders<br/>against new market state
     end
 
     rect rgb(245, 255, 245)
-    note right of Loop: Phase 2 — Strategy receives data
-    Loop->>DE: process(data)
-    DE->>Stgy: on_quote_tick() / on_bar() / ...
+    note right of BL: Phase 2 - Strategy receives data
+    BL->>DE: process(data)
+    DE->>Stgy: on_quote_tick() / on_bar()
     Stgy-->>Exch: submit_order (queued or immediate)
     end
 
     rect rgb(255, 248, 240)
-    note right of Loop: Phase 3 — Settle venues
-    Loop->>Settle: _process_and_settle_venues(T)
-
-    loop until no pending commands
-        Settle->>Exch: _drain_commands(T)
-        note right of Exch: Processes queued commands,<br/>adds orders to matching core
-        Settle->>ME: _core.iterate(T)
-        note right of ME: Matches newly added orders<br/>against current market state
-        note right of ME: Fills may trigger strategy<br/>callbacks that enqueue<br/>further commands
-    end
-
-    Settle->>Exch: run simulation modules
-    Settle->>Exch: check instrument expirations
+    note right of BL: Phase 3 - Settle venues
+    BL->>BL: _process_and_settle_venues(T)
+    BL->>Exch: _drain_commands(T)
+    note right of Exch: Processes queued commands,<br/>adds orders to matching core
+    BL->>ME: _core.iterate(T)
+    note right of ME: Matches newly added orders<br/>against current market state
+    note right of ME: Fills may trigger strategy callbacks<br/>that enqueue further commands,<br/>repeats until no pending commands
+    BL->>Exch: run simulation modules
+    BL->>Exch: check instrument expirations
     end
 ```
 
@@ -903,13 +919,13 @@ venue_config = BacktestVenueConfig(
 
 **L1 quote-based mode:**
 
-When using `BookType.L1_MBP` (top-of-book quotes only), queue position tracking infers
-consumption from changes in the best bid/ask between consecutive quote ticks rather than
-from individual trade ticks or order book deltas.
+When using `BookType.L1_MBP` (top-of-book quotes only), queue position tracking uses
+trade ticks to decrement the queue (the same mechanism as L2/L3), while quote ticks
+handle price-move detection and deferred snapshot resolution.
 
-- **Size decrease at same price**: If the BBO size decreases while the price holds steady,
-  the engine decrements the queue ahead by the decrease amount. This captures fills,
-  cancellations, and other activity consuming the level.
+- **Trade ticks**: Trades at the order's price level decrement the queue ahead by the trade
+  size, identical to L2/L3 behavior. Only trades on the correct aggressor side affect the
+  queue (SELLER trades decrement queue for BUY orders, BUYER trades for SELL orders).
 - **Price moves away**: If the bid drops below a BUY order's price (or ask rises above a
   SELL order's price), the order's price level has been "crossed" and the queue clears to zero,
   making the order fill-eligible on the next matching trade.
@@ -917,8 +933,11 @@ from individual trade ticks or order book deltas.
   not consumed, so queue positions are preserved.
 - **Price returns to a level**: When the price returns after moving away, the queue ahead is
   capped at the new displayed size if it was previously larger.
-- **Trade ticks**: In L1 mode, trades do not directly decrement the queue (the quote changes
-  already reflect their impact). Trades still trigger fills once the queue ahead reaches zero.
+- **Orders behind BBO (pending)**: When a limit order is placed behind the best bid/ask
+  (e.g., BUY below best bid), the queue snapshot is deferred because L1 data has no visible
+  depth at that level. Fills are blocked until the BBO reaches the order's price, at which
+  point the queue is snapshotted from the displayed size. Pending orders are also resolved
+  when trades cross through their price level.
 
 L1 mode uses the same configuration: set `queue_position=True` with `book_type=BookType.L1_MBP`.
 This provides a lightweight alternative to full L2/L3 data when only top-of-book quotes are

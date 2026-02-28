@@ -4,39 +4,67 @@ Released on TBD (UTC).
 
 ### Enhancements
 - Added matching engine L1 quote-based queue position tracking for backtests
+- Added `fill_limit_at_touch` to `FillModel` and `MatchingCore` for at-or-inside-spread limit fill control
 - Added synthetic book support for binary markets (#3495), thanks @Javdu10
+- Added `get_target_px_for_quantity` method on `OrderBook` (#3627), thanks @Javdu10
 - Added Betfair batch submit and cancel order support
 - Added BitMEX dead man's switch (cancelAllAfter) support
 - Added BitMEX grid market maker example in Rust
+- Added Hyperliquid order modify support (Python and Rust)
+- Added OKX trailing stop market order support (Rust and Python)
+- Added OKX algo order amend support (Rust and Python)
+- Removed Hyperliquid builder fee charges (builder-fee approval no longer required)
 
 ### Breaking Changes
 - Removed Coinbase International (`COINBASE_INTX`) adapter, see RFC (#3555)
 - Removed Binance `BINANCE_ED25519_*` env vars for Spot/Margin (use `BINANCE_API_KEY`/`BINANCE_API_SECRET`; Futures deprecated with warning)
+- Removed Hyperliquid `builder_fee_refresh_mins` config option (builder fees no longer charged)
 
 ### Security
+- Added `pip-audit` to security audit pipeline
+- Added Docker image cosign signing and SBOM generation
 - Bumped all eligible GitHub Actions pinned SHAs to latest versions (2-week release policy)
 
 ### Fixes
 - Fixed matching engine applying order book deltas for L1 books (#3615), thanks @maksym-mikheienko
-- Fixed pre-commit hooks portability for Windows (#3617), thanks for reporting @powerseed
+- Fixed streaming backtest producing dummy bars past batch data exhaustion (#3628), thanks for reporting @cauta
+- Fixed `OrderEmulator` trailing stop activation ignoring `LAST_PRICE` trigger type (#3629), thanks for reporting @HaakonFlaaronning
+- Fixed `LiveExecEngine` position reconciliation infinite loop when venue reports flat (#3622), thanks for reporting @mrbaron3
 - Fixed `CryptoOption` instrument pyo3 transform for (#3626), thanks @davidsblom
-- Fixed Binance Futures algo order serde field renames for WS and HTTP parsing (#3624), thanks @qu1zzyboy
+- Fixed `StreamingFeatherWriter` duplicate events from multiple message bus topics (#3625), thanks for reporting @fomotoshi
+- Fixed Binance Futures algo order serde field renames for WS and HTTP parsing (#3624), thanks for reporting @qu1zzyboy
 - Fixed Binance silent HMAC fallback when using encrypted Ed25519 PEM keys (now warns)
+- Fixed BinanceSymbol COIN-M perpetual symbol conversion (#3641), thanks @YeeTsai
 - Fixed Hyperliquid stop/trigger order price derivation (#3611), thanks for reporting @h-tsun3
 - Fixed Hyperliquid price normalization and inner error detection (#3612), thanks for reporting @h-tsun3
-- Fixed Interactive Brokers BarType/str comparison in get_historical_bars (#3616), thank you @powerseed
-- Fixed Interactive Brokers historical bar processing crash (#3619), thank you @shzhng
+- Fixed Interactive Brokers BarType/str comparison in get_historical_bars (#3616), thanks @powerseed
+- Fixed Interactive Brokers historical bar processing crash (#3619), thanks @shzhng
+- Fixed Interactive Brokers contract details parsing (#3638), thanks @davidsblom
+- Fixed Kraken Spot and Futures execution clients not loading instruments during connect (#3644), thanks for reporting @husariancom
+- Fixed Kraken Spot execution client HTTP client created without credentials (#3650), thanks for reporting @husariancom
+- Fixed Kraken sequential `ClientOrderId` exceeding `cl_ord_id` 18-char free-text limit (#3651), thanks for reporting @husariancom
+- Fixed Kraken missing account state registration during connect (#3652), thanks for reporting @husariancom
+- Fixed pre-commit hooks portability for Windows (#3617), thanks for reporting @powerseed
 
 ### Internal Improvements
 - Added catalog deduplication functionality (#3613), thanks @ms32035
+- Extracted common SBE decoder to `nautilus-serialization` crate
 - Implemented `BacktestNode` with catalog streaming in Rust
 - Improved `OrderBookImbalance` example strategy
 - Improved `BestPriceFillModel` to fill inside bid ask spread (#3428), thanks @faysou
 - Standardized use of atomic clock across adapters
 - Standardized adapter credentials handling and testing
+- Refined build script for Windows (#3636), thanks @faysou
+- Optimized backtest engine settle loop to avoid Python list allocation on idle ticks
+- Optimized `MatchingCore.iterate` to avoid list concatenation on every call
+- Upgraded `databento` crate to v0.42.0
 
 ### Documentation Updates
-- Added AX Exchange gold perps backtest tutorial
+- Added AX Exchange gold perps book imbalance tutorial
+- Added AX Exchange spot FX bars mean reversion tutorial
+- Added BitMEX grid market maker tutorial
+- Added order book concepts documentation
+- Improved backtesting mermaid diagram and tutorial formatting
 
 ---
 

@@ -57,8 +57,8 @@ class ImmediateOrderStrategy(Strategy):
 
         if not self.order_submitted:
             instrument = self.cache.instrument(self.instrument_id)
-            mid_price_double = (tick.bid_price.as_double() + tick.ask_price.as_double()) / 2.0
-            limit_price = instrument.next_ask_price(mid_price_double, num_ticks=0)
+            mid = (tick.bid_price.as_double() + tick.ask_price.as_double()) / 2.0
+            limit_price = instrument.next_ask_price(mid, num_ticks=0)
 
             order = self.order_factory.limit(
                 instrument_id=self.instrument_id,
@@ -98,12 +98,13 @@ class DeltaHedgeOnFillStrategy(Strategy):
         if not self.first_order_submitted:
             instrument = self.cache.instrument(self.instrument_id)
             mid = (tick.bid_price.as_double() + tick.ask_price.as_double()) / 2.0
-            price = instrument.next_ask_price(mid, num_ticks=0)
+            limit_price = instrument.next_ask_price(mid, num_ticks=0)
+
             order = self.order_factory.limit(
                 instrument_id=self.instrument_id,
                 order_side=OrderSide.BUY,
                 quantity=Quantity.from_int(100_000),
-                price=price,
+                price=limit_price,
             )
             self.submit_order(order)
             self.first_order_submitted = True

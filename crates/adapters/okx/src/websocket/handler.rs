@@ -228,7 +228,7 @@ pub(super) struct OKXWsFeedHandler {
     order_state_cache: AHashMap<ClientOrderId, OrderStateSnapshot>,
     funding_rate_cache: AHashMap<Ustr, (Ustr, u64)>, // Cache (funding_rate, funding_time) by inst_id
     last_account_state: Option<AccountState>,
-    request_id_counter: AtomicU64,
+    request_id_counter: Arc<AtomicU64>,
 }
 
 impl OKXWsFeedHandler {
@@ -245,6 +245,7 @@ impl OKXWsFeedHandler {
         inst_id_code_cache: Arc<DashMap<Ustr, u64>>,
         auth_tracker: AuthTracker,
         subscriptions_state: SubscriptionState,
+        request_id_counter: Arc<AtomicU64>,
     ) -> Self {
         Self {
             clock: get_atomic_clock_realtime(),
@@ -272,7 +273,7 @@ impl OKXWsFeedHandler {
             order_state_cache: AHashMap::new(),
             funding_rate_cache: AHashMap::new(),
             last_account_state: None,
-            request_id_counter: AtomicU64::new(0),
+            request_id_counter,
         }
     }
 
@@ -580,11 +581,14 @@ impl OKXWsFeedHandler {
                                 return Some(msg);
                             }
                         }
-                        OKXWsChannel::OrdersAlgo => {
+                        OKXWsChannel::OrdersAlgo | OKXWsChannel::AlgoAdvance => {
                             if let Some(msg) = self.handle_algo_orders_data(data, ts_init) {
                                 return Some(msg);
                             }
                         }
+
+                        // Handled by data client, not execution
+                        OKXWsChannel::Instruments => {}
                         _ => {
                             if let Some(msg) =
                                 self.handle_other_channel_data(channel, inst_id, data, ts_init)
@@ -604,6 +608,7 @@ impl OKXWsFeedHandler {
                     return Some(NautilusWsMessage::Error(error));
                 }
                 OKXWsMessage::Reconnected => {
+                    self.drain_pending_requests_on_reconnect();
                     return Some(NautilusWsMessage::Reconnected);
                 }
                 OKXWsMessage::Subscription {
@@ -733,6 +738,30 @@ impl OKXWsFeedHandler {
         true
     }
 
+    fn drain_pending_requests_on_reconnect(&mut self) {
+        // Clear pending requests without emitting rejection events.
+        // Requests may have reached OKX before the disconnect, so emitting
+        // false rejections would cause local state to diverge from venue state.
+        // Reconciliation after reconnect will resolve any ambiguous state.
+        let place_count = self.pending_place_requests.len();
+        let cancel_count = self.pending_cancel_requests.len();
+        let amend_count = self.pending_amend_requests.len();
+        let mass_cancel_count = self.pending_mass_cancel_requests.len();
+
+        if place_count + cancel_count + amend_count + mass_cancel_count > 0 {
+            log::warn!(
+                "Clearing {place_count} place, {cancel_count} cancel, \
+                 {amend_count} amend, {mass_cancel_count} mass-cancel \
+                 pending requests on reconnect (may need reconciliation)"
+            );
+        }
+
+        self.pending_place_requests.clear();
+        self.pending_cancel_requests.clear();
+        self.pending_amend_requests.clear();
+        self.pending_mass_cancel_requests.clear();
+    }
+
     fn register_client_order_aliases(
         &self,
         raw_child: &Option<ClientOrderId>,
@@ -799,6 +828,7 @@ impl OKXWsFeedHandler {
                 if final_id.is_none() {
                     final_id = fill_report.client_order_id;
                 }
+
                 if final_id.is_none()
                     && let Some(child) = raw_child.as_ref()
                     && let Some(mapped) = self.client_id_aliases.get(child)
@@ -857,6 +887,7 @@ impl OKXWsFeedHandler {
                         self.active_client_orders.remove(&client_order_id);
                         self.client_id_aliases.remove(&client_order_id);
                     }
+
                     if let Some(linked) = &status_report.linked_order_ids {
                         for child in linked {
                             self.client_id_aliases.remove(child);
@@ -1426,7 +1457,7 @@ impl OKXWsFeedHandler {
             let previous_state =
                 effective_client_id.and_then(|cid| self.order_state_cache.get(&cid).cloned());
 
-            // SAFETY: order_metadata being Some implies effective_client_id is Some
+            // order_metadata being Some implies effective_client_id is Some
             if let (Some((trader_id, strategy_id, _instrument_id)), Some(canonical_client_id)) =
                 (order_metadata, effective_client_id)
             {
@@ -1646,12 +1677,13 @@ impl OKXWsFeedHandler {
                 self.register_client_order_aliases(&raw_child, &parent_from_msg);
 
             match parse_algo_order_msg(msg, self.account_id, &self.instruments_cache, ts_init) {
-                Ok(report) => {
+                Ok(Some(report)) => {
                     let adjusted =
                         self.adjust_execution_report(report, &effective_client_id, &raw_child);
                     self.update_caches_with_report(&adjusted);
                     exec_reports.push(adjusted);
                 }
+                Ok(None) => {}
                 Err(e) => {
                     log::error!("Failed to parse algo order message: {e}");
                 }
@@ -1720,6 +1752,7 @@ impl OKXWsFeedHandler {
                     log::trace!("Received pong from OKX");
                     return None;
                 }
+
                 if text == TEXT_PING {
                     log::trace!("Received ping from OKX (text)");
                     return Some(OKXWsMessage::Ping);
@@ -2500,7 +2533,10 @@ fn create_okx_timeout_error(msg: String) -> OKXWsError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::AtomicBool};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64},
+    };
 
     use dashmap::DashMap;
     use nautilus_model::{
@@ -2544,6 +2580,7 @@ mod tests {
             inst_id_code_cache,
             auth_tracker,
             subscriptions_state,
+            Arc::new(AtomicU64::new(0)),
         );
 
         (handler, out_rx, active_client_orders, client_id_aliases)
@@ -3129,5 +3166,52 @@ mod tests {
             // Should return None when instrument is not in cache
             assert!(result.is_none());
         }
+    }
+
+    #[rstest]
+    fn test_drain_pending_requests_on_reconnect_clears_without_rejections() {
+        let (mut handler, _out_rx, _active, _aliases) = create_test_handler();
+
+        let trader_id = TraderId::new("TRADER-001");
+        let strategy_id = StrategyId::new("STRATEGY-001");
+        let instrument_id = InstrumentId::from("BTC-USDT-SWAP.OKX");
+        let cancel_client_id = ClientOrderId::new("CANCEL-001");
+        let amend_client_id = ClientOrderId::new("AMEND-001");
+
+        handler.pending_cancel_requests.insert(
+            "cancel-req-1".to_string(),
+            (
+                cancel_client_id,
+                trader_id,
+                strategy_id,
+                instrument_id,
+                Some(VenueOrderId::new("VENUE-001")),
+            ),
+        );
+
+        handler.pending_amend_requests.insert(
+            "amend-req-1".to_string(),
+            (
+                amend_client_id,
+                trader_id,
+                strategy_id,
+                instrument_id,
+                Some(VenueOrderId::new("VENUE-002")),
+            ),
+        );
+
+        handler
+            .pending_mass_cancel_requests
+            .insert("mass-req-1".to_string(), instrument_id);
+
+        handler.drain_pending_requests_on_reconnect();
+
+        assert!(handler.pending_place_requests.is_empty());
+        assert!(handler.pending_cancel_requests.is_empty());
+        assert!(handler.pending_amend_requests.is_empty());
+        assert!(handler.pending_mass_cancel_requests.is_empty());
+
+        // No rejection events emitted, reconciliation handles ambiguous state
+        assert!(handler.pending_messages.is_empty());
     }
 }

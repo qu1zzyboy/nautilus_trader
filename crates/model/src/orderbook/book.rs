@@ -201,6 +201,7 @@ impl OrderBook {
 
         // Collect prices to remove for asks (prices <= best_bid)
         let mut ask_prices_to_remove = Vec::new();
+
         if clear_asks {
             for bp in self.asks.levels.keys() {
                 if bp.value <= best_bid {
@@ -213,6 +214,7 @@ impl OrderBook {
 
         // Collect prices to remove for bids (prices >= best_ask)
         let mut bid_prices_to_remove = Vec::new();
+
         if clear_bids {
             for bp in self.bids.levels.keys() {
                 if bp.value >= best_ask {
@@ -397,6 +399,7 @@ impl OrderBook {
 
         // Set F_LAST on clear when book is empty so buffered consumers flush
         let mut clear = OrderBookDelta::clear(self.instrument_id, self.sequence, ts_event, ts_init);
+
         if total_orders == 0 {
             clear.flags |= RecordFlag::F_LAST as u8;
         }
@@ -868,6 +871,17 @@ impl OrderBook {
         analysis::get_avg_px_for_quantity(qty, levels)
     }
 
+    /// Calculates the worst (last-touched) price to fill the specified quantity.
+    #[must_use]
+    pub fn get_worst_px_for_quantity(&self, qty: Quantity, order_side: OrderSide) -> Option<Price> {
+        let levels = match order_side.as_specified() {
+            OrderSideSpecified::Buy => &self.asks.levels,
+            OrderSideSpecified::Sell => &self.bids.levels,
+        };
+
+        analysis::get_worst_px_for_quantity(qty, levels)
+    }
+
     /// Calculates average price and quantity for target exposure. Returns (price, quantity, executed_exposure).
     #[must_use]
     pub fn get_avg_px_qty_for_exposure(
@@ -972,6 +986,7 @@ impl OrderBook {
                 self.instrument_id
             );
         }
+
         if ts_event < self.ts_last {
             log::warn!(
                 "Out-of-order update: ts_event {} < {} (instrument_id={})",

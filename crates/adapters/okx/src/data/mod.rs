@@ -142,6 +142,7 @@ impl OKXDataClient {
 
         if let Some(vip_level) = config.vip_level {
             ws_public.set_vip_level(vip_level);
+
             if let Some(ref ws) = ws_business {
                 ws.set_vip_level(vip_level);
             }
@@ -341,6 +342,10 @@ impl DataClient for OKXDataClient {
             return Ok(());
         }
 
+        // Create fresh token so tasks from a previous connection cycle are not
+        // immediately cancelled (the old token may already be in cancelled state)
+        self.cancellation_token = CancellationToken::new();
+
         let instrument_types = if self.config.instrument_types.is_empty() {
             vec![OKXInstrumentType::Spot]
         } else {
@@ -476,6 +481,7 @@ impl DataClient for OKXDataClient {
         {
             log::warn!("Failed to unsubscribe all from public websocket: {e:?}");
         }
+
         if let Some(ref ws) = self.ws_business
             && let Err(e) = ws.unsubscribe_all().await
         {
@@ -488,6 +494,7 @@ impl DataClient for OKXDataClient {
         if let Some(ref mut ws) = self.ws_public {
             let _ = ws.close().await;
         }
+
         if let Some(ref mut ws) = self.ws_business {
             let _ = ws.close().await;
         }
@@ -1041,6 +1048,7 @@ impl DataClient for OKXDataClient {
                         clock.get_time_ns(),
                         params,
                     ));
+
                     if let Err(e) = sender.send(DataEvent::Response(response)) {
                         log::error!("Failed to send trades response: {e}");
                     }
@@ -1083,6 +1091,7 @@ impl DataClient for OKXDataClient {
                         clock.get_time_ns(),
                         params,
                     ));
+
                     if let Err(e) = sender.send(DataEvent::Response(response)) {
                         log::error!("Failed to send bars response: {e}");
                     }

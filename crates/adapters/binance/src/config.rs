@@ -26,6 +26,10 @@ use crate::common::enums::{BinanceEnvironment, BinanceProductType};
 ///
 /// Ed25519 API keys are required for SBE WebSocket streams.
 #[derive(Clone, Debug)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.binance", from_py_object)
+)]
 pub struct BinanceDataClientConfig {
     /// Product types to subscribe to.
     pub product_types: Vec<BinanceProductType>,
@@ -66,6 +70,10 @@ impl ClientConfig for BinanceDataClientConfig {
 /// listenKey-based user data streams in favor of WebSocket API authentication,
 /// which only supports Ed25519.
 #[derive(Clone, Debug)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.binance", from_py_object)
+)]
 pub struct BinanceExecClientConfig {
     /// Trader ID for the client.
     pub trader_id: TraderId,

@@ -299,6 +299,46 @@ impl HyperliquidHttpClient {
         })
     }
 
+    #[pyo3(name = "modify_order")]
+    #[allow(clippy::too_many_arguments)]
+    fn py_modify_order<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+        venue_order_id: VenueOrderId,
+        order_side: OrderSide,
+        order_type: OrderType,
+        price: Price,
+        quantity: Quantity,
+        trigger_price: Option<Price>,
+        reduce_only: bool,
+        post_only: bool,
+        time_in_force: TimeInForce,
+        client_order_id: Option<ClientOrderId>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .modify_order(
+                    instrument_id,
+                    venue_order_id,
+                    order_side,
+                    order_type,
+                    price,
+                    quantity,
+                    trigger_price,
+                    reduce_only,
+                    post_only,
+                    time_in_force,
+                    client_order_id,
+                )
+                .await
+                .map_err(to_pyvalue_err)?;
+            Ok(())
+        })
+    }
+
     #[pyo3(name = "submit_orders")]
     fn py_submit_orders<'py>(
         &self,
@@ -431,19 +471,5 @@ impl HyperliquidHttpClient {
                 .map_err(to_pyvalue_err)?;
             to_string(&json).map_err(to_pyvalue_err)
         })
-    }
-
-    /// Returns the current builder maker fee in tenths of a basis point.
-    #[pyo3(name = "builder_maker_tenths_bp")]
-    fn py_builder_maker_tenths_bp(&self) -> u32 {
-        self.builder_maker_tenths_bp()
-    }
-
-    /// Updates the builder maker fee tier from the HL effective maker rate.
-    ///
-    /// Returns `(old_tenths, new_tenths)`.
-    #[pyo3(name = "update_builder_maker_fee")]
-    fn py_update_builder_maker_fee(&self, user_add_rate: f64) -> (u32, u32) {
-        self.update_builder_maker_fee(user_add_rate)
     }
 }
