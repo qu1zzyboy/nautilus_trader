@@ -475,12 +475,15 @@ impl BinanceFuturesExecWsFeedHandler {
             Some(Money::new(commission, commission_currency)),
         );
 
-        // Clean up if fully filled
+        // Clean up if fully filled. For algo orders, keep in active_orders until we process
+        // ALGO_ORDER_UPDATE Triggered/Finished so get_order_context still finds strategy_id.
         if leaves_qty <= 0.0 {
-            self.active_orders.remove(&client_order_id);
-            log::debug!(
-                "Order fully filled: client_order_id={client_order_id}, venue_order_id={venue_order_id}"
-            );
+            if !self.algo_client_order_ids.contains(&client_order_id) {
+                self.active_orders.remove(&client_order_id);
+                log::debug!(
+                    "Order fully filled: client_order_id={client_order_id}, venue_order_id={venue_order_id}"
+                );
+            }
         }
 
         Some(NautilusExecWsMessage::OrderFilled(event))
@@ -584,45 +587,10 @@ impl BinanceFuturesExecWsFeedHandler {
                     algo_data.symbol
                 );
 
-                let Some(actual_order_id) = algo_data
-                    .actual_order_id
-                    .as_ref()
-                    .filter(|s| !s.is_empty())
-                else {
-                    log::warn!(
-                        "Algo order triggered but no valid actual_order_id: client_order_id={client_order_id}"
-                    );
-                    return None;
-                };
-
-                let new_venue_order_id = VenueOrderId::new(actual_order_id.clone());
-
-                let symbol_key = Ustr::from(algo_data.symbol.as_str());
-                let size_precision =
-                    self.instruments_cache
-                        .get(&symbol_key)
-                        .map_or(8, |inst| inst.quantity_precision()) as u8;
-
-                let quantity: f64 = algo_data.quantity.parse().unwrap_or(0.0);
-
-                let event = OrderUpdated::new(
-                    trader_id,
-                    strategy_id,
-                    instrument_id,
-                    client_order_id,
-                    Quantity::new(quantity, size_precision),
-                    UUID4::new(),
-                    ts_event,
-                    ts_init,
-                    false,
-                    Some(new_venue_order_id),
-                    Some(self.account_id),
-                    None,
-                    None,
-                    None,
-                );
-
-                Some(NautilusExecWsMessage::OrderUpdated(event))
+                // Do not emit OrderUpdated (order is already FILLED via ORDER_TRADE_UPDATE).
+                // Do not remove from active_orders here; cleanup is done in Finished (and Canceled/Expired/Rejected)
+                // so that get_order_context still finds the order when those run.
+                None
             }
             BinanceAlgoStatus::Canceled => {
                 self.algo_client_order_ids.remove(&client_order_id);
