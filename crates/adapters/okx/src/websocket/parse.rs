@@ -22,8 +22,8 @@ use nautilus_core::{UUID4, nanos::UnixNanos};
 use nautilus_model::{
     data::{
         Bar, BarSpecification, BarType, BookOrder, Data, FundingRateUpdate, IndexPriceUpdate,
-        MarkPriceUpdate, OrderBookDelta, OrderBookDeltas, OrderBookDeltas_API, OrderBookDepth10,
-        QuoteTick, TradeTick, depth::DEPTH10_LEN,
+        InstrumentStatus, MarkPriceUpdate, OrderBookDelta, OrderBookDeltas, OrderBookDeltas_API,
+        OrderBookDepth10, QuoteTick, TradeTick, depth::DEPTH10_LEN,
     },
     enums::{
         AggregationSource, AggressorSide, BookAction, LiquiditySide, OrderSide, OrderStatus,
@@ -51,14 +51,16 @@ use crate::{
     common::{
         consts::{OKX_POST_ONLY_CANCEL_REASON, OKX_POST_ONLY_CANCEL_SOURCE},
         enums::{
-            OKXAlgoOrderType, OKXBookAction, OKXCandleConfirm, OKXInstrumentType, OKXOrderCategory,
-            OKXOrderStatus, OKXOrderType, OKXSide, OKXTargetCurrency, OKXTriggerType,
+            OKXAlgoOrderType, OKXBookAction, OKXCandleConfirm, OKXInstrumentStatus,
+            OKXInstrumentType, OKXOrderCategory, OKXOrderStatus, OKXOrderType, OKXSide,
+            OKXTargetCurrency, OKXTriggerType,
         },
         models::OKXInstrument,
         parse::{
-            determine_order_type, is_market_price, okx_channel_to_bar_spec, parse_client_order_id,
-            parse_fee, parse_fee_currency, parse_funding_rate_msg, parse_instrument_any,
-            parse_message_vec, parse_millisecond_timestamp, parse_price, parse_quantity,
+            determine_order_type, is_market_price, okx_channel_to_bar_spec,
+            okx_status_to_market_action, parse_client_order_id, parse_fee, parse_fee_currency,
+            parse_funding_rate_msg, parse_instrument_any, parse_message_vec,
+            parse_millisecond_timestamp, parse_price, parse_quantity,
         },
     },
     websocket::messages::{ExecutionReport, NautilusWsMessage, OKXFundingRateMsg},
@@ -68,7 +70,7 @@ use crate::{
 ///
 /// Returns a tuple of (margin_init, margin_maint, maker_fee, taker_fee).
 /// All values are None if the instrument type doesn't support fees.
-fn extract_fees_from_cached_instrument(
+pub(crate) fn extract_fees_from_cached_instrument(
     instrument: &InstrumentAny,
 ) -> (
     Option<Decimal>,
@@ -1469,6 +1471,12 @@ pub fn parse_fill_report(
 
             // Calculate incremental fill as: current_total - previous_total
             if let Some(prev_qty) = previous_filled_qty {
+                if current_filled < prev_qty {
+                    anyhow::bail!(
+                        "Cumulative fill went backwards: acc_fill_sz='{acc_fill_sz}' < previous_filled_qty={prev_qty} \
+                         (possible stale data after reconnect)"
+                    );
+                }
                 let incremental = current_filled - prev_qty;
                 if incremental.is_zero() {
                     anyhow::bail!(
@@ -1506,34 +1514,44 @@ pub fn parse_fill_report(
 
     // OKX sends cumulative fees, so we subtract the previous total to get this fill's fee
     let commission = if let Some(previous_fee) = previous_fee {
-        let incremental = total_fee - previous_fee;
+        if total_fee.currency == previous_fee.currency {
+            let incremental = total_fee - previous_fee;
 
-        if incremental < Money::zero(fee_currency) {
-            log::debug!(
-                "Negative incremental fee detected - likely a maker rebate or fee refund: order_id={}, total_fee={}, previous_fee={}, incremental={}",
-                msg.ord_id.as_str(),
-                total_fee,
-                previous_fee,
-                incremental,
-            );
-        }
+            if incremental < Money::zero(fee_currency) {
+                log::debug!(
+                    "Negative incremental fee detected - likely a maker rebate or fee refund: order_id={}, total_fee={}, previous_fee={}, incremental={}",
+                    msg.ord_id.as_str(),
+                    total_fee,
+                    previous_fee,
+                    incremental,
+                );
+            }
 
-        // Skip corruption check when previous is negative (rebate), as transitions from
-        // rebate to charge legitimately have incremental > total (e.g., -1 → +2 gives +3)
-        if previous_fee >= Money::zero(fee_currency)
-            && total_fee > Money::zero(fee_currency)
-            && incremental > total_fee
-        {
-            log::error!(
-                "Incremental fee exceeds total fee - likely fee cache corruption, using total fee as fallback: order_id={}, total_fee={}, previous_fee={}, incremental={}",
+            // Skip corruption check when previous is negative (rebate), as transitions from
+            // rebate to charge legitimately have incremental > total (e.g., -1 → +2 gives +3)
+            if previous_fee >= Money::zero(fee_currency)
+                && total_fee > Money::zero(fee_currency)
+                && incremental > total_fee
+            {
+                log::error!(
+                    "Incremental fee exceeds total fee - likely fee cache corruption, using total fee as fallback: order_id={}, total_fee={}, previous_fee={}, incremental={}",
+                    msg.ord_id.as_str(),
+                    total_fee,
+                    previous_fee,
+                    incremental,
+                );
+                total_fee
+            } else {
+                incremental
+            }
+        } else {
+            log::warn!(
+                "Fee currency changed from {} to {} for order_id={}, using total fee as commission",
+                previous_fee.currency.code,
+                total_fee.currency.code,
                 msg.ord_id.as_str(),
-                total_fee,
-                previous_fee,
-                incremental,
             );
             total_fee
-        } else {
-            incremental
         }
     } else {
         total_fee
@@ -1625,6 +1643,8 @@ pub fn parse_ws_message_data(
                         extract_fees_from_cached_instrument,
                     );
 
+                let status_action = okx_status_to_market_action(msg.state);
+
                 match parse_instrument_any(
                     &msg,
                     margin_init,
@@ -1633,7 +1653,23 @@ pub fn parse_ws_message_data(
                     taker_fee,
                     ts_init,
                 )? {
-                    Some(inst_any) => Ok(Some(NautilusWsMessage::Instrument(Box::new(inst_any)))),
+                    Some(inst_any) => {
+                        let status = InstrumentStatus::new(
+                            inst_any.id(),
+                            status_action,
+                            ts_init,
+                            ts_init,
+                            None,
+                            None,
+                            Some(matches!(msg.state, OKXInstrumentStatus::Live)),
+                            None,
+                            None,
+                        );
+                        Ok(Some(NautilusWsMessage::Instrument(
+                            Box::new(inst_any),
+                            Some(status),
+                        )))
+                    }
                     None => {
                         log::warn!("Empty instrument payload: {msg:?}");
                         Ok(None)
@@ -3021,6 +3057,34 @@ mod tests {
     }
 
     #[rstest]
+    fn test_parse_fill_report_fee_currency_change_no_panic() {
+        let instrument = create_stub_instrument();
+        let account_id = AccountId::new("OKX-001");
+        let ts_init = UnixNanos::default();
+
+        // First fill charged in USDT
+        let previous_fee = Money::new(1.0, Currency::USDT());
+
+        // Second fill charged in BTC (fee currency changed)
+        let mut order_msg =
+            create_stub_order_msg("0.01", Some("0.02".to_string()), "1234567890", "trade_2");
+        order_msg.fee = Some("-0.00005".to_string());
+        order_msg.fee_ccy = Ustr::from("BTC");
+
+        let result = parse_fill_report(
+            &order_msg,
+            &InstrumentAny::CryptoPerpetual(instrument),
+            account_id,
+            Some(previous_fee),
+            Some(Quantity::from("0.01")),
+            ts_init,
+        );
+
+        let fill_report = result.unwrap();
+        assert_eq!(fill_report.commission.currency, Currency::BTC());
+    }
+
+    #[rstest]
     fn test_parse_fill_report_empty_fill_sz_first_fill() {
         let instrument = create_stub_instrument();
         let account_id = AccountId::new("OKX-001");
@@ -3123,6 +3187,30 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("Cannot determine fill quantity"));
         assert!(err_msg.contains("acc_fill_sz is None"));
+    }
+
+    #[rstest]
+    fn test_parse_fill_report_error_acc_fill_sz_less_than_previous() {
+        let instrument = create_stub_instrument();
+        let account_id = AccountId::new("OKX-001");
+        let ts_init = UnixNanos::default();
+
+        // acc_fill_sz (0.01) < previous_filled_qty (0.03) — stale data after reconnect
+        let order_msg =
+            create_stub_order_msg("", Some("0.01".to_string()), "1234567890", "trade_2");
+
+        let result = parse_fill_report(
+            &order_msg,
+            &InstrumentAny::CryptoPerpetual(instrument),
+            account_id,
+            None,
+            Some(Quantity::from("0.03")),
+            ts_init,
+        );
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Cumulative fill went backwards"));
     }
 
     #[rstest]
@@ -3838,7 +3926,7 @@ mod tests {
         .expect("Failed to parse WebSocket instrument update");
 
         // Verify the update preserves the cached fees
-        if let Some(NautilusWsMessage::Instrument(boxed_inst)) = result {
+        if let Some(NautilusWsMessage::Instrument(boxed_inst, _status)) = result {
             if let InstrumentAny::CurrencyPair(pair) = *boxed_inst {
                 assert_eq!(
                     pair.maker_fee,
@@ -4879,5 +4967,216 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Empty asks"));
+    }
+
+    #[rstest]
+    fn test_parse_instruments_channel_produces_status() {
+        use nautilus_model::{enums::MarketStatusAction, identifiers::InstrumentId};
+
+        use crate::common::{models::OKXInstrument, parse::parse_instrument_any};
+
+        let ts_init = UnixNanos::default();
+
+        // Build a cached instrument with fees
+        let inst_json = serde_json::json!({
+            "instType": "SPOT",
+            "instId": "BTC-USD",
+            "baseCcy": "BTC",
+            "quoteCcy": "USD",
+            "settleCcy": "",
+            "ctVal": "",
+            "ctMult": "",
+            "ctValCcy": "",
+            "optType": "",
+            "stk": "",
+            "listTime": "1733454000000",
+            "expTime": "",
+            "lever": "",
+            "tickSz": "0.1",
+            "lotSz": "0.00000001",
+            "minSz": "0.00001",
+            "ctType": "",
+            "state": "live",
+            "ruleType": "normal",
+            "maxLmtSz": "9999999999",
+            "maxMktSz": "1000000",
+            "maxLmtAmt": "20000000",
+            "maxMktAmt": "1000000",
+            "maxTwapSz": "9999999999",
+            "maxIcebergSz": "9999999999",
+            "maxTriggerSz": "9999999999",
+            "maxStopSz": "1000000",
+            "uly": "",
+            "instFamily": ""
+        });
+        let initial: OKXInstrument = serde_json::from_value(inst_json).unwrap();
+        let parsed = parse_instrument_any(&initial, None, None, None, None, ts_init)
+            .unwrap()
+            .unwrap();
+
+        let mut instruments_cache = AHashMap::new();
+        instruments_cache.insert(Ustr::from("BTC-USD"), parsed);
+
+        let ws_data = serde_json::json!({
+            "instType": "SPOT",
+            "instId": "BTC-USD",
+            "baseCcy": "BTC",
+            "quoteCcy": "USD",
+            "settleCcy": "",
+            "ctVal": "",
+            "ctMult": "",
+            "ctValCcy": "",
+            "optType": "",
+            "stk": "",
+            "listTime": "1733454000000",
+            "expTime": "",
+            "lever": "",
+            "tickSz": "0.1",
+            "lotSz": "0.00000001",
+            "minSz": "0.00001",
+            "ctType": "",
+            "state": "live",
+            "ruleType": "normal",
+            "maxLmtSz": "9999999999",
+            "maxMktSz": "1000000",
+            "maxLmtAmt": "20000000",
+            "maxMktAmt": "1000000",
+            "maxTwapSz": "9999999999",
+            "maxIcebergSz": "9999999999",
+            "maxTriggerSz": "9999999999",
+            "maxStopSz": "1000000",
+            "uly": "",
+            "instFamily": ""
+        });
+
+        let instrument_id = InstrumentId::from("BTC-USD.OKX");
+        let mut funding_cache = AHashMap::new();
+
+        let result = parse_ws_message_data(
+            &OKXWsChannel::Instruments,
+            ws_data,
+            &instrument_id,
+            2,
+            8,
+            ts_init,
+            &mut funding_cache,
+            &instruments_cache,
+        )
+        .expect("Failed to parse instruments channel");
+
+        match result {
+            Some(NautilusWsMessage::Instrument(inst, status)) => {
+                assert_eq!(inst.id(), InstrumentId::from("BTC-USD.OKX"));
+                let status = status.expect("Expected InstrumentStatus");
+                assert_eq!(status.action, MarketStatusAction::Trading);
+                assert_eq!(status.is_trading, Some(true));
+            }
+            other => panic!("Expected Instrument with status, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_parse_instruments_channel_suspend_status() {
+        use nautilus_model::{enums::MarketStatusAction, identifiers::InstrumentId};
+
+        use crate::common::{models::OKXInstrument, parse::parse_instrument_any};
+
+        let ts_init = UnixNanos::default();
+
+        let inst_json = serde_json::json!({
+            "instType": "SPOT",
+            "instId": "BTC-USD",
+            "baseCcy": "BTC",
+            "quoteCcy": "USD",
+            "settleCcy": "",
+            "ctVal": "",
+            "ctMult": "",
+            "ctValCcy": "",
+            "optType": "",
+            "stk": "",
+            "listTime": "1733454000000",
+            "expTime": "",
+            "lever": "",
+            "tickSz": "0.1",
+            "lotSz": "0.00000001",
+            "minSz": "0.00001",
+            "ctType": "",
+            "state": "live",
+            "ruleType": "normal",
+            "maxLmtSz": "9999999999",
+            "maxMktSz": "1000000",
+            "maxLmtAmt": "20000000",
+            "maxMktAmt": "1000000",
+            "maxTwapSz": "9999999999",
+            "maxIcebergSz": "9999999999",
+            "maxTriggerSz": "9999999999",
+            "maxStopSz": "1000000",
+            "uly": "",
+            "instFamily": ""
+        });
+        let initial: OKXInstrument = serde_json::from_value(inst_json).unwrap();
+        let parsed = parse_instrument_any(&initial, None, None, None, None, ts_init)
+            .unwrap()
+            .unwrap();
+
+        let mut instruments_cache = AHashMap::new();
+        instruments_cache.insert(Ustr::from("BTC-USD"), parsed);
+
+        // WS update with suspend state
+        let ws_data = serde_json::json!({
+            "instType": "SPOT",
+            "instId": "BTC-USD",
+            "baseCcy": "BTC",
+            "quoteCcy": "USD",
+            "settleCcy": "",
+            "ctVal": "",
+            "ctMult": "",
+            "ctValCcy": "",
+            "optType": "",
+            "stk": "",
+            "listTime": "1733454000000",
+            "expTime": "",
+            "lever": "",
+            "tickSz": "0.1",
+            "lotSz": "0.00000001",
+            "minSz": "0.00001",
+            "ctType": "",
+            "state": "suspend",
+            "ruleType": "normal",
+            "maxLmtSz": "9999999999",
+            "maxMktSz": "1000000",
+            "maxLmtAmt": "20000000",
+            "maxMktAmt": "1000000",
+            "maxTwapSz": "9999999999",
+            "maxIcebergSz": "9999999999",
+            "maxTriggerSz": "9999999999",
+            "maxStopSz": "1000000",
+            "uly": "",
+            "instFamily": ""
+        });
+
+        let instrument_id = InstrumentId::from("BTC-USD.OKX");
+        let mut funding_cache = AHashMap::new();
+
+        let result = parse_ws_message_data(
+            &OKXWsChannel::Instruments,
+            ws_data,
+            &instrument_id,
+            2,
+            8,
+            ts_init,
+            &mut funding_cache,
+            &instruments_cache,
+        )
+        .expect("Failed to parse instruments channel");
+
+        match result {
+            Some(NautilusWsMessage::Instrument(_, status)) => {
+                let status = status.expect("Expected InstrumentStatus");
+                assert_eq!(status.action, MarketStatusAction::Suspend);
+                assert_eq!(status.is_trading, Some(false));
+            }
+            other => panic!("Expected Instrument with status, was {other:?}"),
+        }
     }
 }
