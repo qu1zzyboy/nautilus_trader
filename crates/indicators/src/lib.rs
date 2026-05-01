@@ -61,6 +61,7 @@
 
 pub mod average;
 pub mod book;
+pub mod harmony;
 pub mod indicator;
 pub mod momentum;
 pub mod ratio;
