@@ -648,9 +648,6 @@ pub enum BinanceWsEventType {
     MarkPriceUpdate,
     /// Kline/candlestick event.
     Kline,
-    /// Continuous contract kline/candlestick event.
-    #[serde(rename = "continuous_kline")]
-    ContinuousKline,
     /// Forced liquidation order event.
     ForceOrder,
     /// 24-hour rolling ticker event.
@@ -699,7 +696,6 @@ impl BinanceWsEventType {
             Self::DepthUpdate => "depthUpdate",
             Self::MarkPriceUpdate => "markPriceUpdate",
             Self::Kline => "kline",
-            Self::ContinuousKline => "continuous_kline",
             Self::ForceOrder => "forceOrder",
             Self::Ticker24Hr => "24hrTicker",
             Self::MiniTicker24Hr => "24hrMiniTicker",
