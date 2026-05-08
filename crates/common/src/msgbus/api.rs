@@ -23,7 +23,7 @@
 //! - Publishing messages to subscribers.
 //! - Sending messages to endpoints.
 
-use std::{any::Any, cell::RefCell, rc::Rc, thread::LocalKey};
+use std::{any::Any, cell::RefCell, thread::LocalKey};
 
 use nautilus_core::UUID4;
 #[cfg(feature = "defi")]
@@ -34,6 +34,7 @@ use nautilus_model::{
     data::{
         Bar, Data, FundingRateUpdate, GreeksData, IndexPriceUpdate, MarkPriceUpdate,
         OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
+        option_chain::{OptionChainSlice, OptionGreeks},
     },
     events::{AccountState, OrderEventAny, PositionEvent},
     orderbook::OrderBook,
@@ -46,8 +47,8 @@ use ustr::Ustr;
 use super::{
     ACCOUNT_STATE_HANDLERS, ANY_HANDLERS, BAR_HANDLERS, BOOK_HANDLERS, DELTAS_HANDLERS,
     DEPTH10_HANDLERS, FUNDING_RATE_HANDLERS, GREEKS_HANDLERS, HANDLER_BUFFER_CAP,
-    INDEX_PRICE_HANDLERS, MARK_PRICE_HANDLERS, MESSAGE_BUS, ORDER_EVENT_HANDLERS,
-    POSITION_EVENT_HANDLERS, QUOTE_HANDLERS, TRADE_HANDLERS,
+    INDEX_PRICE_HANDLERS, MARK_PRICE_HANDLERS, OPTION_CHAIN_HANDLERS, OPTION_GREEKS_HANDLERS,
+    ORDER_EVENT_HANDLERS, POSITION_EVENT_HANDLERS, QUOTE_HANDLERS, TRADE_HANDLERS,
     core::{MessageBus, Subscription},
     get_message_bus,
     matching::is_matching_backtracking,
@@ -202,6 +203,13 @@ pub fn deregister_any(endpoint: MStr<Endpoint>) {
         .shift_remove(&endpoint);
 }
 
+/// Returns whether an endpoint handler is registered for the given endpoint name.
+#[must_use]
+pub fn has_endpoint(endpoint: &str) -> bool {
+    let key: MStr<Endpoint> = Ustr::from(endpoint).into();
+    get_message_bus().borrow().get_endpoint(key).is_some()
+}
+
 /// Subscribes a handler to a pattern using runtime type dispatch (Any).
 ///
 /// # Warnings
@@ -215,7 +223,7 @@ pub fn deregister_any(endpoint: MStr<Endpoint>) {
 pub fn subscribe_any(
     pattern: MStr<Pattern>,
     handler: ShareableMessageHandler,
-    priority: Option<u8>,
+    priority: Option<u32>,
 ) {
     let msgbus = get_message_bus();
     let mut msgbus_ref_mut = msgbus.borrow_mut();
@@ -247,7 +255,7 @@ pub fn subscribe_any(
 pub fn subscribe_instruments(
     pattern: MStr<Pattern>,
     handler: ShareableMessageHandler,
-    priority: Option<u8>,
+    priority: Option<u32>,
 ) {
     subscribe_any(pattern, handler, priority);
 }
@@ -256,7 +264,7 @@ pub fn subscribe_instruments(
 pub fn subscribe_instrument_close(
     pattern: MStr<Pattern>,
     handler: ShareableMessageHandler,
-    priority: Option<u8>,
+    priority: Option<u32>,
 ) {
     subscribe_any(pattern, handler, priority);
 }
@@ -265,7 +273,7 @@ pub fn subscribe_instrument_close(
 pub fn subscribe_book_deltas(
     pattern: MStr<Pattern>,
     handler: TypedHandler<OrderBookDeltas>,
-    priority: Option<u8>,
+    priority: Option<u32>,
 ) {
     get_message_bus()
         .borrow_mut()
@@ -277,7 +285,7 @@ pub fn subscribe_book_deltas(
 pub fn subscribe_book_depth10(
     pattern: MStr<Pattern>,
     handler: TypedHandler<OrderBookDepth10>,
-    priority: Option<u8>,
+    priority: Option<u32>,
 ) {
     get_message_bus().borrow_mut().router_depth10.subscribe(
         pattern,
@@ -290,7 +298,7 @@ pub fn subscribe_book_depth10(
 pub fn subscribe_book_snapshots(
     pattern: MStr<Pattern>,
     handler: TypedHandler<OrderBook>,
-    priority: Option<u8>,
+    priority: Option<u32>,
 ) {
     get_message_bus()
         .borrow_mut()
@@ -302,7 +310,7 @@ pub fn subscribe_book_snapshots(
 pub fn subscribe_quotes(
     pattern: MStr<Pattern>,
     handler: TypedHandler<QuoteTick>,
-    priority: Option<u8>,
+    priority: Option<u32>,
 ) {
     get_message_bus()
         .borrow_mut()
@@ -314,7 +322,7 @@ pub fn subscribe_quotes(
 pub fn subscribe_trades(
     pattern: MStr<Pattern>,
     handler: TypedHandler<TradeTick>,
-    priority: Option<u8>,
+    priority: Option<u32>,
 ) {
     get_message_bus()
         .borrow_mut()
@@ -323,7 +331,7 @@ pub fn subscribe_trades(
 }
 
 /// Subscribes a handler to bars matching a pattern.
-pub fn subscribe_bars(pattern: MStr<Pattern>, handler: TypedHandler<Bar>, priority: Option<u8>) {
+pub fn subscribe_bars(pattern: MStr<Pattern>, handler: TypedHandler<Bar>, priority: Option<u32>) {
     get_message_bus()
         .borrow_mut()
         .router_bars
@@ -334,7 +342,7 @@ pub fn subscribe_bars(pattern: MStr<Pattern>, handler: TypedHandler<Bar>, priori
 pub fn subscribe_mark_prices(
     pattern: MStr<Pattern>,
     handler: TypedHandler<MarkPriceUpdate>,
-    priority: Option<u8>,
+    priority: Option<u32>,
 ) {
     get_message_bus().borrow_mut().router_mark_prices.subscribe(
         pattern,
@@ -347,7 +355,7 @@ pub fn subscribe_mark_prices(
 pub fn subscribe_index_prices(
     pattern: MStr<Pattern>,
     handler: TypedHandler<IndexPriceUpdate>,
-    priority: Option<u8>,
+    priority: Option<u32>,
 ) {
     get_message_bus()
         .borrow_mut()
@@ -359,7 +367,7 @@ pub fn subscribe_index_prices(
 pub fn subscribe_funding_rates(
     pattern: MStr<Pattern>,
     handler: TypedHandler<FundingRateUpdate>,
-    priority: Option<u8>,
+    priority: Option<u32>,
 ) {
     get_message_bus()
         .borrow_mut()
@@ -371,7 +379,7 @@ pub fn subscribe_funding_rates(
 pub fn subscribe_greeks(
     pattern: MStr<Pattern>,
     handler: TypedHandler<GreeksData>,
-    priority: Option<u8>,
+    priority: Option<u32>,
 ) {
     get_message_bus()
         .borrow_mut()
@@ -379,11 +387,35 @@ pub fn subscribe_greeks(
         .subscribe(pattern, handler, priority.unwrap_or(0));
 }
 
+/// Subscribes a handler to option greeks updates matching a pattern.
+pub fn subscribe_option_greeks(
+    pattern: MStr<Pattern>,
+    handler: TypedHandler<OptionGreeks>,
+    priority: Option<u32>,
+) {
+    get_message_bus()
+        .borrow_mut()
+        .router_option_greeks
+        .subscribe(pattern, handler, priority.unwrap_or(0));
+}
+
+/// Subscribes a handler to option chain slice updates matching a pattern.
+pub fn subscribe_option_chain(
+    pattern: MStr<Pattern>,
+    handler: TypedHandler<OptionChainSlice>,
+    priority: Option<u32>,
+) {
+    get_message_bus()
+        .borrow_mut()
+        .router_option_chain
+        .subscribe(pattern, handler, priority.unwrap_or(0));
+}
+
 /// Subscribes a handler to order events matching a pattern.
 pub fn subscribe_order_events(
     pattern: MStr<Pattern>,
     handler: TypedHandler<OrderEventAny>,
-    priority: Option<u8>,
+    priority: Option<u32>,
 ) {
     get_message_bus()
         .borrow_mut()
@@ -395,7 +427,7 @@ pub fn subscribe_order_events(
 pub fn subscribe_position_events(
     pattern: MStr<Pattern>,
     handler: TypedHandler<PositionEvent>,
-    priority: Option<u8>,
+    priority: Option<u32>,
 ) {
     get_message_bus()
         .borrow_mut()
@@ -407,7 +439,7 @@ pub fn subscribe_position_events(
 pub fn subscribe_account_state(
     pattern: MStr<Pattern>,
     handler: TypedHandler<AccountState>,
-    priority: Option<u8>,
+    priority: Option<u32>,
 ) {
     get_message_bus()
         .borrow_mut()
@@ -419,7 +451,7 @@ pub fn subscribe_account_state(
 pub fn subscribe_positions(
     pattern: MStr<Pattern>,
     handler: TypedHandler<Position>,
-    priority: Option<u8>,
+    priority: Option<u32>,
 ) {
     get_message_bus().borrow_mut().router_positions.subscribe(
         pattern,
@@ -433,7 +465,7 @@ pub fn subscribe_positions(
 pub fn subscribe_defi_blocks(
     pattern: MStr<Pattern>,
     handler: TypedHandler<Block>,
-    priority: Option<u8>,
+    priority: Option<u32>,
 ) {
     get_message_bus().borrow_mut().router_defi_blocks.subscribe(
         pattern,
@@ -447,7 +479,7 @@ pub fn subscribe_defi_blocks(
 pub fn subscribe_defi_pools(
     pattern: MStr<Pattern>,
     handler: TypedHandler<Pool>,
-    priority: Option<u8>,
+    priority: Option<u32>,
 ) {
     get_message_bus().borrow_mut().router_defi_pools.subscribe(
         pattern,
@@ -461,7 +493,7 @@ pub fn subscribe_defi_pools(
 pub fn subscribe_defi_swaps(
     pattern: MStr<Pattern>,
     handler: TypedHandler<PoolSwap>,
-    priority: Option<u8>,
+    priority: Option<u32>,
 ) {
     get_message_bus().borrow_mut().router_defi_swaps.subscribe(
         pattern,
@@ -475,7 +507,7 @@ pub fn subscribe_defi_swaps(
 pub fn subscribe_defi_liquidity(
     pattern: MStr<Pattern>,
     handler: TypedHandler<PoolLiquidityUpdate>,
-    priority: Option<u8>,
+    priority: Option<u32>,
 ) {
     get_message_bus()
         .borrow_mut()
@@ -488,7 +520,7 @@ pub fn subscribe_defi_liquidity(
 pub fn subscribe_defi_collects(
     pattern: MStr<Pattern>,
     handler: TypedHandler<PoolFeeCollect>,
-    priority: Option<u8>,
+    priority: Option<u32>,
 ) {
     get_message_bus()
         .borrow_mut()
@@ -501,7 +533,7 @@ pub fn subscribe_defi_collects(
 pub fn subscribe_defi_flash(
     pattern: MStr<Pattern>,
     handler: TypedHandler<PoolFlash>,
-    priority: Option<u8>,
+    priority: Option<u32>,
 ) {
     get_message_bus().borrow_mut().router_defi_flash.subscribe(
         pattern,
@@ -511,12 +543,12 @@ pub fn subscribe_defi_flash(
 }
 
 /// Unsubscribes a handler from instrument messages.
-pub fn unsubscribe_instruments(pattern: MStr<Pattern>, handler: ShareableMessageHandler) {
+pub fn unsubscribe_instruments(pattern: MStr<Pattern>, handler: &ShareableMessageHandler) {
     unsubscribe_any(pattern, handler);
 }
 
 /// Unsubscribes a handler from instrument close messages.
-pub fn unsubscribe_instrument_close(pattern: MStr<Pattern>, handler: ShareableMessageHandler) {
+pub fn unsubscribe_instrument_close(pattern: MStr<Pattern>, handler: &ShareableMessageHandler) {
     unsubscribe_any(pattern, handler);
 }
 
@@ -659,6 +691,22 @@ pub fn unsubscribe_greeks(pattern: MStr<Pattern>, handler: &TypedHandler<GreeksD
         .unsubscribe(pattern, handler);
 }
 
+/// Unsubscribes a handler from option greeks updates.
+pub fn unsubscribe_option_greeks(pattern: MStr<Pattern>, handler: &TypedHandler<OptionGreeks>) {
+    get_message_bus()
+        .borrow_mut()
+        .router_option_greeks
+        .unsubscribe(pattern, handler);
+}
+
+/// Unsubscribes a handler from option chain slice updates.
+pub fn unsubscribe_option_chain(pattern: MStr<Pattern>, handler: &TypedHandler<OptionChainSlice>) {
+    get_message_bus()
+        .borrow_mut()
+        .router_option_chain
+        .unsubscribe(pattern, handler);
+}
+
 /// Unsubscribes a handler from DeFi blocks.
 #[cfg(feature = "defi")]
 pub fn unsubscribe_defi_blocks(pattern: MStr<Pattern>, handler: &TypedHandler<Block>) {
@@ -717,7 +765,7 @@ pub fn unsubscribe_defi_flash(pattern: MStr<Pattern>, handler: &TypedHandler<Poo
 }
 
 /// Unsubscribes a handler from a pattern (Any-based).
-pub fn unsubscribe_any(pattern: MStr<Pattern>, handler: ShareableMessageHandler) {
+pub fn unsubscribe_any(pattern: MStr<Pattern>, handler: &ShareableMessageHandler) {
     log::debug!("Unsubscribing {handler:?} from pattern '{pattern}'");
 
     let handler_id = handler.0.id();
@@ -792,9 +840,12 @@ pub fn publish_any(topic: MStr<Topic>, message: &dyn Any) {
     // Take buffer (re-entrancy safe)
     let mut handlers = ANY_HANDLERS.with_borrow_mut(std::mem::take);
 
-    get_message_bus()
-        .borrow_mut()
-        .fill_matching_any_handlers(topic, &mut handlers);
+    {
+        let bus_rc = get_message_bus();
+        let mut bus = bus_rc.borrow_mut();
+        bus.fill_matching_any_handlers(topic, &mut handlers);
+        bus.increment_pub_count();
+    }
 
     for handler in &handlers {
         handler.0.handle(message);
@@ -894,6 +945,24 @@ pub fn publish_greeks(topic: MStr<Topic>, greeks: &GreeksData) {
     );
 }
 
+/// Publishes option greeks to subscribers on a topic.
+pub fn publish_option_greeks(topic: MStr<Topic>, option_greeks: &OptionGreeks) {
+    publish_typed(
+        &OPTION_GREEKS_HANDLERS,
+        |bus, h| bus.router_option_greeks.fill_matching_handlers(topic, h),
+        option_greeks,
+    );
+}
+
+/// Publishes an option chain slice to subscribers on a topic.
+pub fn publish_option_chain(topic: MStr<Topic>, slice: &OptionChainSlice) {
+    publish_typed(
+        &OPTION_CHAIN_HANDLERS,
+        |bus, h| bus.router_option_chain.fill_matching_handlers(topic, h),
+        slice,
+    );
+}
+
 /// Publishes an account state to subscribers on a topic.
 pub fn publish_account_state(topic: MStr<Topic>, state: &AccountState) {
     publish_typed(
@@ -983,12 +1052,12 @@ pub fn publish_defi_flash(topic: MStr<Topic>, flash: &PoolFlash) {
 
 /// Publishes a message to typed handlers using thread-local buffer reuse.
 ///
-/// The `fill_fn` receives a mutable reference to the MessageBus, avoiding
+/// The `fill_fn` receives a mutable reference to the `MessageBus`, avoiding
 /// redundant TLS access and Rc clone/drop overhead per publish.
 ///
 /// # Invariants
 ///
-/// - `fill_fn` must not call any publish path (would panic from RefCell double-borrow).
+/// - `fill_fn` must not call any publish path (would panic from `RefCell` double-borrow).
 /// - Handler panics drop the buffer, losing reuse optimization (acceptable as panics are fatal).
 #[inline]
 fn publish_typed<T: 'static>(
@@ -1000,10 +1069,12 @@ fn publish_typed<T: 'static>(
     let mut handlers = tls.with_borrow_mut(std::mem::take);
 
     // Borrow scope ends before dispatch to support re-entrant publishes
-    MESSAGE_BUS.with(|cell| {
-        let rc = cell.get_or_init(|| Rc::new(RefCell::new(MessageBus::default())));
-        fill_fn(&mut rc.borrow_mut(), &mut handlers);
-    });
+    let bus_rc = get_message_bus();
+    {
+        let mut bus = bus_rc.borrow_mut();
+        fill_fn(&mut bus, &mut handlers);
+        bus.increment_pub_count();
+    }
 
     for handler in &handlers {
         handler.handle(message);
@@ -1015,7 +1086,15 @@ fn publish_typed<T: 'static>(
 
 /// Sends a message to an endpoint handler using runtime type dispatch (Any).
 pub fn send_any(endpoint: MStr<Endpoint>, message: &dyn Any) {
-    let handler = get_message_bus().borrow().get_endpoint(endpoint).cloned();
+    let handler = {
+        let bus = get_message_bus();
+        let mut bus = bus.borrow_mut();
+        let handler = bus.get_endpoint(endpoint).cloned();
+        if handler.is_some() {
+            bus.increment_sent_count();
+        }
+        handler
+    };
 
     if let Some(handler) = handler {
         handler.0.handle(message);
@@ -1025,25 +1104,36 @@ pub fn send_any(endpoint: MStr<Endpoint>, message: &dyn Any) {
 }
 
 /// Sends a message to an endpoint, converting to Any (convenience wrapper).
-pub fn send_any_value<T: 'static>(endpoint: MStr<Endpoint>, message: T) {
-    let handler = get_message_bus().borrow().get_endpoint(endpoint).cloned();
+pub fn send_any_value<T: 'static>(endpoint: MStr<Endpoint>, message: &T) {
+    let handler = {
+        let bus = get_message_bus();
+        let mut bus = bus.borrow_mut();
+        let handler = bus.get_endpoint(endpoint).cloned();
+        if handler.is_some() {
+            bus.increment_sent_count();
+        }
+        handler
+    };
 
     if let Some(handler) = handler {
-        handler.0.handle(&message);
+        handler.0.handle(message);
     } else {
         log::error!("send_any_value: no registered endpoint '{endpoint}'");
     }
 }
 
 /// Sends the [`DataResponse`] to the registered correlation ID handler.
-pub fn send_response(correlation_id: &UUID4, message: DataResponse) {
-    let handler = get_message_bus()
-        .borrow()
-        .get_response_handler(correlation_id)
-        .cloned();
+pub fn send_response(correlation_id: &UUID4, message: &DataResponse) {
+    let handler = {
+        let bus = get_message_bus();
+        let mut bus = bus.borrow_mut();
+        let handler = bus.get_response_handler(correlation_id).cloned();
+        bus.increment_res_count();
+        handler
+    };
 
     if let Some(handler) = handler {
-        match &message {
+        match message {
             DataResponse::Data(resp) => handler.0.handle(resp),
             DataResponse::Instrument(resp) => handler.0.handle(resp.as_ref()),
             DataResponse::Instruments(resp) => handler.0.handle(resp),
@@ -1051,6 +1141,7 @@ pub fn send_response(correlation_id: &UUID4, message: DataResponse) {
             DataResponse::Quotes(resp) => handler.0.handle(resp),
             DataResponse::Trades(resp) => handler.0.handle(resp),
             DataResponse::FundingRates(resp) => handler.0.handle(resp),
+            DataResponse::ForwardPrices(resp) => handler.0.handle(resp),
             DataResponse::Bars(resp) => handler.0.handle(resp),
         }
     } else {
@@ -1120,11 +1211,13 @@ pub fn send_trading_command(endpoint: MStr<Endpoint>, command: TradingCommand) {
 
 /// Sends a data command to an endpoint handler, transferring ownership.
 pub fn send_data_command(endpoint: MStr<Endpoint>, command: DataCommand) {
-    send_endpoint_owned(
+    let is_request = data_command_is_request(&command);
+    send_endpoint_owned_counted(
         endpoint,
         command,
         |bus| bus.endpoints_data_commands.get(endpoint),
         "send_data_command",
+        is_request,
     );
 }
 
@@ -1180,7 +1273,12 @@ fn send_endpoint_ref<T: 'static, F>(
 {
     let handler = {
         let bus = get_message_bus();
-        get_handler(&bus.borrow()).cloned()
+        let mut bus = bus.borrow_mut();
+        let handler = get_handler(&bus).cloned();
+        if handler.is_some() {
+            bus.increment_sent_count();
+        }
+        handler
     };
 
     if let Some(handler) = handler {
@@ -1199,9 +1297,30 @@ fn send_endpoint_owned<T: 'static, F>(
 ) where
     F: FnOnce(&MessageBus) -> Option<&TypedIntoHandler<T>>,
 {
+    send_endpoint_owned_counted(endpoint, message, get_handler, fn_name, false);
+}
+
+#[inline]
+fn send_endpoint_owned_counted<T: 'static, F>(
+    endpoint: MStr<Endpoint>,
+    message: T,
+    get_handler: F,
+    fn_name: &str,
+    count_request: bool,
+) where
+    F: FnOnce(&MessageBus) -> Option<&TypedIntoHandler<T>>,
+{
     let handler = {
         let bus = get_message_bus();
-        get_handler(&bus.borrow()).cloned()
+        let mut bus = bus.borrow_mut();
+        let handler = get_handler(&bus).cloned();
+        if handler.is_some() {
+            bus.increment_sent_count();
+            if count_request {
+                bus.increment_req_count();
+            }
+        }
+        handler
     };
 
     if let Some(handler) = handler {
@@ -1211,12 +1330,22 @@ fn send_endpoint_owned<T: 'static, F>(
     }
 }
 
+#[inline]
+fn data_command_is_request(command: &DataCommand) -> bool {
+    match command {
+        DataCommand::Request(_) => true,
+        #[cfg(feature = "defi")]
+        DataCommand::DefiRequest(_) => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Tests for the message bus API functions.
     //!
     //! Includes re-entrancy tests that verify handlers can call back into the
-    //! message bus without causing RefCell borrow conflicts. This is the scenario
+    //! message bus without causing `RefCell` borrow conflicts. This is the scenario
     //! where `send_*` holds a borrow, calls the handler, and the handler needs to
     //! call `borrow_mut()` for topic getters or other operations.
 
@@ -1233,13 +1362,14 @@ mod tests {
 
     use super::*;
     use crate::messages::{
-        data::{DataCommand, SubscribeCommand, SubscribeQuotes},
+        data::{DataCommand, RequestCommand, RequestQuotes, SubscribeCommand, SubscribeQuotes},
         execution::{CancelAllOrders, TradingCommand},
     };
 
     #[rstest]
     fn test_typed_quote_publish_subscribe_integration() {
-        let _msgbus = get_message_bus();
+        let msgbus = get_message_bus();
+        let pub_count = msgbus.borrow().pub_count();
         let received = Rc::new(RefCell::new(Vec::new()));
         let received_clone = received.clone();
 
@@ -1254,6 +1384,7 @@ mod tests {
         publish_quote("data.quotes.TEST".into(), &quote);
 
         assert_eq!(received.borrow().len(), 2);
+        assert_eq!(msgbus.borrow().pub_count(), pub_count + 2);
     }
 
     #[rstest]
@@ -1541,14 +1672,11 @@ mod tests {
 
     #[rstest]
     fn test_send_data_command_allows_reentrant_topic_access() {
-        use nautilus_model::identifiers::ClientId;
+        use crate::msgbus::switchboard::get_trades_topic;
 
-        use crate::{
-            messages::data::{DataCommand, SubscribeCommand, SubscribeQuotes},
-            msgbus::switchboard::get_trades_topic,
-        };
-
-        let _msgbus = get_message_bus();
+        let msgbus = get_message_bus();
+        let sent_count = msgbus.borrow().sent_count();
+        let req_count = msgbus.borrow().req_count();
         let topic_retrieved = Rc::new(RefCell::new(false));
         let topic_clone = topic_retrieved.clone();
 
@@ -1572,6 +1700,45 @@ mod tests {
         send_data_command(endpoint, cmd);
 
         assert!(*topic_retrieved.borrow());
+        assert_eq!(msgbus.borrow().sent_count(), sent_count + 1);
+        assert_eq!(msgbus.borrow().req_count(), req_count);
+
+        let request = DataCommand::Request(RequestCommand::Quotes(RequestQuotes::new(
+            InstrumentId::from("TEST.VENUE"),
+            None,
+            None,
+            None,
+            Some(ClientId::new("SIM")),
+            UUID4::new(),
+            0.into(),
+            None,
+        )));
+        send_data_command(endpoint, request);
+
+        assert_eq!(msgbus.borrow().sent_count(), sent_count + 2);
+        assert_eq!(msgbus.borrow().req_count(), req_count + 1);
+    }
+
+    #[rstest]
+    fn test_send_data_request_without_endpoint_does_not_increment_counts() {
+        let msgbus = get_message_bus();
+        let sent_count = msgbus.borrow().sent_count();
+        let req_count = msgbus.borrow().req_count();
+
+        let request = DataCommand::Request(RequestCommand::Quotes(RequestQuotes::new(
+            InstrumentId::from("MISSING.VENUE"),
+            None,
+            None,
+            None,
+            Some(ClientId::new("SIM")),
+            UUID4::new(),
+            0.into(),
+            None,
+        )));
+        send_data_command("Missing.dataCmd".into(), request);
+
+        assert_eq!(msgbus.borrow().sent_count(), sent_count);
+        assert_eq!(msgbus.borrow().req_count(), req_count);
     }
 
     #[rstest]
@@ -1608,6 +1775,30 @@ mod tests {
         send_data_response(endpoint, resp);
 
         assert!(*topic_retrieved.borrow());
+    }
+
+    #[rstest]
+    fn test_send_response_increments_response_count() {
+        use nautilus_model::identifiers::ClientId;
+
+        use crate::messages::data::{DataResponse, QuotesResponse};
+
+        let msgbus = get_message_bus();
+        let res_count = msgbus.borrow().res_count();
+        let resp = DataResponse::Quotes(QuotesResponse {
+            correlation_id: UUID4::new(),
+            client_id: ClientId::new("SIM"),
+            instrument_id: InstrumentId::from("TEST.VENUE"),
+            data: vec![],
+            start: None,
+            end: None,
+            ts_init: 0.into(),
+            params: None,
+        });
+
+        send_response(&UUID4::new(), &resp);
+
+        assert_eq!(msgbus.borrow().res_count(), res_count + 1);
     }
 
     #[rstest]

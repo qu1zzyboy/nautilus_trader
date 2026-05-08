@@ -249,7 +249,7 @@ Deribit offers two post-only modes:
    Deribit automatically adjusts the price to one tick inside the spread.
 2. **Reject mode**: Order is immediately rejected if it would cross the spread.
 
-The Nautilus adapter uses **reject mode** (`reject_post_only=true`) to ensure deterministic behavior.
+The Nautilus adapter uses **reject mode** (`reject_post_only=true`) for deterministic behavior.
 If a post-only order would take liquidity, it is rejected with error code `11054`, and an `OrderRejected`
 event is emitted with the `due_post_only` flag set to `true`.
 
@@ -279,7 +279,7 @@ This provides several advantages:
 
 | Feature           | Supported | Notes                                     |
 |-------------------|-----------|-------------------------------------------|
-| Query positions   | ✓         | Real-time position updates.               |
+| Query positions   | ✓         | Real‑time position updates.               |
 | Position mode     | -         | Deribit uses net position mode only.      |
 | Leverage control  | -         | Leverage set at account level via UI.     |
 | Margin mode       | -         | Portfolio margin via Deribit UI settings. |
@@ -290,7 +290,7 @@ This provides several advantages:
 |----------------------|-----------|------------------------------------|
 | Query open orders    | ✓         | List all active orders.            |
 | Query order history  | ✓         | Historical order data.             |
-| Order status updates | ✓         | Real-time order state changes.     |
+| Order status updates | ✓         | Real‑time order state changes.     |
 | Trade history        | ✓         | Execution and fill reports.        |
 
 ### Contingent orders
@@ -301,6 +301,36 @@ This provides several advantages:
 | OCO orders          | -         | *Not supported*.                   |
 | Bracket orders      | -         | *Not supported*.                   |
 | Conditional orders  | ✓         | Stop market and stop limit orders. |
+
+### Liquidation handling
+
+Deribit tags any trade that was triggered by a liquidation. On the
+`user.trades` stream and `private/get_user_trades_*` endpoints, the optional
+`liquidation` field indicates which side was being liquidated:
+
+| Value  | Meaning                                   |
+|--------|-------------------------------------------|
+| `"M"`  | Maker side was liquidated.                |
+| `"T"`  | Taker side was liquidated.                |
+| `"MT"` | Both sides were liquidated.               |
+| absent | Normal (non‑liquidation) trade.           |
+
+The adapter logs a warning for each liquidation-tagged fill with the
+instrument, trade ID, order ID, and liquidation side, and then emits the
+`FillReport` through the normal pipeline. Deribit does not operate an ADL
+mechanism distinct from the liquidation + insurance-fund / portfolio margin
+process, so there is no separate ADL signal to surface.
+
+Upstream references:
+
+- [`user.trades.{instrument_name}.{interval}` channel](https://docs.deribit.com/#user-trades-instrument_name-interval)
+- [Liquidation documentation](https://support.deribit.com/hc/en-us/articles/25944769313309-Liquidations)
+
+## Funding rates
+
+Deribit exchanges funding continuously (every few seconds) rather than at fixed intervals
+like most other exchanges. The `interval` field on `FundingRateUpdate` is `None` for
+Deribit because this continuous model does not map to a discrete period.
 
 ## Rate limiting
 
@@ -463,19 +493,21 @@ create a read-only key without `trade:read_write`.
 ## Testnet
 
 Deribit provides a testnet environment for testing strategies without real funds.
-To use the testnet, set `is_testnet=True` in your client configuration:
+To use the testnet, set `environment=DeribitEnvironment.TESTNET` in your client configuration:
 
 ```python
+from nautilus_trader.core.nautilus_pyo3 import DeribitEnvironment
+
 config = TradingNodeConfig(
     data_clients={
         DERIBIT: DeribitDataClientConfig(
-            is_testnet=True,  # Enable testnet mode
+            environment=DeribitEnvironment.TESTNET,
             # ... other config
         ),
     },
     exec_clients={
         DERIBIT: DeribitExecClientConfig(
-            is_testnet=True,  # Enable testnet mode
+            environment=DeribitEnvironment.TESTNET,
             # ... other config
         ),
     },
@@ -502,9 +534,10 @@ for the testnet through the testnet interface at [test.deribit.com](https://test
 | `api_key`                          | `None`     | Deribit API key; loads from environment variables when omitted. |
 | `api_secret`                       | `None`     | Deribit API secret; loads from environment variables when omitted. |
 | `product_types`                    | `None`     | Product types to load (Future, Option, Spot, etc.). If `None`, defaults to Future. |
+| `environment`                      | `None`     | Environment enum (`MAINNET` or `TESTNET`). |
 | `base_url_http`                    | `None`     | Override for the HTTP REST base URL. |
 | `base_url_ws`                      | `None`     | Override for the WebSocket base URL. |
-| `is_testnet`                       | `False`    | Use Deribit testnet endpoints when `True`. |
+| `proxy_url`                        | `None`     | Optional proxy URL for HTTP and WebSocket transports. |
 | `http_timeout_secs`                | `60`       | Request timeout (seconds) for REST calls. |
 | `max_retries`                      | `3`        | Maximum retry attempts for recoverable errors. |
 | `retry_delay_initial_ms`           | `1,000`    | Initial delay (milliseconds) before retrying. |
@@ -518,9 +551,10 @@ for the testnet through the testnet interface at [test.deribit.com](https://test
 | `api_key`                | `None`     | Deribit API key; loads from environment variables when omitted. |
 | `api_secret`             | `None`     | Deribit API secret; loads from environment variables when omitted. |
 | `product_types`          | `None`     | Product types to load (Future, Option, Spot, etc.). If `None`, defaults to Future. |
+| `environment`            | `None`     | Environment enum (`MAINNET` or `TESTNET`). |
 | `base_url_http`          | `None`     | Override for the HTTP REST base URL. |
 | `base_url_ws`            | `None`     | Override for the WebSocket base URL. |
-| `is_testnet`             | `False`    | Use Deribit testnet endpoints when `True`. |
+| `proxy_url`              | `None`     | Optional proxy URL for HTTP and WebSocket transports. |
 | `http_timeout_secs`      | `60`       | Request timeout (seconds) for REST calls. |
 | `max_retries`            | `3`        | Maximum retry attempts for recoverable errors. |
 | `retry_delay_initial_ms` | `1,000`    | Initial delay (milliseconds) before retrying. |
@@ -538,6 +572,7 @@ from nautilus_trader.adapters.deribit import DeribitLiveDataClientFactory
 from nautilus_trader.adapters.deribit import DeribitLiveExecClientFactory
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.config import TradingNodeConfig
+from nautilus_trader.core.nautilus_pyo3 import DeribitEnvironment
 from nautilus_trader.core.nautilus_pyo3 import DeribitProductType
 from nautilus_trader.live.node import TradingNode
 
@@ -548,8 +583,8 @@ config = TradingNodeConfig(
             api_key=None,           # Uses DERIBIT_API_KEY env var
             api_secret=None,        # Uses DERIBIT_API_SECRET env var
             product_types=(DeribitProductType.Future,),
+            environment=DeribitEnvironment.MAINNET,
             instrument_provider=InstrumentProviderConfig(load_all=True),
-            is_testnet=False,
         ),
     },
     exec_clients={
@@ -557,8 +592,8 @@ config = TradingNodeConfig(
             api_key=None,
             api_secret=None,
             product_types=(DeribitProductType.Future,),
+            environment=DeribitEnvironment.MAINNET,
             instrument_provider=InstrumentProviderConfig(load_all=True),
-            is_testnet=False,
         ),
     },
 )

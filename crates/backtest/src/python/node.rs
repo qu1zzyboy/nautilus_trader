@@ -18,33 +18,64 @@
 use std::collections::HashMap;
 
 use nautilus_common::{actor::data_actor::ImportableActorConfig, python::actor::PyDataActor};
+#[cfg(feature = "examples")]
+use nautilus_core::python::to_pytype_err;
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
 use nautilus_model::identifiers::{ActorId, ComponentId, StrategyId};
+#[cfg(feature = "examples")]
+use nautilus_trading::examples::strategies::{
+    CompositeMarketMaker, CompositeMarketMakerConfig, DeltaNeutralVol, DeltaNeutralVolConfig,
+    EmaCross, EmaCrossConfig, GridMarketMaker, GridMarketMakerConfig, HurstVpinDirectional,
+    HurstVpinDirectionalConfig,
+};
 use nautilus_trading::{
     ImportableStrategyConfig,
     python::strategy::{PyStrategy, PyStrategyInner},
 };
 use pyo3::{prelude::*, types::PyDict};
 
-use crate::{config::BacktestRunConfig, engine::BacktestResult, node::BacktestNode};
+use crate::{config::BacktestRunConfig, node::BacktestNode, result::BacktestResult};
 
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 #[pymethods]
 impl BacktestNode {
+    /// Orchestrates catalog-driven backtests from run configurations.
+    ///
+    /// `BacktestNode` connects the `ParquetDataCatalog` with `BacktestEngine` to load
+    /// historical data and run backtests. Supports both oneshot and streaming modes.
     #[new]
     fn py_new(configs: Vec<BacktestRunConfig>) -> PyResult<Self> {
         Self::new(configs).map_err(to_pyruntime_err)
     }
 
+    /// Builds backtest engines from the run configurations.
+    ///
+    /// For each config, creates a `BacktestEngine`, adds venues, and loads
+    /// instruments from the catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if engine creation, venue setup, or instrument loading fails.
     #[pyo3(name = "build")]
     fn py_build(&mut self) -> PyResult<()> {
         self.build().map_err(to_pyruntime_err)
     }
 
+    /// Runs all configured backtests and returns results.
+    ///
+    /// Automatically calls `build()` if engines have not been created yet.
+    /// For each run config, loads data from the catalog and runs the engine.
+    /// Supports both oneshot (`chunk_size = None`) and streaming modes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if building, data loading, or engine execution fails.
     #[pyo3(name = "run")]
     fn py_run(&mut self) -> PyResult<Vec<BacktestResult>> {
         self.run().map_err(to_pyruntime_err)
     }
 
+    /// Disposes all engines and releases resources.
     #[pyo3(name = "dispose")]
     fn py_dispose(&mut self) {
         self.dispose();
@@ -55,6 +86,7 @@ impl BacktestNode {
         reason = "Required for Python actor component registration"
     )]
     #[pyo3(name = "add_actor_from_config")]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_add_actor_from_config(
         &mut self,
         _py: Python,
@@ -140,7 +172,13 @@ impl BacktestNode {
             .map_err(to_pyruntime_err)?;
 
         // Validate no duplicate before any mutations
-        if engine.kernel().trader.actor_ids().contains(&actor_id) {
+        if engine
+            .kernel()
+            .trader
+            .borrow()
+            .actor_ids()
+            .contains(&actor_id)
+        {
             return Err(to_pyruntime_err(format!(
                 "Actor '{actor_id}' is already registered"
             )));
@@ -154,6 +192,7 @@ impl BacktestNode {
         let clock = engine
             .kernel_mut()
             .trader
+            .borrow_mut()
             .create_component_clock(component_id);
 
         // Phase 3: Register the actor with its dedicated clock
@@ -192,6 +231,7 @@ impl BacktestNode {
         engine
             .kernel_mut()
             .trader
+            .borrow_mut()
             .add_actor_id_for_lifecycle(actor_id)
             .map_err(to_pyruntime_err)?;
 
@@ -204,6 +244,7 @@ impl BacktestNode {
         reason = "Required for Python strategy component registration"
     )]
     #[pyo3(name = "add_strategy_from_config")]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_add_strategy_from_config(
         &mut self,
         _py: Python,
@@ -264,7 +305,16 @@ impl BacktestNode {
                         } else {
                             anyhow::bail!("Invalid `strategy_id` type");
                         };
-                        py_strategy_ref.set_strategy_id(strategy_id_val);
+                        py_strategy_ref.set_strategy_id(strategy_id_val)?;
+                    }
+
+                    if let Ok(order_id_tag) = config_obj.getattr("order_id_tag")
+                        && !order_id_tag.is_none()
+                    {
+                        let order_id_tag_val = order_id_tag
+                            .extract::<String>()
+                            .map_err(|e| anyhow::anyhow!("Invalid `order_id_tag` type: {e}"))?;
+                        py_strategy_ref.set_order_id_tag(&order_id_tag_val)?;
                     }
 
                     if let Ok(log_events) = config_obj.getattr("log_events")
@@ -289,7 +339,13 @@ impl BacktestNode {
             .map_err(to_pyruntime_err)?;
 
         // Validate no duplicate before any mutations
-        if engine.kernel().trader.strategy_ids().contains(&strategy_id) {
+        if engine
+            .kernel()
+            .trader
+            .borrow()
+            .strategy_ids()
+            .contains(&strategy_id)
+        {
             return Err(to_pyruntime_err(format!(
                 "Strategy '{strategy_id}' is already registered"
             )));
@@ -304,6 +360,7 @@ impl BacktestNode {
         let clock = engine
             .kernel_mut()
             .trader
+            .borrow_mut()
             .create_component_clock(component_id);
 
         // Phase 3: Register the strategy with its dedicated clock
@@ -341,6 +398,7 @@ impl BacktestNode {
         engine
             .kernel_mut()
             .trader
+            .borrow_mut()
             .add_strategy_id_with_subscriptions::<PyStrategyInner>(strategy_id)
             .map_err(to_pyruntime_err)?;
 
@@ -348,12 +406,67 @@ impl BacktestNode {
         Ok(())
     }
 
+    /// Adds a native Rust strategy from its config to the engine for the given run config.
+    ///
+    /// The config type determines which built-in strategy is constructed.
+    /// All execution happens in Rust; Python is the configuration layer.
+    ///
+    /// Custom native Rust strategies require the native strategy plugin API.
+    #[pyo3(name = "add_native_strategy")]
+    fn py_add_native_strategy(
+        &mut self,
+        run_config_id: &str,
+        config: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        #[cfg(feature = "examples")]
+        {
+            let engine = self.get_engine_mut(run_config_id).ok_or_else(|| {
+                to_pyruntime_err(format!("No engine for run config '{run_config_id}'"))
+            })?;
+
+            if let Ok(config) = config.extract::<EmaCrossConfig>() {
+                engine
+                    .add_strategy(EmaCross::from_config(config))
+                    .map_err(to_pyruntime_err)
+            } else if let Ok(config) = config.extract::<GridMarketMakerConfig>() {
+                engine
+                    .add_strategy(GridMarketMaker::new(config))
+                    .map_err(to_pyruntime_err)
+            } else if let Ok(config) = config.extract::<CompositeMarketMakerConfig>() {
+                engine
+                    .add_strategy(CompositeMarketMaker::new(config))
+                    .map_err(to_pyruntime_err)
+            } else if let Ok(config) = config.extract::<DeltaNeutralVolConfig>() {
+                engine
+                    .add_strategy(DeltaNeutralVol::new(config))
+                    .map_err(to_pyruntime_err)
+            } else if let Ok(config) = config.extract::<HurstVpinDirectionalConfig>() {
+                engine
+                    .add_strategy(HurstVpinDirectional::new(config))
+                    .map_err(to_pyruntime_err)
+            } else {
+                let type_name = config.get_type().name()?;
+                Err(to_pytype_err(format!(
+                    "Unsupported native strategy config type: {type_name}",
+                )))
+            }
+        }
+
+        #[cfg(not(feature = "examples"))]
+        {
+            let _ = (run_config_id, config);
+            Err(to_pyruntime_err(
+                "add_native_strategy requires the `examples` feature",
+            ))
+        }
+    }
+
     fn __repr__(&self) -> String {
         format!("{self:?}")
     }
 }
 
-fn create_config_instance<'py>(
+pub(crate) fn create_config_instance<'py>(
     py: Python<'py>,
     config_path: &str,
     config: &HashMap<String, serde_json::Value>,
@@ -382,6 +495,7 @@ fn create_config_instance<'py>(
 
     // Convert config dict to Python dict
     let py_dict = PyDict::new(py);
+
     for (key, value) in config {
         let json_str = serde_json::to_string(value)
             .map_err(|e| anyhow::anyhow!("Failed to serialize config value: {e}"))?;

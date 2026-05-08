@@ -98,6 +98,7 @@ use nautilus_model::{
     data::{
         Bar, Data, FundingRateUpdate, GreeksData, IndexPriceUpdate, MarkPriceUpdate,
         OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
+        option_chain::{OptionChainSlice, OptionGreeks},
     },
     events::{AccountState, OrderEventAny, PositionEvent},
     identifiers::TraderId,
@@ -138,7 +139,7 @@ pub struct Subscription {
     /// The priority for the subscription determines the ordering of handlers receiving
     /// messages being processed, higher priority handlers will receive messages before
     /// lower priority handlers.
-    pub priority: u8,
+    pub priority: u32,
 }
 
 impl Subscription {
@@ -147,7 +148,7 @@ impl Subscription {
     pub fn new(
         pattern: MStr<Pattern>,
         handler: ShareableMessageHandler,
-        priority: Option<u8>,
+        priority: Option<u32>,
     ) -> Self {
         Self {
             handler_id: handler.0.id(),
@@ -239,6 +240,8 @@ pub struct MessageBus {
     pub(crate) router_orders: TopicRouter<OrderAny>,
     pub(crate) router_positions: TopicRouter<Position>,
     pub(crate) router_greeks: TopicRouter<GreeksData>,
+    pub(crate) router_option_greeks: TopicRouter<OptionGreeks>,
+    pub(crate) router_option_chain: TopicRouter<OptionChainSlice>,
     #[cfg(feature = "defi")]
     pub(crate) router_defi_blocks: TopicRouter<nautilus_model::defi::Block>, // nautilus-import-ok
     #[cfg(feature = "defi")]
@@ -265,6 +268,10 @@ pub struct MessageBus {
     pub(crate) endpoints_data: IntoEndpointMap<Data>,
     routers_typed: AHashMap<TypeId, Box<dyn Any>>,
     endpoints_typed: AHashMap<TypeId, Box<dyn Any>>,
+    sent_count: u64,
+    req_count: u64,
+    res_count: u64,
+    pub_count: u64,
 }
 
 impl Default for MessageBus {
@@ -308,6 +315,8 @@ impl MessageBus {
             router_orders: TopicRouter::new(),
             router_positions: TopicRouter::new(),
             router_greeks: TopicRouter::new(),
+            router_option_greeks: TopicRouter::new(),
+            router_option_chain: TopicRouter::new(),
             #[cfg(feature = "defi")]
             router_defi_blocks: TopicRouter::new(),
             #[cfg(feature = "defi")]
@@ -334,6 +343,10 @@ impl MessageBus {
             endpoints_data: IntoEndpointMap::new(),
             routers_typed: AHashMap::new(),
             endpoints_typed: AHashMap::new(),
+            sent_count: 0,
+            req_count: 0,
+            res_count: 0,
+            pub_count: 0,
         }
     }
 
@@ -370,6 +383,62 @@ impl MessageBus {
             .expect("EndpointMap type mismatch - this is a bug")
     }
 
+    /// Disposes of the message bus, clearing all subscriptions, endpoints,
+    /// and handler references.
+    pub fn dispose(&mut self) {
+        self.subscriptions.clear();
+        self.topics.clear();
+        self.endpoints.clear();
+        self.correlation_index.clear();
+
+        self.router_quotes.clear();
+        self.router_trades.clear();
+        self.router_bars.clear();
+        self.router_deltas.clear();
+        self.router_depth10.clear();
+        self.router_book_snapshots.clear();
+        self.router_mark_prices.clear();
+        self.router_index_prices.clear();
+        self.router_funding_rates.clear();
+        self.router_order_events.clear();
+        self.router_position_events.clear();
+        self.router_account_state.clear();
+        self.router_orders.clear();
+        self.router_positions.clear();
+        self.router_greeks.clear();
+        self.router_option_greeks.clear();
+        self.router_option_chain.clear();
+
+        #[cfg(feature = "defi")]
+        {
+            self.router_defi_blocks.clear();
+            self.router_defi_pools.clear();
+            self.router_defi_swaps.clear();
+            self.router_defi_liquidity.clear();
+            self.router_defi_collects.clear();
+            self.router_defi_flash.clear();
+            self.endpoints_defi_data.clear();
+        }
+
+        self.endpoints_quotes.clear();
+        self.endpoints_trades.clear();
+        self.endpoints_bars.clear();
+        self.endpoints_account_state.clear();
+        self.endpoints_trading_commands.clear();
+        self.endpoints_data_commands.clear();
+        self.endpoints_data_responses.clear();
+        self.endpoints_exec_reports.clear();
+        self.endpoints_order_events.clear();
+        self.endpoints_data.clear();
+
+        self.routers_typed.clear();
+        self.endpoints_typed.clear();
+        self.sent_count = 0;
+        self.req_count = 0;
+        self.res_count = 0;
+        self.pub_count = 0;
+    }
+
     /// Returns the memory address of this instance as a hexadecimal string.
     #[must_use]
     pub fn mem_address(&self) -> String {
@@ -380,6 +449,46 @@ impl MessageBus {
     #[must_use]
     pub fn switchboard(&self) -> &MessagingSwitchboard {
         &self.switchboard
+    }
+
+    /// Returns the total count of messages sent to endpoints.
+    #[must_use]
+    pub const fn sent_count(&self) -> u64 {
+        self.sent_count
+    }
+
+    /// Returns the total count of requests sent to endpoints.
+    #[must_use]
+    pub const fn req_count(&self) -> u64 {
+        self.req_count
+    }
+
+    /// Returns the total count of responses sent to registered handlers.
+    #[must_use]
+    pub const fn res_count(&self) -> u64 {
+        self.res_count
+    }
+
+    /// Returns the total count of messages published to topics.
+    #[must_use]
+    pub const fn pub_count(&self) -> u64 {
+        self.pub_count
+    }
+
+    pub(crate) fn increment_sent_count(&mut self) {
+        self.sent_count += 1;
+    }
+
+    pub(crate) fn increment_req_count(&mut self) {
+        self.req_count += 1;
+    }
+
+    pub(crate) fn increment_res_count(&mut self) {
+        self.res_count += 1;
+    }
+
+    pub(crate) fn increment_pub_count(&mut self) {
+        self.pub_count += 1;
     }
 
     /// Returns the registered endpoint addresses.
@@ -412,7 +521,7 @@ impl MessageBus {
         let topic = MStr::<Topic>::topic(topic).expect(FAILED);
         self.topics
             .get(&topic)
-            .map_or_else(|| self.find_topic_matches(topic).len(), |subs| subs.len())
+            .map_or_else(|| self.find_topic_matches(topic).len(), Vec::len)
     }
 
     /// Returns active subscriptions.
@@ -557,7 +666,7 @@ mod tests {
     use crate::msgbus::{
         self, ShareableMessageHandler, get_message_bus,
         matching::is_matching_backtracking,
-        stubs::{get_call_check_handler, get_stub_shareable_handler},
+        stubs::{get_any_saving_handler, get_call_check_handler, get_stub_shareable_handler},
         subscriptions_count_any,
     };
 
@@ -568,6 +677,22 @@ mod tests {
 
         assert_eq!(msgbus.trader_id, trader_id);
         assert_eq!(msgbus.name, stringify!(MessageBus));
+    }
+
+    #[rstest]
+    fn test_dispose_resets_counters() {
+        let mut msgbus = MessageBus::default();
+
+        msgbus.increment_sent_count();
+        msgbus.increment_req_count();
+        msgbus.increment_res_count();
+        msgbus.increment_pub_count();
+        msgbus.dispose();
+
+        assert_eq!(msgbus.sent_count(), 0);
+        assert_eq!(msgbus.req_count(), 0);
+        assert_eq!(msgbus.res_count(), 0);
+        assert_eq!(msgbus.pub_count(), 0);
     }
 
     #[rstest]
@@ -652,14 +777,44 @@ mod tests {
         let msgbus = get_message_bus();
         let endpoint = "MyEndpoint".into();
         let (handler, checker) = get_call_check_handler(None);
+        let sent_count = msgbus.borrow().sent_count();
 
         msgbus::register_any(endpoint, handler);
         assert!(msgbus.borrow().get_endpoint(endpoint).is_some());
         assert!(!checker.was_called());
 
-        // Send a message to the endpoint
         msgbus::send_any(endpoint, &"Test Message");
+
         assert!(checker.was_called());
+        assert_eq!(msgbus.borrow().sent_count(), sent_count + 1);
+    }
+
+    #[rstest]
+    fn test_endpoint_send_value_increments_sent_count() {
+        let msgbus = get_message_bus();
+        let endpoint = "MyValueEndpoint".into();
+        let (handler, checker) = get_call_check_handler(None);
+        let sent_count = msgbus.borrow().sent_count();
+
+        msgbus::register_any(endpoint, handler);
+        msgbus::send_any_value(endpoint, &"Test Message");
+
+        assert!(checker.was_called());
+        assert_eq!(msgbus.borrow().sent_count(), sent_count + 1);
+    }
+
+    #[rstest]
+    fn test_publish_any_increments_publish_count() {
+        let msgbus = get_message_bus();
+        let topic = "my-published-topic";
+        let (handler, checker) = get_call_check_handler(None);
+        let pub_count = msgbus.borrow().pub_count();
+
+        msgbus::subscribe_any(topic.into(), handler, None);
+        msgbus::publish_any(topic.into(), &"Test Message");
+
+        assert!(checker.was_called());
+        assert_eq!(msgbus.borrow().pub_count(), pub_count + 1);
     }
 
     #[rstest]
@@ -693,7 +848,7 @@ mod tests {
         let handler = get_stub_shareable_handler(None);
 
         msgbus::subscribe_any(topic.into(), handler.clone(), None);
-        msgbus::unsubscribe_any(topic.into(), handler);
+        msgbus::unsubscribe_any(topic.into(), &handler);
 
         assert!(!msgbus.borrow().has_subscribers(topic));
         assert!(msgbus.borrow().patterns().is_empty());
@@ -757,9 +912,74 @@ mod tests {
         assert_eq!(matches[1].handler_id, Ustr::from("1"));
     }
 
+    #[rstest]
+    fn test_late_wildcard_subscription_receives_cached_topic() {
+        let msgbus = get_message_bus();
+        let topic = "data.instrument.POLYMARKET.TEST-SYMBOL";
+
+        let (early_handler, early_saver) =
+            get_any_saving_handler::<String>(Some(Ustr::from("early")));
+        msgbus::subscribe_any("data.*.POLYMARKET.*".into(), early_handler, None);
+
+        msgbus::publish_any(topic.into(), &"ONE".to_string());
+
+        let (late_handler, late_saver) = get_any_saving_handler::<String>(Some(Ustr::from("late")));
+        msgbus::subscribe_any("data.instrument.POLYMARKET.*".into(), late_handler, None);
+
+        msgbus::publish_any(topic.into(), &"TWO".to_string());
+
+        assert_eq!(early_saver.get_messages(), vec!["ONE", "TWO"]);
+        assert_eq!(late_saver.get_messages(), vec!["TWO"]);
+
+        let topic_mstr: MStr<Topic> = topic.into();
+        let cached = msgbus.borrow_mut().matching_subscriptions(topic_mstr);
+        assert_eq!(cached.len(), 2);
+    }
+
+    #[rstest]
+    fn test_late_wildcard_backfills_into_multiple_cached_topics() {
+        let msgbus = get_message_bus();
+        let topics = ["data.A", "data.B", "data.C"];
+
+        let (early_handler, early_saver) =
+            get_any_saving_handler::<String>(Some(Ustr::from("early")));
+        msgbus::subscribe_any("data.*".into(), early_handler, None);
+
+        for topic in &topics {
+            msgbus::publish_any((*topic).into(), &(*topic).to_string());
+        }
+
+        let (late_handler, late_saver) = get_any_saving_handler::<String>(Some(Ustr::from("late")));
+        msgbus::subscribe_any("data.*".into(), late_handler, None);
+
+        for topic in &topics {
+            msgbus::publish_any((*topic).into(), &format!("{topic}-2"));
+        }
+
+        assert_eq!(
+            early_saver.get_messages(),
+            vec![
+                "data.A", "data.B", "data.C", "data.A-2", "data.B-2", "data.C-2"
+            ],
+        );
+        assert_eq!(
+            late_saver.get_messages(),
+            vec!["data.A-2", "data.B-2", "data.C-2"]
+        );
+
+        for topic in &topics {
+            let topic_mstr: MStr<Topic> = (*topic).into();
+            assert_eq!(
+                msgbus.borrow_mut().matching_subscriptions(topic_mstr).len(),
+                2,
+                "topic {topic} should have both subscribers cached",
+            );
+        }
+    }
+
     /// A simple reference model for subscription behavior.
     struct SimpleSubscriptionModel {
-        /// Stores (pattern, handler_id) tuples for active subscriptions.
+        /// Stores (pattern, `handler_id`) tuples for active subscriptions.
         subscriptions: Vec<(String, String)>,
     }
 
@@ -875,7 +1095,7 @@ mod tests {
                             .unwrap();
 
                         // Apply to message bus
-                        msgbus::unsubscribe_any(pattern.as_str().into(), handler.clone());
+                        msgbus::unsubscribe_any(pattern.as_str().into(), &handler);
 
                         assert_eq!(
                             model.subscription_count(),
