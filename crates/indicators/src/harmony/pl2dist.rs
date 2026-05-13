@@ -15,11 +15,9 @@
 
 //! Raw price-location-to-distance ratio: displacement divided by path length.
 
-use std::{
-    collections::VecDeque,
-    fmt::Display,
-};
+use std::fmt::Display;
 
+use arraydeque::{ArrayDeque, Wrapping};
 use nautilus_model::{
     data::{Bar, QuoteTick, TradeTick},
     enums::PriceType,
@@ -29,6 +27,8 @@ use crate::indicator::Indicator;
 
 /// Window used by the notebook (`WINDOW = 60`).
 pub const DEFAULT_PERIOD: usize = 60;
+const MAX_PERIOD: usize = 8_192;
+const MAX_CLOSES: usize = MAX_PERIOD + 1;
 
 /// Raw price-location-to-distance ratio:
 /// `(C_t - C_{t-n}) / sum(|C_i - C_{i-1}|)`.
@@ -47,8 +47,8 @@ pub struct Pl2Dist {
     pub price_type: PriceType,
     pub value: f64,
     pub initialized: bool,
-    closes: VecDeque<f64>,
-    deltas: VecDeque<f64>,
+    closes: ArrayDeque<f64, MAX_CLOSES, Wrapping>,
+    deltas: ArrayDeque<f64, MAX_PERIOD, Wrapping>,
     path_sum: f64,
 }
 
@@ -101,14 +101,18 @@ impl Pl2Dist {
     #[must_use]
     pub fn new(period: usize, price_type: Option<PriceType>) -> Self {
         assert!(period > 0, "Pl2Dist period must be positive");
+        assert!(
+            period <= MAX_PERIOD,
+            "Pl2Dist period {period} exceeds MAX_PERIOD ({MAX_PERIOD})"
+        );
 
         Self {
             period,
             price_type: price_type.unwrap_or(PriceType::Last),
             value: 0.0,
             initialized: false,
-            closes: VecDeque::with_capacity(period + 1),
-            deltas: VecDeque::with_capacity(period),
+            closes: ArrayDeque::new(),
+            deltas: ArrayDeque::new(),
             path_sum: 0.0,
         }
     }
@@ -121,19 +125,18 @@ impl Pl2Dist {
     pub fn update_raw(&mut self, close: f64) {
         if let Some(&prev) = self.closes.back() {
             let delta_abs = (close - prev).abs();
-            self.path_sum += delta_abs;
-            self.deltas.push_back(delta_abs);
-            if self.deltas.len() > self.period {
-                if let Some(old) = self.deltas.pop_front() {
-                    self.path_sum -= old;
-                }
+            if self.deltas.len() == self.period {
+                let old = self.deltas.pop_front().expect("deltas must be non-empty");
+                self.path_sum -= old;
             }
+            let _ = self.deltas.push_back(delta_abs);
+            self.path_sum += delta_abs;
         }
 
-        self.closes.push_back(close);
-        if self.closes.len() > self.period + 1 {
+        if self.closes.len() == self.period + 1 {
             self.closes.pop_front();
         }
+        let _ = self.closes.push_back(close);
 
         self.initialized = self.closes.len() == self.period + 1 && self.deltas.len() == self.period;
         if !self.initialized {

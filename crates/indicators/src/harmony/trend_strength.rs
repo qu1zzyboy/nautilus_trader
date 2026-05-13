@@ -15,11 +15,9 @@
 
 //! Complete trend strength factor from `sync/TrendStrengh因子/main_crypto.ipynb`.
 
-use std::{
-    collections::VecDeque,
-    fmt::Display,
-};
+use std::fmt::Display;
 
+use arraydeque::{ArrayDeque, Wrapping};
 use nautilus_model::{
     data::{Bar, QuoteTick, TradeTick},
     enums::PriceType,
@@ -37,6 +35,7 @@ pub const DEFAULT_EWM_ALPHA: f64 = 0.1;
 pub const DEFAULT_NORMALIZATION_PERIOD: usize = 5_000;
 /// Denominator epsilon used by the notebook min-max scaling.
 pub const DEFAULT_NORMALIZATION_EPSILON: f64 = 1e-10;
+const MAX_NORMALIZATION_PERIOD: usize = 8_192;
 
 /// Complete notebook trend strength factor:
 /// `Pl2Dist -> ewm_mean(alpha=0.1) -> ewm_mean(alpha=0.1) -> rolling min-max [-1, 1]`.
@@ -63,7 +62,7 @@ pub struct TrendStrength {
     pl2dist: Pl2Dist,
     ewm1: ExponentiallyWeightedMean,
     ewm2: ExponentiallyWeightedMean,
-    normalization_window: VecDeque<f64>,
+    normalization_window: ArrayDeque<f64, MAX_NORMALIZATION_PERIOD, Wrapping>,
 }
 
 impl Display for TrendStrength {
@@ -135,6 +134,10 @@ impl TrendStrength {
             normalization_period > 0,
             "TrendStrength normalization_period must be positive"
         );
+        assert!(
+            normalization_period <= MAX_NORMALIZATION_PERIOD,
+            "TrendStrength normalization_period {normalization_period} exceeds MAX_NORMALIZATION_PERIOD ({MAX_NORMALIZATION_PERIOD})"
+        );
 
         let price_type = price_type.unwrap_or(PriceType::Last);
         Self {
@@ -150,7 +153,7 @@ impl TrendStrength {
             pl2dist: Pl2Dist::new(period, Some(price_type)),
             ewm1: ExponentiallyWeightedMean::new(ewm_alpha, Some(1), Some(price_type)),
             ewm2: ExponentiallyWeightedMean::new(ewm_alpha, Some(1), Some(price_type)),
-            normalization_window: VecDeque::with_capacity(normalization_period),
+            normalization_window: ArrayDeque::new(),
         }
     }
 
@@ -179,10 +182,10 @@ impl TrendStrength {
         self.ewm2.update_raw(self.ewm1.value);
         self.smoothed_value = self.ewm2.value;
 
-        self.normalization_window.push_back(self.smoothed_value);
-        if self.normalization_window.len() > self.normalization_period {
+        if self.normalization_window.len() == self.normalization_period {
             self.normalization_window.pop_front();
         }
+        let _ = self.normalization_window.push_back(self.smoothed_value);
 
         self.initialized = self.normalization_window.len() == self.normalization_period;
         if !self.initialized {
