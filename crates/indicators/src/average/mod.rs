@@ -18,6 +18,7 @@
 pub mod ama;
 pub mod dema;
 pub mod ema;
+pub mod ewm;
 pub mod hma;
 pub mod lr;
 pub mod rma;

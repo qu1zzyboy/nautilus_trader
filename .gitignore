@@ -33,6 +33,7 @@ logs/
 *.dbn
 *.dbn.zst
 *.parquet
+/sync/
 
 # IntelliJ and VSCode project
 *.iml

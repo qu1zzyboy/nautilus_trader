@@ -13,14 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Trend strength (directional efficiency) over a rolling window of closes.
-//!
-//! Specification (see repository `TrendStrengh因子/算法说明.md`):
-//!
-//! `factor_t = (C_t - C_{t-n}) / sum_{i=0}^{n-1} |C_{t-i} - C_{t-i-1}|`
-//!
-//! Default `n` is **120**. Use [`TrendStrength::new`] with a smaller `period` (e.g. **60**) to match
-//! `TrendStrengh因子/main_crypto.ipynb`.
+//! Complete trend strength factor from `sync/TrendStrengh因子/main_crypto.ipynb`.
 
 use std::{
     collections::VecDeque,
@@ -32,30 +25,57 @@ use nautilus_model::{
     enums::PriceType,
 };
 
-use crate::indicator::Indicator;
+use crate::{
+    average::ewm::ExponentiallyWeightedMean,
+    harmony::pl2dist::{Pl2Dist, DEFAULT_PERIOD},
+    indicator::{Indicator, MovingAverage},
+};
 
-/// Default rolling window length from `TrendStrengh因子/算法说明.md` (`n = 120`).
-pub const DEFAULT_PERIOD: usize = 120;
+/// Alpha used by the two notebook `ewm_mean` passes.
+pub const DEFAULT_EWM_ALPHA: f64 = 0.1;
+/// Window used by the notebook rolling min-max normalization.
+pub const DEFAULT_NORMALIZATION_PERIOD: usize = 5_000;
+/// Denominator epsilon used by the notebook min-max scaling.
+pub const DEFAULT_NORMALIZATION_EPSILON: f64 = 1e-10;
 
-/// Rolling-window trend strength: signed net displacement divided by path length (sum of absolute
-/// close-to-close moves).
+/// Complete notebook trend strength factor:
+/// `Pl2Dist -> ewm_mean(alpha=0.1) -> ewm_mean(alpha=0.1) -> rolling min-max [-1, 1]`.
 #[repr(C)]
 #[derive(Debug)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.indicators")
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.indicators")
+)]
 pub struct TrendStrength {
-    /// Window length `n` (uses `n + 1` closes: \\(C_{t-n}\\) through \\(C_t\\)).
     pub period: usize,
+    pub ewm_alpha: f64,
+    pub normalization_period: usize,
+    pub normalization_epsilon: f64,
     pub price_type: PriceType,
-    /// Latest factor value; zero until [`Self::initialized`] is true or when path sum is zero.
+    pub raw_value: f64,
+    pub smoothed_value: f64,
     pub value: f64,
     pub initialized: bool,
-    closes: VecDeque<f64>,
-    deltas: VecDeque<f64>,
-    path_sum: f64,
+    pl2dist: Pl2Dist,
+    ewm1: ExponentiallyWeightedMean,
+    ewm2: ExponentiallyWeightedMean,
+    normalization_window: VecDeque<f64>,
 }
 
 impl Display for TrendStrength {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}({})", self.name(), self.period)
+        write!(
+            f,
+            "{}({}, {}, {})",
+            self.name(),
+            self.period,
+            self.ewm_alpha,
+            self.normalization_period
+        )
     }
 }
 
@@ -65,7 +85,7 @@ impl Indicator for TrendStrength {
     }
 
     fn has_inputs(&self) -> bool {
-        !self.closes.is_empty()
+        self.pl2dist.has_inputs()
     }
 
     fn initialized(&self) -> bool {
@@ -85,77 +105,98 @@ impl Indicator for TrendStrength {
     }
 
     fn reset(&mut self) {
+        self.raw_value = 0.0;
+        self.smoothed_value = 0.0;
         self.value = 0.0;
         self.initialized = false;
-        self.closes.clear();
-        self.deltas.clear();
-        self.path_sum = 0.0;
+        self.pl2dist.reset();
+        self.ewm1.reset();
+        self.ewm2.reset();
+        self.normalization_window.clear();
     }
 }
 
 impl TrendStrength {
-    /// Creates a new [`TrendStrength`] with the given window length.
+    /// Creates a new [`TrendStrength`] matching the notebook pipeline.
     ///
     /// # Panics
     ///
-    /// Panics if `period` is zero.
+    /// Panics if `period`, `normalization_period`, or `ewm_alpha` are invalid.
     #[must_use]
-    pub fn new(period: usize, price_type: Option<PriceType>) -> Self {
-        assert!(period > 0, "TrendStrength period must be positive");
+    pub fn new(
+        period: usize,
+        price_type: Option<PriceType>,
+        ewm_alpha: Option<f64>,
+        normalization_period: Option<usize>,
+    ) -> Self {
+        let ewm_alpha = ewm_alpha.unwrap_or(DEFAULT_EWM_ALPHA);
+        let normalization_period = normalization_period.unwrap_or(DEFAULT_NORMALIZATION_PERIOD);
+        assert!(
+            normalization_period > 0,
+            "TrendStrength normalization_period must be positive"
+        );
 
+        let price_type = price_type.unwrap_or(PriceType::Last);
         Self {
             period,
-            price_type: price_type.unwrap_or(PriceType::Last),
+            ewm_alpha,
+            normalization_period,
+            normalization_epsilon: DEFAULT_NORMALIZATION_EPSILON,
+            price_type,
+            raw_value: 0.0,
+            smoothed_value: 0.0,
             value: 0.0,
             initialized: false,
-            closes: VecDeque::with_capacity(period + 1),
-            deltas: VecDeque::with_capacity(period),
-            path_sum: 0.0,
+            pl2dist: Pl2Dist::new(period, Some(price_type)),
+            ewm1: ExponentiallyWeightedMean::new(ewm_alpha, Some(1), Some(price_type)),
+            ewm2: ExponentiallyWeightedMean::new(ewm_alpha, Some(1), Some(price_type)),
+            normalization_window: VecDeque::with_capacity(normalization_period),
         }
     }
 
-    /// Creates an instance with [`DEFAULT_PERIOD`] (120).
     #[must_use]
     pub fn new_default(price_type: Option<PriceType>) -> Self {
-        Self::new(DEFAULT_PERIOD, price_type)
+        Self::new(
+            DEFAULT_PERIOD,
+            price_type,
+            Some(DEFAULT_EWM_ALPHA),
+            Some(DEFAULT_NORMALIZATION_PERIOD),
+        )
     }
 
-    /// Updates the indicator with a raw close (or last) price as `f64`.
     pub fn update_raw(&mut self, close: f64) {
-        if let Some(&prev) = self.closes.back() {
-            let delta_abs = (close - prev).abs();
-            self.path_sum += delta_abs;
-            self.deltas.push_back(delta_abs);
-            if self.deltas.len() > self.period {
-                if let Some(old) = self.deltas.pop_front() {
-                    self.path_sum -= old;
-                }
-            }
+        self.pl2dist.update_raw(close);
+        if !self.pl2dist.initialized {
+            self.raw_value = 0.0;
+            self.smoothed_value = 0.0;
+            self.value = 0.0;
+            self.initialized = false;
+            return;
         }
 
-        self.closes.push_back(close);
-        if self.closes.len() > self.period + 1 {
-            self.closes.pop_front();
+        self.raw_value = self.pl2dist.value;
+        self.ewm1.update_raw(self.raw_value);
+        self.ewm2.update_raw(self.ewm1.value);
+        self.smoothed_value = self.ewm2.value;
+
+        self.normalization_window.push_back(self.smoothed_value);
+        if self.normalization_window.len() > self.normalization_period {
+            self.normalization_window.pop_front();
         }
 
-        self.initialized = self.closes.len() == self.period + 1 && self.deltas.len() == self.period;
-
+        self.initialized = self.normalization_window.len() == self.normalization_period;
         if !self.initialized {
             self.value = 0.0;
             return;
         }
 
-        let Some((&first, &last)) = self.closes.front().zip(self.closes.back()) else {
-            self.value = 0.0;
-            return;
-        };
-        let net_displacement = last - first;
+        let (min, max) = self.normalization_window.iter().fold(
+            (f64::INFINITY, f64::NEG_INFINITY),
+            |(min, max), &value| (min.min(value), max.max(value)),
+        );
 
-        self.value = if self.path_sum == 0.0 {
-            0.0
-        } else {
-            net_displacement / self.path_sum
-        };
+        self.value =
+            2.0 * (self.smoothed_value - min) / (max - min + self.normalization_epsilon) - 1.0;
     }
 }
 
@@ -163,67 +204,36 @@ impl TrendStrength {
 mod tests {
     use rstest::rstest;
 
-    use crate::{harmony::trend_strength::TrendStrength, indicator::Indicator, stubs::*};
+    use crate::{harmony::trend_strength::TrendStrength, indicator::Indicator};
 
     #[rstest]
-    fn test_display_and_default_not_initialized() {
-        let ind = TrendStrength::new_default(None);
-        assert_eq!(format!("{ind}"), "TrendStrength(120)");
+    fn test_pipeline_initializes_after_normalization_window() {
+        let mut ind = TrendStrength::new(2, None, Some(0.1), Some(5));
+        ind.update_raw(1.0);
+        ind.update_raw(2.0);
         assert!(!ind.initialized());
-    }
 
-    #[rstest]
-    fn test_monotone_up_full_window() {
-        let mut ind = TrendStrength::new(4, None);
-        for x in [0.0_f64, 1.0, 2.0, 3.0, 4.0] {
-            ind.update_raw(x);
-        }
-        assert!(ind.initialized());
-        assert!((ind.value - 1.0).abs() < 1e-12);
-    }
-
-    #[rstest]
-    fn test_monotone_down_full_window() {
-        let mut ind = TrendStrength::new(4, None);
-        for x in [4.0_f64, 3.0, 2.0, 1.0, 0.0] {
-            ind.update_raw(x);
-        }
-        assert!(ind.initialized());
-        assert!((ind.value - (-1.0)).abs() < 1e-12);
-    }
-
-    #[rstest]
-    fn test_flat_path_zero() {
-        let mut ind = TrendStrength::new(2, None);
-        ind.update_raw(1.0);
-        ind.update_raw(1.0);
-        ind.update_raw(1.0);
-        assert!(ind.initialized());
+        ind.update_raw(3.0);
+        assert!(!ind.initialized());
+        assert_eq!(ind.raw_value, 1.0);
+        assert_eq!(ind.smoothed_value, 1.0);
         assert_eq!(ind.value, 0.0);
+
+        for value in [4.0, 5.0, 6.0, 7.0] {
+            ind.update_raw(value);
+        }
+        assert!(ind.initialized());
     }
 
     #[rstest]
     fn test_reset() {
-        let mut ind = TrendStrength::new(2, None);
-        ind.update_raw(1.0);
-        ind.update_raw(2.0);
-        ind.update_raw(3.0);
+        let mut ind = TrendStrength::new(2, None, Some(0.1), Some(5));
+        for value in [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0] {
+            ind.update_raw(value);
+        }
         assert!(ind.initialized());
         ind.reset();
         assert!(!ind.initialized());
         assert_eq!(ind.value, 0.0);
-    }
-
-    #[rstest]
-    fn test_handle_bar() {
-        let mut ind = TrendStrength::new(2, None);
-        let bar1 = bar_ethusdt_binance_minute_bid("100.0");
-        let bar2 = bar_ethusdt_binance_minute_bid("101.0");
-        let bar3 = bar_ethusdt_binance_minute_bid("103.0");
-        ind.handle_bar(&bar1);
-        ind.handle_bar(&bar2);
-        ind.handle_bar(&bar3);
-        assert!(ind.initialized());
-        assert!((ind.value - 1.0).abs() < 1e-9);
     }
 }

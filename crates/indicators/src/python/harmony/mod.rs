@@ -13,7 +13,5 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Custom quantitative indicators (Harmony namespace).
-
 pub mod pl2dist;
 pub mod trend_strength;

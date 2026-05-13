@@ -26,9 +26,10 @@ use rstest::*;
 use crate::{
     average::{
         MovingAverageType, ama::AdaptiveMovingAverage, dema::DoubleExponentialMovingAverage,
-        ema::ExponentialMovingAverage, hma::HullMovingAverage, lr::LinearRegression,
-        rma::WilderMovingAverage, sma::SimpleMovingAverage, vidya::VariableIndexDynamicAverage,
-        vwap::VolumeWeightedAveragePrice, wma::WeightedMovingAverage,
+        ema::ExponentialMovingAverage, ewm::ExponentiallyWeightedMean, hma::HullMovingAverage,
+        lr::LinearRegression, rma::WilderMovingAverage, sma::SimpleMovingAverage,
+        vidya::VariableIndexDynamicAverage, vwap::VolumeWeightedAveragePrice,
+        wma::WeightedMovingAverage,
     },
     momentum::{
         amat::ArcherMovingAveragesTrends, bb::BollingerBands, bias::Bias,
@@ -117,6 +118,11 @@ pub fn indicator_sma_10() -> SimpleMovingAverage {
 #[fixture]
 pub fn indicator_ema_10() -> ExponentialMovingAverage {
     ExponentialMovingAverage::new(10, Some(PriceType::Mid))
+}
+
+#[fixture]
+pub fn indicator_ewm_alpha_10() -> ExponentiallyWeightedMean {
+    ExponentiallyWeightedMean::new(0.1, Some(1), Some(PriceType::Mid))
 }
 
 #[fixture]

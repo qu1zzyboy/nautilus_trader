@@ -26,6 +26,7 @@
 
 pub mod average;
 pub mod book;
+pub mod harmony;
 pub mod momentum;
 pub mod ratio;
 pub mod volatility;
@@ -42,6 +43,7 @@ pub fn indicators(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Average
     m.add_class::<crate::average::MovingAverageType>()?;
     m.add_class::<crate::average::ema::ExponentialMovingAverage>()?;
+    m.add_class::<crate::average::ewm::ExponentiallyWeightedMean>()?;
     m.add_class::<crate::average::sma::SimpleMovingAverage>()?;
     m.add_class::<crate::average::ama::AdaptiveMovingAverage>()?;
     m.add_class::<crate::average::dema::DoubleExponentialMovingAverage>()?;
@@ -51,6 +53,10 @@ pub fn indicators(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::average::vwap::VolumeWeightedAveragePrice>()?;
     m.add_class::<crate::average::lr::LinearRegression>()?;
     m.add_class::<crate::average::wma::WeightedMovingAverage>()?;
+
+    // Harmony
+    m.add_class::<crate::harmony::pl2dist::Pl2Dist>()?;
+    m.add_class::<crate::harmony::trend_strength::TrendStrength>()?;
 
     // Book
         m.add_class::<crate::book::imbalance::BookImbalanceRatio>()?;
