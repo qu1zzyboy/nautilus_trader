@@ -24,7 +24,7 @@ use nautilus_core::{
     consts::NAUTILUS_USER_AGENT, datetime::SECONDS_IN_DAY, nanos::UnixNanos, time::AtomicTime,
 };
 use nautilus_model::{
-    data::{Bar, BarType, TradeTick},
+    data::{Bar, BarType, BnBar, TradeTick},
     enums::{
         AggregationSource, AggressorSide, BarAggregation, MarketStatusAction, OrderSide, OrderType,
         TimeInForce,
@@ -2307,13 +2307,13 @@ impl BinanceFuturesHttpClient {
     ///
     /// Returns an error if the bar type is not supported, instrument is not cached,
     /// or the request fails.
-    pub async fn request_bars(
+    pub async fn request_bn_bars(
         &self,
         bar_type: BarType,
         start: Option<DateTime<Utc>>,
         end: Option<DateTime<Utc>>,
         limit: Option<u32>,
-    ) -> anyhow::Result<Vec<Bar>> {
+    ) -> anyhow::Result<Vec<BnBar>> {
         anyhow::ensure!(
             bar_type.aggregation_source() == AggregationSource::External,
             "Only EXTERNAL aggregation is supported"
@@ -2355,17 +2355,28 @@ impl BinanceFuturesHttpClient {
             let low: f64 = kline.low.parse().unwrap_or(0.0);
             let close: f64 = kline.close.parse().unwrap_or(0.0);
             let volume: f64 = kline.volume.parse().unwrap_or(0.0);
+            let quote_volume: f64 = kline.quote_volume.parse().unwrap_or(0.0);
+            let taker_buy_volume: f64 = kline.taker_buy_base_volume.parse().unwrap_or(0.0);
+            let taker_buy_quote_volume: f64 =
+                kline.taker_buy_quote_volume.parse().unwrap_or(0.0);
+            let trades_count = u64::try_from(kline.num_trades).unwrap_or(0);
 
             // close_time is end of interval, add 1ms for next bar's open
             let ts_event = UnixNanos::from_millis(kline.close_time as u64);
 
-            let bar = Bar::new(
+            let bar = BnBar::new(
                 bar_type,
                 Price::new(open, price_precision),
                 Price::new(high, price_precision),
                 Price::new(low, price_precision),
                 Price::new(close, price_precision),
                 Quantity::new(volume, size_precision),
+                Quantity::new(quote_volume, size_precision),
+                Quantity::new(taker_buy_volume, size_precision),
+                Quantity::new(taker_buy_quote_volume, size_precision),
+                trades_count,
+                0,
+                0,
                 ts_event,
                 ts_init,
             );
@@ -2373,6 +2384,27 @@ impl BinanceFuturesHttpClient {
         }
 
         Ok(result)
+    }
+
+    /// Requests standard bar data for an instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bar type is not supported, instrument is not cached,
+    /// or the request fails.
+    pub async fn request_bars(
+        &self,
+        bar_type: BarType,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<u32>,
+    ) -> anyhow::Result<Vec<Bar>> {
+        Ok(self
+            .request_bn_bars(bar_type, start, end, limit)
+            .await?
+            .iter()
+            .map(BnBar::as_bar)
+            .collect())
     }
 }
 

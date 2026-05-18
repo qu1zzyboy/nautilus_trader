@@ -28,7 +28,7 @@ use log::LevelFilter;
 use nautilus_core::{Params, UnixNanos};
 use nautilus_model::{
     data::{
-        Bar, BarType, BookOrder, CustomData, DataType, FundingRateUpdate, HasTsInit,
+        Bar, BarType, BnBar, BookOrder, CustomData, Data, DataType, FundingRateUpdate, HasTsInit,
         IndexPriceUpdate, InstrumentStatus, MarkPriceUpdate, OrderBookDelta, OrderBookDeltas,
         QuoteTick, TradeTick,
         close::InstrumentClose,
@@ -136,6 +136,27 @@ pub(crate) fn make_test_custom_data(label: &str) -> CustomData {
     }))
 }
 
+fn make_test_bn_bar(instrument_id: InstrumentId) -> BnBar {
+    let bar_type =
+        BarType::from_str(&format!("{instrument_id}-1-MINUTE-LAST-EXTERNAL")).unwrap();
+    BnBar::new(
+        bar_type,
+        Price::from("1.00000"),
+        Price::from("1.00010"),
+        Price::from("0.99990"),
+        Price::from("1.00005"),
+        Quantity::from("1000"),
+        Quantity::from("1000.05"),
+        Quantity::from("600"),
+        Quantity::from("600.03"),
+        42,
+        100,
+        141,
+        UnixNanos::from(1),
+        UnixNanos::from(2),
+    )
+}
+
 #[derive(Debug)]
 struct TestDataActor {
     core: DataActorCore,
@@ -156,6 +177,8 @@ struct TestDataActor {
     pub received_chain_slices: Vec<OptionChainSlice>,
     pub received_signals: Vec<Signal>,
     pub received_custom_data: Vec<CustomData>,
+    pub received_bn_bars: Vec<BnBar>,
+    pub received_historical_bn_bars: Vec<BnBar>,
     #[cfg(feature = "defi")]
     pub received_blocks: Vec<Block>,
     #[cfg(feature = "defi")]
@@ -187,6 +210,11 @@ impl DataActor for TestDataActor {
     fn on_data(&mut self, data: &CustomData) -> anyhow::Result<()> {
         self.received_data.push(data.data_type.to_string());
         self.received_custom_data.push(data.clone());
+        Ok(())
+    }
+
+    fn on_bn_bar(&mut self, bar: &BnBar) -> anyhow::Result<()> {
+        self.received_bn_bars.push(*bar);
         Ok(())
     }
 
@@ -243,6 +271,11 @@ impl DataActor for TestDataActor {
     fn on_historical_bars(&mut self, bars: &[Bar]) -> anyhow::Result<()> {
         // Push to common received vec
         self.received_bars.extend(bars);
+        Ok(())
+    }
+
+    fn on_historical_bn_bars(&mut self, bars: &[BnBar]) -> anyhow::Result<()> {
+        self.received_historical_bn_bars.extend(bars);
         Ok(())
     }
 
@@ -333,6 +366,8 @@ impl TestDataActor {
             received_chain_slices: Vec::new(),
             received_signals: Vec::new(),
             received_custom_data: Vec::new(),
+            received_bn_bars: Vec::new(),
+            received_historical_bn_bars: Vec::new(),
             #[cfg(feature = "defi")]
             received_blocks: Vec::new(),
             #[cfg(feature = "defi")]
@@ -492,6 +527,32 @@ fn test_subscribe_and_receive_custom_data(
     msgbus::publish_any(topic, &data);
 
     assert_eq!(actor.received_data.len(), 2);
+}
+
+#[rstest]
+fn test_subscribe_and_receive_bn_bar_custom_data(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    audusd_sim: CurrencyPair,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    let bn_bar = make_test_bn_bar(audusd_sim.id);
+    let Data::Custom(data) = Data::from(bn_bar) else {
+        panic!("BnBar must convert to Data::Custom");
+    };
+    actor.subscribe_data(data.data_type.clone(), None, None);
+
+    let topic = get_custom_topic(&data.data_type);
+    let data_type_string = data.data_type.to_string();
+    msgbus::publish_any(topic, &data);
+
+    assert_eq!(actor.received_bn_bars, vec![bn_bar]);
+    assert_eq!(actor.received_custom_data, vec![data]);
+    assert_eq!(actor.received_data, vec![data_type_string]);
 }
 
 #[rstest]
@@ -1944,6 +2005,47 @@ fn test_request_data(
     // Actor should receive the custom data
     assert_eq!(actor.received_data.len(), 1);
     assert_eq!(actor.received_data[0], "Any { .. }");
+}
+
+#[rstest]
+fn test_bn_bar_data_response_triggers_historical_callback(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    audusd_sim: CurrencyPair,
+) {
+    test_logging();
+
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    let bn_bar = make_test_bn_bar(audusd_sim.id);
+    let Data::Custom(data) = Data::from(bn_bar) else {
+        panic!("BnBar must convert to Data::Custom");
+    };
+    let data_type = data.data_type.clone();
+    let client_id = ClientId::new("TestClient");
+    let request_id = actor
+        .request_data(data_type.clone(), client_id, None, None, None, None)
+        .unwrap();
+
+    let response = CustomDataResponse::new(
+        request_id,
+        client_id,
+        Some(audusd_sim.id.venue),
+        data_type,
+        vec![bn_bar],
+        Some(UnixNanos::from(946_684_800_000_000_000)),
+        Some(UnixNanos::from(946_771_200_000_000_000)),
+        UnixNanos::default(),
+        None,
+    );
+
+    msgbus::send_response(&request_id, &DataResponse::Data(response));
+
+    assert_eq!(actor.received_historical_bn_bars, vec![bn_bar]);
+    assert_eq!(actor.received_data, vec!["Any { .. }"]);
 }
 
 #[cfg(feature = "defi")]

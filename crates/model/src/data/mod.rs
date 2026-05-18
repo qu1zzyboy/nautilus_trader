@@ -17,6 +17,7 @@
 
 pub mod bar;
 pub mod bet;
+pub mod bn_bar;
 pub mod black_scholes;
 pub mod close;
 pub mod custom;
@@ -45,11 +46,12 @@ use std::{
 
 use nautilus_core::{Params, UnixNanos};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value as JsonValue, to_string};
+use serde_json::{Value as JsonValue, json, to_string};
 
 // Re-exports
 #[rustfmt::skip]  // Keep these grouped
 pub use bar::{Bar, BarSpecification, BarType};
+pub use bn_bar::BnBar;
 pub use black_scholes::Greeks;
 pub use close::InstrumentClose;
 #[cfg(feature = "python")]
@@ -480,6 +482,21 @@ impl From<TradeTick> for Data {
 impl From<Bar> for Data {
     fn from(value: Bar) -> Self {
         Self::Bar(value)
+    }
+}
+
+impl From<BnBar> for Data {
+    fn from(value: BnBar) -> Self {
+        let metadata = serde_json::from_value(json!({
+            "bar_type": value.bar_type.to_string(),
+        }))
+        .expect("BnBar metadata should be valid params");
+        let data_type = DataType::new(
+            "BnBar",
+            Some(metadata),
+            Some(value.instrument_id().to_string()),
+        );
+        Self::Custom(CustomData::new(std::sync::Arc::new(value), data_type))
     }
 }
 

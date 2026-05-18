@@ -34,8 +34,8 @@ use nautilus_model::defi::{
 };
 use nautilus_model::{
     data::{
-        Bar, BarType, CustomData, DataType, FundingRateUpdate, IndexPriceUpdate, InstrumentStatus,
-        MarkPriceUpdate, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
+        Bar, BarType, BnBar, CustomData, DataType, FundingRateUpdate, IndexPriceUpdate,
+        InstrumentStatus, MarkPriceUpdate, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
         close::InstrumentClose,
         option_chain::{OptionChainSlice, OptionGreeks, StrikeRange},
     },
@@ -277,6 +277,16 @@ pub trait DataActor:
     /// Returns an error if handling the data fails.
     #[allow(unused_variables)]
     fn on_data(&mut self, data: &CustomData) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Actions to be performed when receiving Binance kline bar data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if handling the Binance bar fails.
+    #[allow(unused_variables)]
+    fn on_bn_bar(&mut self, bar: &BnBar) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -559,6 +569,16 @@ pub trait DataActor:
         Ok(())
     }
 
+    /// Actions to be performed when receiving historical Binance bars.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if handling the historical Binance bars fails.
+    #[allow(unused_variables)]
+    fn on_historical_bn_bars(&mut self, bars: &[BnBar]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Actions to be performed when receiving historical mark prices.
     ///
     /// # Errors
@@ -603,6 +623,12 @@ pub trait DataActor:
         if self.not_running() {
             log_not_running(&data);
             return;
+        }
+
+        if let Some(bn_bar) = data.data.as_any().downcast_ref::<BnBar>()
+            && let Err(e) = self.on_bn_bar(bn_bar)
+        {
+            log_error(&e);
         }
 
         if let Err(e) = self.on_data(data) {
@@ -950,6 +976,12 @@ pub trait DataActor:
     /// Handles a data response.
     fn handle_data_response(&mut self, resp: &CustomDataResponse) {
         log_received(&resp);
+
+        if let Some(bn_bars) = resp.data.downcast_ref::<Vec<BnBar>>()
+            && let Err(e) = self.on_historical_bn_bars(bn_bars)
+        {
+            log_error(&e);
+        }
 
         if let Err(e) = self.on_historical_data(resp.data.as_ref()) {
             log_error(&e);
