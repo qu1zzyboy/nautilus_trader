@@ -14,6 +14,7 @@
 # -------------------------------------------------------------------------------------------------
 
 from decimal import Decimal
+from unittest.mock import ANY
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 
@@ -23,6 +24,7 @@ import pytest
 from nautilus_trader.adapters.bybit.config import BybitExecClientConfig
 from nautilus_trader.adapters.bybit.constants import BYBIT_VENUE
 from nautilus_trader.adapters.bybit.execution import BybitExecutionClient
+from nautilus_trader.adapters.bybit.execution import _is_confirmed_submit_rejection_error
 from nautilus_trader.adapters.bybit.execution import _parse_bybit_tp_sl_params
 from nautilus_trader.common.component import TestClock
 from nautilus_trader.core import nautilus_pyo3
@@ -1307,6 +1309,7 @@ def test_handle_order_status_report_caches_venue_position_id(
         init_id=TestIdStubs.uuid(),
         ts_init=0,
     )
+    order.apply(TestEventStubs.order_submitted(order=order))
     cache.add_order(order, None)
 
     venue_position_id = PositionId("BTCUSDT-SPOT.BYBIT-LONG")
@@ -1329,6 +1332,139 @@ def test_handle_order_status_report_caches_venue_position_id(
 
     assert client._order_position_ids[order.client_order_id] == venue_position_id
     client.generate_order_accepted.assert_called_once()
+
+
+def test_handle_order_status_report_submitted_bbo_emits_accepted_then_updated(
+    exec_client_builder,
+    monkeypatch,
+    cache,
+    instrument,
+):
+    # Arrange
+    client, *_ = exec_client_builder(monkeypatch)
+    order = LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-BBO-SUBMITTED"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.100000"),
+        price=Price.from_str("50000.00"),
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    order.apply(TestEventStubs.order_submitted(order=order))
+    cache.add_order(order, None)
+
+    venue_order_id = VenueOrderId("BYBIT-BBO-001")
+    resolved_price = Price.from_str("49995.00")
+
+    report = MagicMock()
+    report.client_order_id = order.client_order_id
+    report.instrument_id = order.instrument_id
+    report.venue_order_id = venue_order_id
+    report.venue_position_id = None
+    report.order_status = OrderStatus.ACCEPTED
+    report.quantity = order.quantity
+    report.price = resolved_price
+    report.trigger_price = None
+    report.ts_last = 0
+
+    def is_order_updated(order_arg):
+        return order_arg.price != resolved_price
+
+    report.is_order_updated.side_effect = is_order_updated
+    monkeypatch.setattr(
+        "nautilus_trader.adapters.bybit.execution.OrderStatusReport.from_pyo3",
+        lambda _: report,
+    )
+
+    call_order: list[str] = []
+    client.generate_order_accepted = MagicMock(
+        side_effect=lambda **_kwargs: call_order.append("accepted"),
+    )
+    client.generate_order_updated = MagicMock(
+        side_effect=lambda **_kwargs: call_order.append("updated"),
+    )
+
+    # Act
+    client._handle_order_status_report_pyo3(MagicMock())
+
+    # Assert
+    assert call_order == ["accepted", "updated"]
+    client.generate_order_accepted.assert_called_once_with(
+        strategy_id=order.strategy_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        venue_order_id=venue_order_id,
+        ts_event=0,
+    )
+    client.generate_order_updated.assert_called_once_with(
+        strategy_id=order.strategy_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        venue_order_id=venue_order_id,
+        quantity=order.quantity,
+        price=resolved_price,
+        trigger_price=None,
+        ts_event=0,
+    )
+
+
+def test_handle_order_status_report_accepted_with_diff_emits_only_updated(
+    exec_client_builder,
+    monkeypatch,
+    cache,
+    instrument,
+):
+    # Arrange
+    client, *_ = exec_client_builder(monkeypatch)
+    order = LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-AMEND"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.100000"),
+        price=Price.from_str("50000.00"),
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    order.apply(TestEventStubs.order_submitted(order=order))
+    order.apply(
+        TestEventStubs.order_accepted(
+            order=order,
+            venue_order_id=VenueOrderId("BYBIT-AMEND-001"),
+        ),
+    )
+    cache.add_order(order, None)
+
+    new_price = Price.from_str("50100.00")
+    report = MagicMock()
+    report.client_order_id = order.client_order_id
+    report.instrument_id = order.instrument_id
+    report.venue_order_id = order.venue_order_id
+    report.venue_position_id = None
+    report.order_status = OrderStatus.ACCEPTED
+    report.quantity = order.quantity
+    report.price = new_price
+    report.trigger_price = None
+    report.ts_last = 0
+    report.is_order_updated.return_value = True
+    monkeypatch.setattr(
+        "nautilus_trader.adapters.bybit.execution.OrderStatusReport.from_pyo3",
+        lambda _: report,
+    )
+
+    client.generate_order_accepted = MagicMock()
+    client.generate_order_updated = MagicMock()
+
+    # Act
+    client._handle_order_status_report_pyo3(MagicMock())
+
+    # Assert
+    client.generate_order_accepted.assert_not_called()
+    client.generate_order_updated.assert_called_once()
 
 
 @pytest.mark.parametrize(
@@ -1512,6 +1648,341 @@ async def test_submit_order_with_tp_sl_in_demo_mode_emits_order_denied(
         http_client.submit_order.assert_not_awaited()
     finally:
         await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_submit_order_demo_post_submit_lookup_failure_waits_for_reconciliation(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    client, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"environment": nautilus_pyo3.BybitEnvironment.DEMO},
+    )
+
+    http_client.submit_order = AsyncMock(
+        side_effect=ValueError("No order returned after submission"),
+    )
+    client.generate_order_submitted = MagicMock()
+    client.generate_order_rejected = MagicMock()
+
+    order = LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-UNKNOWN-OUTCOME"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.100"),
+        price=Price.from_str("50000.00"),
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    command = SubmitOrder(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        order=order,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        position_id=None,
+        client_id=None,
+    )
+
+    await client._submit_order(command)
+
+    client.generate_order_submitted.assert_called_once()
+    http_client.submit_order.assert_awaited_once()
+    client.generate_order_rejected.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_submit_order_demo_confirmed_rejection_emits_order_rejected(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    client, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"environment": nautilus_pyo3.BybitEnvironment.DEMO},
+    )
+
+    http_client.submit_order = AsyncMock(
+        side_effect=ValueError("Order rejected: EC_PostOnlyWillTakeLiquidity"),
+    )
+    client.generate_order_submitted = MagicMock()
+    client.generate_order_rejected = MagicMock()
+
+    order = LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-CONFIRMED-REJECT"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.100"),
+        price=Price.from_str("50000.00"),
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+        post_only=True,
+    )
+    command = SubmitOrder(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        order=order,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        position_id=None,
+        client_id=None,
+    )
+
+    await client._submit_order(command)
+
+    client.generate_order_submitted.assert_called_once()
+    http_client.submit_order.assert_awaited_once()
+    client.generate_order_rejected.assert_called_once_with(
+        strategy_id=order.strategy_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        reason="Order rejected: EC_PostOnlyWillTakeLiquidity",
+        ts_event=ANY,
+        due_post_only=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_submit_order_live_ws_failure_waits_for_reconciliation(
+    exec_client_builder,
+    monkeypatch,
+):
+    instrument = create_bybit_linear_perpetual()
+    client, _, _, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={
+            "position_mode": {
+                instrument.id.symbol.value: nautilus_pyo3.BybitPositionMode.BOTH_SIDES,
+            },
+        },
+    )
+
+    ws_trade_client = client._ws_trade_client
+    ws_trade_client.submit_order = AsyncMock(
+        side_effect=RuntimeError("Network error: connection closed"),
+    )
+    client.generate_order_submitted = MagicMock()
+    client.generate_order_rejected = MagicMock()
+
+    await client._connect()
+
+    order = LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-LIVE-WS-UNKNOWN-OUTCOME"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.100"),
+        price=Price.from_str("50000.00"),
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    command = SubmitOrder(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        order=order,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        position_id=None,
+        client_id=None,
+    )
+
+    try:
+        await client._submit_order(command)
+
+        client.generate_order_submitted.assert_called_once()
+        ws_trade_client.submit_order.assert_awaited_once()
+        client.generate_order_rejected.assert_not_called()
+        assert client._order_position_ids[order.client_order_id] == PositionId(
+            "BTCUSDT-LINEAR.BYBIT-LONG",
+        )
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_submit_order_list_demo_post_submit_lookup_failure_waits_for_reconciliation(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    client, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"environment": nautilus_pyo3.BybitEnvironment.DEMO},
+    )
+
+    http_client.submit_order = AsyncMock(
+        side_effect=ValueError("No order returned after submission"),
+    )
+    client.generate_order_submitted = MagicMock()
+    client.generate_order_rejected = MagicMock()
+
+    order = LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-LIST-UNKNOWN-OUTCOME"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.100"),
+        price=Price.from_str("50000.00"),
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    command = SubmitOrderList(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        order_list=OrderList(TestIdStubs.order_list_id(), [order]),
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        position_id=None,
+        client_id=None,
+    )
+
+    await client._submit_order_list(command)
+
+    client.generate_order_submitted.assert_called_once()
+    http_client.submit_order.assert_awaited_once()
+    client.generate_order_rejected.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_submit_order_list_demo_confirmed_rejection_emits_order_rejected(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    client, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"environment": nautilus_pyo3.BybitEnvironment.DEMO},
+    )
+
+    http_client.submit_order = AsyncMock(
+        side_effect=ValueError("Order rejected: EC_PostOnlyWillTakeLiquidity"),
+    )
+    client.generate_order_submitted = MagicMock()
+    client.generate_order_rejected = MagicMock()
+
+    order = LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-LIST-CONFIRMED-REJECT"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.100"),
+        price=Price.from_str("50000.00"),
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+        post_only=True,
+    )
+    command = SubmitOrderList(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        order_list=OrderList(TestIdStubs.order_list_id(), [order]),
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        position_id=None,
+        client_id=None,
+    )
+
+    await client._submit_order_list(command)
+
+    client.generate_order_submitted.assert_called_once()
+    http_client.submit_order.assert_awaited_once()
+    client.generate_order_rejected.assert_called_once_with(
+        strategy_id=order.strategy_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        reason="Order rejected: EC_PostOnlyWillTakeLiquidity",
+        ts_event=ANY,
+        due_post_only=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_submit_order_list_live_ws_failure_waits_for_reconciliation(
+    exec_client_builder,
+    monkeypatch,
+):
+    instrument = create_bybit_linear_perpetual()
+    client, _, _, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={
+            "position_mode": {
+                instrument.id.symbol.value: nautilus_pyo3.BybitPositionMode.BOTH_SIDES,
+            },
+        },
+    )
+
+    ws_trade_client = client._ws_trade_client
+    ws_trade_client.build_place_order_params = MagicMock(return_value=MagicMock())
+    ws_trade_client.batch_place_orders = AsyncMock(
+        side_effect=RuntimeError("Network error: connection closed"),
+    )
+    client.generate_order_submitted = MagicMock()
+    client.generate_order_rejected = MagicMock()
+
+    await client._connect()
+
+    order = LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-LIST-LIVE-WS-UNKNOWN-OUTCOME"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.100"),
+        price=Price.from_str("50000.00"),
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    command = SubmitOrderList(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        order_list=OrderList(TestIdStubs.order_list_id(), [order]),
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        position_id=None,
+        client_id=None,
+    )
+
+    try:
+        await client._submit_order_list(command)
+
+        client.generate_order_submitted.assert_called_once()
+        ws_trade_client.build_place_order_params.assert_called_once()
+        ws_trade_client.batch_place_orders.assert_awaited_once()
+        client.generate_order_rejected.assert_not_called()
+        assert client._order_position_ids[order.client_order_id] == PositionId(
+            "BTCUSDT-LINEAR.BYBIT-LONG",
+        )
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (ValueError("Order rejected: EC_PostOnlyWillTakeLiquidity"), True),
+        (RuntimeError("Network error: Timed out after 60000ms"), False),
+        (RuntimeError("Request canceled: Adapter disconnecting"), False),
+        (RuntimeError("Unexpected HTTP status code 500: server error"), False),
+        (RuntimeError("Unexpected HTTP status code 400: bad request"), False),
+        (ValueError("No order returned after submission"), False),
+        (
+            ValueError("Order lookup failed after submission: Bybit error 10001: Request error"),
+            False,
+        ),
+        (ValueError("Bybit error 10000: Server Timeout"), False),
+        (ValueError("Bybit error 10001: Request parameter error"), False),
+    ],
+)
+def test_is_confirmed_submit_rejection_error(exc, expected):
+    assert _is_confirmed_submit_rejection_error(exc) is expected
 
 
 @pytest.mark.asyncio

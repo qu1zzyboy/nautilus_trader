@@ -786,18 +786,17 @@ impl BacktestEngine {
             self.flush_accumulator_events(&clocks, flush_ts);
         }
 
-        // Stop trader
         self.kernel.stop_trader();
+
+        // Settle residual on_stop commands (e.g. close_all_positions) before stopping
+        // engines. Venue modules are not re-run; process_modules is once per timestamp.
+        let ts_now = self.kernel.clock.borrow().timestamp_ns();
+        self.settle_venues(ts_now);
 
         // Stop engines
         self.kernel.data_engine.borrow_mut().stop();
         self.kernel.risk_engine.borrow_mut().stop();
         self.kernel.exec_engine.borrow_mut().stop();
-
-        // Process remaining exchange messages
-        let ts_now = self.kernel.clock.borrow().timestamp_ns();
-        self.settle_venues(ts_now);
-        self.run_venue_modules(ts_now);
 
         self.run_finished = Some(UnixNanos::from(std::time::SystemTime::now()));
         self.backtest_end = Some(self.kernel.clock.borrow().timestamp_ns());
@@ -936,7 +935,11 @@ impl BacktestEngine {
         let orders = cache.orders(None, None, None, None, None);
         let total_events: usize = orders.iter().map(|o| o.event_count()).sum();
         let total_orders = orders.len();
-        let positions = cache.positions(None, None, None, None, None);
+        let positions: Vec<Position> = cache
+            .positions(None, None, None, None, None)
+            .into_iter()
+            .map(|p| p.cloned())
+            .collect();
         let total_positions = positions.len();
 
         let analyzer = self.build_analyzer(&cache, &positions);
@@ -972,9 +975,8 @@ impl BacktestEngine {
         }
     }
 
-    fn build_analyzer(&self, cache: &Cache, positions: &[&Position]) -> PortfolioAnalyzer {
+    fn build_analyzer(&self, cache: &Cache, positions: &[Position]) -> PortfolioAnalyzer {
         let mut analyzer = PortfolioAnalyzer::default();
-        let positions_owned: Vec<_> = positions.iter().map(|p| (*p).clone()).collect();
         let mut snapshot_positions = Vec::new();
 
         for position in positions {
@@ -984,7 +986,7 @@ impl BacktestEngine {
         // Aggregate starting and current balances across all venue accounts
         for venue in self.venues.keys() {
             if let Some(account) = cache.account_for_venue(venue) {
-                let account_ref: &dyn Account = match account {
+                let account_ref: &dyn Account = match &*account {
                     AccountAny::Margin(margin) => margin,
                     AccountAny::Cash(cash) => cash,
                     AccountAny::Betting(betting) => betting,
@@ -1008,7 +1010,7 @@ impl BacktestEngine {
             }
         }
 
-        analyzer.add_positions(&positions_owned);
+        analyzer.add_positions(positions);
         analyzer.add_positions(&snapshot_positions);
         analyzer
     }
@@ -1208,6 +1210,10 @@ impl BacktestEngine {
         // Only process and iterate venues that had pending commands each
         // pass, to avoid extra fill-model rolls on untouched venues.
         loop {
+            // Drain first so commands buffered in the trading queue (e.g. from
+            // on_stop handlers) reach the venues before we check for activity.
+            self.drain_command_queues();
+
             let active_venues: Vec<Venue> = self
                 .venues
                 .iter()
@@ -1321,7 +1327,7 @@ impl BacktestEngine {
 
             if let Some(account) = cache.account_for_venue(&ex.id) {
                 log::info!("Balances starting:");
-                let account_ref: &dyn Account = match account {
+                let account_ref: &dyn Account = match &*account {
                     AccountAny::Margin(margin) => margin,
                     AccountAny::Cash(cash) => cash,
                     AccountAny::Betting(betting) => betting,
@@ -1358,7 +1364,11 @@ impl BacktestEngine {
         let orders = cache.orders(None, None, None, None, None);
         let total_events: usize = orders.iter().map(|o| o.event_count()).sum();
         let total_orders = orders.len();
-        let positions = cache.positions(None, None, None, None, None);
+        let positions: Vec<Position> = cache
+            .positions(None, None, None, None, None)
+            .into_iter()
+            .map(|p| p.cloned())
+            .collect();
         let total_positions = positions.len();
 
         let config_id = self.run_config_id.as_deref().unwrap_or("None");

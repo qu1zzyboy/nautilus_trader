@@ -8,7 +8,7 @@ on:
   push:
     branches: [nightly-merge-test]
   schedule:
-    - cron: '0 14 * * *' # At 14:00 UTC daily
+    - cron: "0 14 * * *" # At 14:00 UTC daily
   workflow_dispatch: # Allow manual trigger
 
 jobs:
@@ -34,7 +34,7 @@ jobs:
         with:
           persist-credentials: false
           token: ${{ secrets.NIGHTLY_TOKEN }}
-          fetch-depth: 0  # Fetch all history for all tags and branches
+          fetch-depth: 0 # Fetch all history for all tags and branches
 
       - name: Fetch develop branch workflows
         id: fetch-workflows
@@ -132,14 +132,9 @@ jobs:
         # https://github.com/actions/checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          persist-credentials: false
+          persist-credentials: true
           token: ${{ secrets.NIGHTLY_TOKEN }}
-          fetch-depth: 0  # Fetch all history for all tags and branches
-
-      - name: Configure authenticated git remote
-        run: |
-          git remote set-url origin \
-            "https://x-access-token:${{ secrets.NIGHTLY_TOKEN }}@github.com/${{ github.repository }}"
+          fetch-depth: 0 # Fetch all history for all tags and branches
 
       - name: Configure Git user
         run: |
@@ -173,7 +168,7 @@ jobs:
           fi
 
       - name: Check merge result
-        run: |
+        run: |-
           develop_sha="${{ needs.check-develop-status.outputs.develop_sha }}"
           nightly_sha=$(git rev-parse HEAD)
           if [[ "$nightly_sha" == "$develop_sha" ]]; then

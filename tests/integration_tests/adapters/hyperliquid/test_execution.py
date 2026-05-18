@@ -22,7 +22,9 @@ import pytest
 from nautilus_trader.adapters.hyperliquid.config import HyperliquidExecClientConfig
 from nautilus_trader.adapters.hyperliquid.constants import HYPERLIQUID_VENUE
 from nautilus_trader.adapters.hyperliquid.execution import HyperliquidExecutionClient
+from nautilus_trader.adapters.hyperliquid.execution import _is_transport_error
 from nautilus_trader.core import nautilus_pyo3
+from nautilus_trader.execution.messages import BatchCancelOrders
 from nautilus_trader.execution.messages import CancelAllOrders
 from nautilus_trader.execution.messages import CancelOrder
 from nautilus_trader.execution.messages import GenerateFillReports
@@ -521,6 +523,7 @@ async def test_submit_order_rejection(exec_client_builder, monkeypatch, instrume
     )
     await client._connect()
 
+    client.generate_order_rejected = MagicMock()
     http_client.submit_order.side_effect = Exception("Order rejected: Insufficient margin")
 
     order = LimitOrder(
@@ -549,8 +552,11 @@ async def test_submit_order_rejection(exec_client_builder, monkeypatch, instrume
         # Act - Should not raise, but handle gracefully
         await client._submit_order(command)
 
-        # Assert - Order rejection is handled internally
+        # Assert - Order rejection is emitted with the venue reason
         http_client.submit_order.assert_awaited_once()
+        client.generate_order_rejected.assert_called_once()
+        reason = client.generate_order_rejected.call_args.kwargs["reason"]
+        assert "Insufficient margin" in reason
     finally:
         await client._disconnect()
 
@@ -664,6 +670,7 @@ async def test_cancel_order_rejection(
     )
     await client._connect()
 
+    client.generate_order_cancel_rejected = MagicMock()
     http_client.cancel_order.side_effect = Exception("Order already filled")
 
     order = LimitOrder(
@@ -695,8 +702,11 @@ async def test_cancel_order_rejection(
         # Act - Should not raise
         await client._cancel_order(command)
 
-        # Assert - Rejection is handled internally
+        # Assert - Cancel rejection is emitted with the venue reason
         http_client.cancel_order.assert_awaited_once()
+        client.generate_order_cancel_rejected.assert_called_once()
+        reason = client.generate_order_cancel_rejected.call_args.kwargs["reason"]
+        assert "Order already filled" in reason
     finally:
         await client._disconnect()
 
@@ -2714,3 +2724,761 @@ async def test_buffered_fills_cleared_on_terminal_cleanup(
         assert cid.value not in client._buffered_fills
     finally:
         await client._disconnect()
+
+
+def _build_order_accepted_pyo3(client, instrument, client_order_id, venue_order_id):
+    return nautilus_pyo3.OrderAccepted(
+        trader_id=nautilus_pyo3.TraderId(TestIdStubs.trader_id().value),
+        strategy_id=nautilus_pyo3.StrategyId(TestIdStubs.strategy_id().value),
+        instrument_id=nautilus_pyo3.InstrumentId.from_str(instrument.id.value),
+        client_order_id=nautilus_pyo3.ClientOrderId(client_order_id.value),
+        venue_order_id=nautilus_pyo3.VenueOrderId(venue_order_id),
+        account_id=nautilus_pyo3.AccountId(client.account_id.value),
+        event_id=nautilus_pyo3.UUID4(),
+        ts_event=0,
+        ts_init=0,
+        reconciliation=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_fill_report_buffers_when_order_not_in_cache(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+):
+    """
+    A FillReport arriving before the order has been added to the local cache must be
+    buffered in `_pending_fills` rather than dropped, so it can be replayed once the
+    order becomes known.
+    """
+    # Arrange
+    client, _, _, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    cid = ClientOrderId("O-PENDING-001")
+    # Force the non-external path while the cache has no order, exercising the race.
+    monkeypatch.setattr(client, "_is_external_order", lambda _: False)
+
+    captured: list = []
+    monkeypatch.setattr(client, "_send_order_event", lambda event: captured.append(event))
+
+    fill = _build_fill_report_pyo3(
+        client,
+        instrument,
+        cid,
+        "9400",
+        "T-PENDING-1",
+        "0.00020",
+        "56730.0",
+    )
+
+    try:
+        # Act
+        client._handle_fill_report_pyo3(fill)
+
+        # Assert
+        assert captured == []
+        assert client._pending_fills[cid.value] == [fill]
+        assert "T-PENDING-1" not in client._processed_trade_ids
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_order_accepted_drains_pending_fill(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+):
+    """
+    The dedicated OrderAccepted WS event must drain any FillReport that was buffered
+    while the order was not yet in cache, producing OrderFilled in order.
+    """
+    # Arrange
+    client, _, _, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    order = LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-PENDING-002"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.00020"),
+        price=Price.from_str("56730.0"),
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    voi = VenueOrderId("9410")
+    captured: list = []
+    monkeypatch.setattr(client, "_send_order_event", lambda event: captured.append(event))
+
+    fill = _build_fill_report_pyo3(
+        client,
+        instrument,
+        order.client_order_id,
+        voi.value,
+        "T-PENDING-2",
+        "0.00020",
+        "56730.0",
+    )
+    accepted_msg = _build_order_accepted_pyo3(
+        client,
+        instrument,
+        order.client_order_id,
+        voi.value,
+    )
+
+    try:
+        monkeypatch.setattr(client, "_is_external_order", lambda _: False)
+
+        # Act 1: fill arrives before order known, buffered.
+        client._handle_fill_report_pyo3(fill)
+        assert client._pending_fills[order.client_order_id.value] == [fill]
+
+        # Act 2: order is now added to cache; OrderAccepted drains the buffer.
+        cache.add_order(order, None)
+        client._handle_order_accepted_pyo3(accepted_msg)
+
+        # Assert
+        filled_events = [e for e in captured if isinstance(e, OrderFilled)]
+        assert len(filled_events) == 1
+        assert filled_events[0].venue_order_id == voi
+        assert filled_events[0].trade_id.value == "T-PENDING-2"
+        assert order.client_order_id.value not in client._pending_fills
+        assert "T-PENDING-2" in client._processed_trade_ids
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_order_status_accepted_drains_pending_fill(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+):
+    """
+    The ACCEPTED branch of OrderStatusReport must drain any FillReport buffered while
+    the order was not yet in cache.
+    """
+    # Arrange
+    client, _, _, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    order = LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-PENDING-003"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.00020"),
+        price=Price.from_str("56730.0"),
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    voi = VenueOrderId("9420")
+    captured: list = []
+    monkeypatch.setattr(client, "_send_order_event", lambda event: captured.append(event))
+
+    fill = _build_fill_report_pyo3(
+        client,
+        instrument,
+        order.client_order_id,
+        voi.value,
+        "T-PENDING-3",
+        "0.00020",
+        "56730.0",
+    )
+    accepted_report = _build_status_report_pyo3(
+        client,
+        instrument,
+        order.client_order_id,
+        voi.value,
+        nautilus_pyo3.OrderStatus.ACCEPTED,
+        price="56730.0",
+        quantity="0.00020",
+    )
+
+    try:
+        monkeypatch.setattr(client, "_is_external_order", lambda _: False)
+
+        # Act 1: fill arrives before order known, buffered.
+        client._handle_fill_report_pyo3(fill)
+        assert client._pending_fills[order.client_order_id.value] == [fill]
+
+        # Act 2: order is now in cache; OrderStatusReport(ACCEPTED) drains.
+        cache.add_order(order, None)
+        client._handle_order_status_report_pyo3(accepted_report)
+
+        # Assert
+        filled_events = [e for e in captured if isinstance(e, OrderFilled)]
+        assert len(filled_events) == 1
+        assert filled_events[0].venue_order_id == voi
+        assert filled_events[0].trade_id.value == "T-PENDING-3"
+        assert order.client_order_id.value not in client._pending_fills
+        assert "T-PENDING-3" in client._processed_trade_ids
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_inline_auto_accept_drains_pending_fill(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+):
+    """
+    When a later FillReport arrives and finds the order in cache but not yet accepted in
+    the local state machine, the inline auto-accept path must drain any previously
+    buffered FillReports for the same order.
+    """
+    # Arrange
+    client, _, _, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    order = LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-PENDING-004"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.00040"),
+        price=Price.from_str("56730.0"),
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    voi = VenueOrderId("9430")
+    captured: list = []
+    monkeypatch.setattr(client, "_send_order_event", lambda event: captured.append(event))
+
+    fill_a = _build_fill_report_pyo3(
+        client,
+        instrument,
+        order.client_order_id,
+        voi.value,
+        "T-PENDING-4A",
+        "0.00020",
+        "56730.0",
+    )
+    fill_b = _build_fill_report_pyo3(
+        client,
+        instrument,
+        order.client_order_id,
+        voi.value,
+        "T-PENDING-4B",
+        "0.00020",
+        "56735.0",
+    )
+
+    try:
+        monkeypatch.setattr(client, "_is_external_order", lambda _: False)
+
+        # Act 1: fill A arrives before order known, buffered.
+        client._handle_fill_report_pyo3(fill_a)
+        assert client._pending_fills[order.client_order_id.value] == [fill_a]
+
+        # Act 2: order is now in cache; fill B finds order and triggers inline drain.
+        cache.add_order(order, None)
+        client._handle_fill_report_pyo3(fill_b)
+
+        # Assert: both fills processed, A before B (drain runs before B's own emit).
+        filled_events = [e for e in captured if isinstance(e, OrderFilled)]
+        assert len(filled_events) == 2
+        assert filled_events[0].trade_id.value == "T-PENDING-4A"
+        assert filled_events[1].trade_id.value == "T-PENDING-4B"
+        assert order.client_order_id.value not in client._pending_fills
+        assert "T-PENDING-4A" in client._processed_trade_ids
+        assert "T-PENDING-4B" in client._processed_trade_ids
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_multiple_pending_fills_drained_in_arrival_order(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+):
+    """
+    Multiple FillReports buffered while the order is not in cache must be re-dispatched
+    in arrival order so the engine observes the correct cumulative fill sequence.
+    """
+    # Arrange
+    client, _, _, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    order = LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-PENDING-MULTI"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.00040"),
+        price=Price.from_str("56730.0"),
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    voi = VenueOrderId("9440")
+    captured: list = []
+    monkeypatch.setattr(client, "_send_order_event", lambda event: captured.append(event))
+
+    fill_a = _build_fill_report_pyo3(
+        client,
+        instrument,
+        order.client_order_id,
+        voi.value,
+        "T-PENDING-MA",
+        "0.00010",
+        "56720.0",
+    )
+    fill_b = _build_fill_report_pyo3(
+        client,
+        instrument,
+        order.client_order_id,
+        voi.value,
+        "T-PENDING-MB",
+        "0.00010",
+        "56725.0",
+    )
+    accepted_msg = _build_order_accepted_pyo3(
+        client,
+        instrument,
+        order.client_order_id,
+        voi.value,
+    )
+
+    try:
+        monkeypatch.setattr(client, "_is_external_order", lambda _: False)
+
+        # Act 1: two fills arrive, both buffered.
+        client._handle_fill_report_pyo3(fill_a)
+        client._handle_fill_report_pyo3(fill_b)
+        assert len(client._pending_fills[order.client_order_id.value]) == 2
+
+        # Act 2: order added, OrderAccepted drains both in order.
+        cache.add_order(order, None)
+        client._handle_order_accepted_pyo3(accepted_msg)
+
+        # Assert
+        filled_events = [e for e in captured if isinstance(e, OrderFilled)]
+        assert len(filled_events) == 2
+        assert filled_events[0].trade_id.value == "T-PENDING-MA"
+        assert filled_events[0].last_px == Price.from_str("56720.0")
+        assert filled_events[1].trade_id.value == "T-PENDING-MB"
+        assert filled_events[1].last_px == Price.from_str("56725.0")
+        assert order.client_order_id.value not in client._pending_fills
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_pending_fills_cleared_on_terminal_cleanup(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+):
+    """
+    Terminal cleanup must drop any pending fills so a stranded entry cannot outlive the
+    cloid mapping it was keyed on.
+    """
+    # Arrange
+    client, _, _, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    cid = ClientOrderId("O-PENDING-005")
+    fill = _build_fill_report_pyo3(
+        client,
+        instrument,
+        cid,
+        "9450",
+        "T-PENDING-5",
+        "0.00020",
+        "56730.0",
+    )
+    client._pending_fills[cid.value] = [fill]
+
+    try:
+        # Act
+        client._cleanup_cloid_mapping(cid)
+
+        # Assert
+        assert cid.value not in client._pending_fills
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (TimeoutError("connect"), True),
+        (OSError("connection reset"), True),
+        (ValueError("transport error: HTTP client error: refused"), True),
+        (ValueError("IO error: broken pipe"), True),
+        (ValueError("timeout"), True),
+        (ValueError("bad request: invalid payload"), False),
+        (ValueError("exchange error: insufficient margin"), False),
+        (ValueError("auth error: invalid signature"), False),
+        (Exception("Order already filled"), False),
+    ],
+)
+def test_is_transport_error_classifier(exc, expected):
+    assert _is_transport_error(exc) is expected
+
+
+def _make_limit_order(instrument, coid: str = "O-TXP-001") -> LimitOrder:
+    return LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId(coid),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.00100"),
+        price=Price.from_str("50000.0"),
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+
+def _accept_order(order: LimitOrder, voi: str) -> None:
+    order.apply(TestEventStubs.order_submitted(order=order))
+    order.apply(
+        TestEventStubs.order_accepted(order=order, venue_order_id=VenueOrderId(voi)),
+    )
+
+
+_TRANSPORT_EXC_CASES = [
+    pytest.param(TimeoutError("connect timeout"), id="native-timeout"),
+    pytest.param(
+        ValueError("transport error: HTTP client error: connection refused"),
+        id="pyo3-transport",
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc", _TRANSPORT_EXC_CASES)
+async def test_submit_order_transport_failure_does_not_reject(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    exc,
+):
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    client.generate_order_rejected = MagicMock()
+    http_client.submit_order.side_effect = exc
+
+    order = _make_limit_order(instrument, coid="O-TXP-SUBMIT")
+    command = SubmitOrder(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        order=order,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        position_id=None,
+        client_id=None,
+    )
+
+    try:
+        await client._submit_order(command)
+
+        http_client.submit_order.assert_awaited_once()
+        client.generate_order_rejected.assert_not_called()
+        assert order.client_order_id.value not in client._terminal_orders
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc", _TRANSPORT_EXC_CASES)
+async def test_submit_order_list_transport_failure_does_not_reject(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    exc,
+):
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    client.generate_order_rejected = MagicMock()
+    http_client.submit_orders.side_effect = exc
+
+    order = _make_limit_order(instrument, coid="O-TXP-LIST")
+    order_list = OrderList(order_list_id=OrderListId("OL-TXP"), orders=[order])
+    command = SubmitOrderList(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        order_list=order_list,
+        position_id=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        client_id=None,
+    )
+
+    try:
+        await client._submit_order_list(command)
+
+        http_client.submit_orders.assert_awaited_once()
+        client.generate_order_rejected.assert_not_called()
+        assert order.client_order_id.value not in client._terminal_orders
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc", _TRANSPORT_EXC_CASES)
+async def test_cancel_order_transport_failure_does_not_reject(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+    exc,
+):
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    client.generate_order_cancel_rejected = MagicMock()
+    http_client.cancel_order.side_effect = exc
+
+    order = _make_limit_order(instrument, coid="O-TXP-CANCEL")
+    _accept_order(order, voi="9001")
+    cache.add_order(order, None)
+
+    command = CancelOrder(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        venue_order_id=order.venue_order_id,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        client_id=None,
+    )
+
+    try:
+        await client._cancel_order(command)
+
+        http_client.cancel_order.assert_awaited_once()
+        client.generate_order_cancel_rejected.assert_not_called()
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc", _TRANSPORT_EXC_CASES)
+async def test_cancel_all_orders_transport_failure_does_not_reject(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+    exc,
+):
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    client.generate_order_cancel_rejected = MagicMock()
+    http_client.cancel_order.side_effect = exc
+
+    order_a = _make_limit_order(instrument, coid="O-TXP-ALL-A")
+    order_b = _make_limit_order(instrument, coid="O-TXP-ALL-B")
+    _accept_order(order_a, voi="9101")
+    _accept_order(order_b, voi="9102")
+    cache.add_order(order_a, None)
+    cache.add_order(order_b, None)
+    cache.update_order(order_a)
+    cache.update_order(order_b)
+
+    command = CancelAllOrders(
+        trader_id=order_a.trader_id,
+        strategy_id=order_a.strategy_id,
+        instrument_id=instrument.id,
+        order_side=OrderSide.NO_ORDER_SIDE,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        client_id=None,
+    )
+
+    try:
+        await client._cancel_all_orders(command)
+
+        assert http_client.cancel_order.await_count == 2
+        client.generate_order_cancel_rejected.assert_not_called()
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc", _TRANSPORT_EXC_CASES)
+async def test_batch_cancel_orders_transport_failure_does_not_reject(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+    exc,
+):
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    client.generate_order_cancel_rejected = MagicMock()
+    http_client.cancel_order.side_effect = exc
+
+    order_a = _make_limit_order(instrument, coid="O-TXP-BATCH-A")
+    order_b = _make_limit_order(instrument, coid="O-TXP-BATCH-B")
+    _accept_order(order_a, voi="9201")
+    _accept_order(order_b, voi="9202")
+    cache.add_order(order_a, None)
+    cache.add_order(order_b, None)
+
+    cancels = [
+        CancelOrder(
+            trader_id=order.trader_id,
+            strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=order.venue_order_id,
+            command_id=TestIdStubs.uuid(),
+            ts_init=0,
+            client_id=None,
+        )
+        for order in (order_a, order_b)
+    ]
+    command = BatchCancelOrders(
+        trader_id=order_a.trader_id,
+        strategy_id=order_a.strategy_id,
+        instrument_id=instrument.id,
+        cancels=cancels,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        client_id=None,
+    )
+
+    try:
+        await client._batch_cancel_orders(command)
+
+        assert http_client.cancel_order.await_count == 2
+        client.generate_order_cancel_rejected.assert_not_called()
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc", _TRANSPORT_EXC_CASES)
+async def test_modify_order_transport_failure_preserves_pending_state(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+    exc,
+):
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    client.generate_order_modify_rejected = MagicMock()
+    http_client.modify_order.side_effect = exc
+
+    order = _make_limit_order(instrument, coid="O-TXP-MODIFY")
+    _accept_order(order, voi="9301")
+    cache.add_order(order, None)
+
+    target_qty = Quantity.from_str("0.00200")
+    command = ModifyOrder(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        venue_order_id=order.venue_order_id,
+        quantity=target_qty,
+        price=Price.from_str("51000.0"),
+        trigger_price=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    try:
+        await client._modify_order(command)
+
+        http_client.modify_order.assert_awaited_once()
+        client.generate_order_modify_rejected.assert_not_called()
+        assert (
+            client._pending_modify_keys[order.client_order_id.value] == order.venue_order_id.value
+        )
+        assert client._pending_modify_target_qty[order.client_order_id.value] == target_qty
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_split_outcome_forwards_to_http_client(exec_client_builder, monkeypatch):
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+
+    response = await client._split_outcome(outcome=50, amount=Decimal("1.5"))
+
+    http_client.submit_split_outcome.assert_awaited_once_with(50, Decimal("1.5"))
+    assert response == '{"status":"ok","response":{"type":"default"}}'
+
+
+@pytest.mark.asyncio
+async def test_merge_outcome_defaults_amount_to_none(exec_client_builder, monkeypatch):
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+
+    await client._merge_outcome(outcome=7)
+
+    http_client.submit_merge_outcome.assert_awaited_once_with(7, None)
+
+
+@pytest.mark.asyncio
+async def test_merge_outcome_passes_amount(exec_client_builder, monkeypatch):
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+
+    await client._merge_outcome(outcome=7, amount=Decimal("0.5"))
+
+    http_client.submit_merge_outcome.assert_awaited_once_with(7, Decimal("0.5"))
+
+
+@pytest.mark.asyncio
+async def test_merge_question_defaults_amount_to_none(exec_client_builder, monkeypatch):
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+
+    await client._merge_question(question=9)
+
+    http_client.submit_merge_question.assert_awaited_once_with(9, None)
+
+
+@pytest.mark.asyncio
+async def test_merge_question_passes_amount(exec_client_builder, monkeypatch):
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+
+    await client._merge_question(question=9, amount=Decimal("2.0"))
+
+    http_client.submit_merge_question.assert_awaited_once_with(9, Decimal("2.0"))
+
+
+@pytest.mark.asyncio
+async def test_negate_outcome_forwards_all_args(exec_client_builder, monkeypatch):
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+
+    await client._negate_outcome(question=9, outcome=52, amount=Decimal("1.0"))
+
+    http_client.submit_negate_outcome.assert_awaited_once_with(9, 52, Decimal("1.0"))
+
+
+@pytest.mark.asyncio
+async def test_split_outcome_propagates_http_errors(exec_client_builder, monkeypatch):
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+
+    http_client.submit_split_outcome.side_effect = RuntimeError("rate limited")
+
+    with pytest.raises(RuntimeError, match="rate limited"):
+        await client._split_outcome(outcome=50, amount=Decimal("1.0"))

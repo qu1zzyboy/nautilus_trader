@@ -17,14 +17,20 @@
 
 use std::sync::LazyLock;
 
-use nautilus_model::identifiers::Venue;
+use nautilus_model::identifiers::{ClientId, Venue};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use ustr::Ustr;
 
+/// Venue identifier string.
 pub const POLYMARKET: &str = "POLYMARKET";
 
+/// Static venue instance.
 pub static POLYMARKET_VENUE: LazyLock<Venue> = LazyLock::new(|| Venue::new(Ustr::from(POLYMARKET)));
+
+/// Static client ID instance.
+pub static POLYMARKET_CLIENT_ID: LazyLock<ClientId> =
+    LazyLock::new(|| ClientId::new(Ustr::from(POLYMARKET)));
 
 /// Polymarket builder code for order attribution.
 pub const POLYMARKET_NAUTILUS_BUILDER_CODE: &str =
@@ -73,6 +79,9 @@ pub const BATCH_ORDER_LIMIT: usize = 15;
 
 /// Requests per minute.
 pub const HTTP_RATE_LIMIT: u32 = 100;
+
+/// Maximum number of `condition_ids` accepted in a single Gamma `/markets` query.
+pub const GAMMA_CONDITION_IDS_BATCH_SIZE: usize = 100;
 
 pub const INVALID_API_KEY: &str = "Unauthorized/Invalid api key";
 pub const CANCEL_ALREADY_DONE: &str = "already canceled or matched";

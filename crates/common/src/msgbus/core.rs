@@ -100,8 +100,9 @@ use nautilus_model::{
         OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
         option_chain::{OptionChainSlice, OptionGreeks},
     },
-    events::{AccountState, OrderEventAny, PositionEvent},
+    events::{AccountState, OrderEventAny, PortfolioSnapshot, PositionEvent},
     identifiers::TraderId,
+    instruments::InstrumentAny,
     orderbook::OrderBook,
     orders::OrderAny,
     position::Position,
@@ -239,9 +240,11 @@ pub struct MessageBus {
     pub(crate) router_account_state: TopicRouter<AccountState>,
     pub(crate) router_orders: TopicRouter<OrderAny>,
     pub(crate) router_positions: TopicRouter<Position>,
+    pub(crate) router_portfolio: TopicRouter<PortfolioSnapshot>,
     pub(crate) router_greeks: TopicRouter<GreeksData>,
     pub(crate) router_option_greeks: TopicRouter<OptionGreeks>,
     pub(crate) router_option_chain: TopicRouter<OptionChainSlice>,
+    pub(crate) router_instruments: TopicRouter<InstrumentAny>,
     #[cfg(feature = "defi")]
     pub(crate) router_defi_blocks: TopicRouter<nautilus_model::defi::Block>, // nautilus-import-ok
     #[cfg(feature = "defi")]
@@ -312,11 +315,13 @@ impl MessageBus {
             router_order_events: TopicRouter::new(),
             router_position_events: TopicRouter::new(),
             router_account_state: TopicRouter::new(),
+            router_portfolio: TopicRouter::new(),
             router_orders: TopicRouter::new(),
             router_positions: TopicRouter::new(),
             router_greeks: TopicRouter::new(),
             router_option_greeks: TopicRouter::new(),
             router_option_chain: TopicRouter::new(),
+            router_instruments: TopicRouter::new(),
             #[cfg(feature = "defi")]
             router_defi_blocks: TopicRouter::new(),
             #[cfg(feature = "defi")]
@@ -403,11 +408,13 @@ impl MessageBus {
         self.router_order_events.clear();
         self.router_position_events.clear();
         self.router_account_state.clear();
+        self.router_portfolio.clear();
         self.router_orders.clear();
         self.router_positions.clear();
         self.router_greeks.clear();
         self.router_option_greeks.clear();
         self.router_option_chain.clear();
+        self.router_instruments.clear();
 
         #[cfg(feature = "defi")]
         {

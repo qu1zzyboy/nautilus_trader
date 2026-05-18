@@ -36,7 +36,7 @@ use config::ExecutionEngineConfig;
 use futures::future::join_all;
 use indexmap::{IndexMap, IndexSet};
 use nautilus_common::{
-    cache::Cache,
+    cache::{Cache, CacheSnapshotRef},
     clients::ExecutionClient,
     clock::Clock,
     generators::position_id::PositionIdGenerator,
@@ -49,7 +49,7 @@ use nautilus_common::{
         },
     },
     msgbus::{
-        self, MessagingSwitchboard, ShareableMessageHandler, TypedIntoHandler, get_message_bus,
+        self, MessagingSwitchboard, TypedHandler, TypedIntoHandler, get_message_bus,
         switchboard::{self},
     },
     runner::try_get_trading_cmd_sender,
@@ -60,6 +60,7 @@ use nautilus_core::{
     datetime::{mins_to_nanos, mins_to_secs},
 };
 use nautilus_model::{
+    accounts::Account,
     enums::{
         ContingencyType, OmsType, OrderStatus, OrderType, PositionSide, TimeInForce,
         TrailingOffsetType,
@@ -70,7 +71,7 @@ use nautilus_model::{
         PositionOpened,
     },
     identifiers::{
-        ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, Venue, VenueOrderId,
+        ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId, Venue, VenueOrderId,
     },
     instruments::{Instrument, InstrumentAny},
     orderbook::own::{OwnBookOrder, OwnOrderBook, should_handle_own_book_order},
@@ -94,6 +95,9 @@ const TIMER_PURGE_CLOSED_ORDERS: &str = "ExecEngine_PURGE_CLOSED_ORDERS";
 const TIMER_PURGE_CLOSED_POSITIONS: &str = "ExecEngine_PURGE_CLOSED_POSITIONS";
 const TIMER_PURGE_ACCOUNT_EVENTS: &str = "ExecEngine_PURGE_ACCOUNT_EVENTS";
 
+/// Callback that anchors cache snapshot metadata in an external store.
+pub type SnapshotAnchorer = Rc<dyn Fn(CacheSnapshotRef) -> anyhow::Result<()>>;
+
 /// Central execution engine responsible for orchestrating order routing and execution.
 ///
 /// The execution engine manages the entire order lifecycle from submission to completion,
@@ -114,6 +118,7 @@ pub struct ExecutionEngine {
     command_count: Cell<u64>,
     event_count: u64,
     report_count: u64,
+    snapshot_anchorer: Option<SnapshotAnchorer>,
 }
 
 impl Debug for ExecutionEngine {
@@ -151,6 +156,7 @@ impl ExecutionEngine {
             command_count: Cell::new(0),
             event_count: 0,
             report_count: 0,
+            snapshot_anchorer: None,
         }
     }
 
@@ -229,7 +235,7 @@ impl ExecutionEngine {
         let weak = WeakCell::from(Rc::downgrade(engine));
         let pattern = switchboard::get_instruments_pattern(venue);
 
-        let handler = ShareableMessageHandler::from_typed(move |instrument: &InstrumentAny| {
+        let handler = TypedHandler::from(move |instrument: &InstrumentAny| {
             if let Some(rc) = weak.upgrade() {
                 let venue = instrument.id().venue;
                 let client_id = rc.borrow().routing_map.get(&venue).copied();
@@ -242,7 +248,7 @@ impl ExecutionEngine {
             }
         });
 
-        msgbus::subscribe_any(pattern, handler, None);
+        msgbus::subscribe_instruments(pattern, handler, None);
         log::info!("Subscribed to instrument updates for venue {venue}");
     }
 
@@ -262,6 +268,14 @@ impl ExecutionEngine {
     /// Returns a reference to the configuration.
     pub const fn config(&self) -> &ExecutionEngineConfig {
         &self.config
+    }
+
+    /// Sets the cache snapshot anchorer.
+    ///
+    /// The system event-store integration installs this while a run is open. Passing
+    /// `None` disables anchor recording for later cache snapshots.
+    pub fn set_snapshot_anchorer(&mut self, anchorer: Option<SnapshotAnchorer>) {
+        self.snapshot_anchorer = anchorer;
     }
 
     #[must_use]
@@ -827,7 +841,7 @@ impl ExecutionEngine {
             .borrow()
             .positions_open(None, None, None, None, None)
             .into_iter()
-            .cloned()
+            .map(|p| p.cloned())
             .collect();
 
         for position in positions {
@@ -928,6 +942,11 @@ impl ExecutionEngine {
     /// This handles exchange-generated orders (liquidation, ADL, settlement) that were
     /// not submitted locally.
     pub fn reconcile_order_status_report(&mut self, report: &OrderStatusReport) {
+        msgbus::publish_any(
+            MessagingSwitchboard::reconciliation_raw_order_status_report_topic(),
+            report,
+        );
+
         let cache = self.cache.borrow();
 
         let order = report
@@ -1188,6 +1207,11 @@ impl ExecutionEngine {
     /// closures (e.g. Hyperliquid liquidations) that arrive without a companion order
     /// status report still update the local position.
     pub fn reconcile_fill_report(&mut self, report: &FillReport) {
+        msgbus::publish_any(
+            MessagingSwitchboard::reconciliation_raw_fill_report_topic(),
+            report,
+        );
+
         let cache = self.cache.borrow();
 
         let order = report
@@ -1262,6 +1286,16 @@ impl ExecutionEngine {
     /// Adapters use this to emit ADL / liquidation / settlement events without
     /// losing real fill metadata.
     pub fn reconcile_order_with_fills(&mut self, report: &OrderStatusReport, fills: &[FillReport]) {
+        msgbus::publish_any(
+            MessagingSwitchboard::reconciliation_raw_order_status_report_topic(),
+            report,
+        );
+
+        let fill_report_topic = MessagingSwitchboard::reconciliation_raw_fill_report_topic();
+        for fill in fills {
+            msgbus::publish_any(fill_report_topic, fill);
+        }
+
         let cache = self.cache.borrow();
         let order = report
             .client_order_id
@@ -1408,6 +1442,11 @@ impl ExecutionEngine {
     /// Compares the venue-reported position with cached positions and logs any discrepancies.
     /// Handles both hedging (with `venue_position_id`) and netting (without) modes.
     pub fn reconcile_position_report(&mut self, report: &PositionStatusReport) {
+        msgbus::publish_any(
+            MessagingSwitchboard::reconciliation_raw_position_status_report_topic(),
+            report,
+        );
+
         let cache = self.cache.borrow();
 
         let size_precision = cache
@@ -1521,9 +1560,16 @@ impl ExecutionEngine {
             }
         }
 
+        let raw_fill_topic = MessagingSwitchboard::reconciliation_raw_fill_report_topic();
+
         for fill_reports in mass_status.fill_reports().values() {
             for fill_report in fill_reports {
                 if external_venue_ids.contains(&fill_report.venue_order_id) {
+                    // Skipped fills still arrived from the venue; capture them
+                    // for forensic replay even though reconciliation is covered
+                    // by the inferred fill generated above.
+                    msgbus::publish_any(raw_fill_topic, fill_report);
+
                     log::debug!(
                         "Skipping fill report for external order {}: covered by inferred fill",
                         fill_report.venue_order_id
@@ -2185,7 +2231,26 @@ impl ExecutionEngine {
             anyhow::bail!("Duplicate fill");
         }
 
+        if let Some(position_id) = fill.position_id
+            && self.position_contains_trade_id(position_id, fill.trade_id)
+        {
+            log::warn!(
+                "Duplicate fill: {} trade_id={} already applied to position {}, skipping",
+                order.client_order_id(),
+                fill.trade_id,
+                position_id
+            );
+            anyhow::bail!("Duplicate position fill");
+        }
+
         self.check_overfill(order, fill)
+    }
+
+    fn position_contains_trade_id(&self, position_id: PositionId, trade_id: TradeId) -> bool {
+        self.cache
+            .borrow()
+            .position(&position_id)
+            .is_some_and(|position| position.trade_ids.contains(&trade_id))
     }
 
     fn update_cached_order(
@@ -2331,22 +2396,32 @@ impl ExecutionEngine {
                 return;
             };
 
-        if self.cache.borrow().account(&fill.account_id).is_none() {
-            log::error!(
-                "Cannot handle order fill: no account found for {}, {fill}",
-                fill.instrument_id.venue,
-            );
-            return;
-        }
+        let is_margin_account = {
+            let cache = self.cache.borrow();
+            let Some(account) = cache.account(&fill.account_id) else {
+                log::error!(
+                    "Cannot handle order fill: no account found for {}, {fill}",
+                    fill.instrument_id.venue,
+                );
+                return;
+            };
+
+            account.is_margin_account()
+        };
 
         // Skip portfolio position updates for combo fills (spread instruments)
         // Combo fills are only used for order management, not portfolio updates
+        if !instrument.is_spread() && is_margin_account {
+            let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
+            msgbus::send_order_event(portfolio_endpoint, OrderEventAny::Filled(fill));
+        }
+
         let position = if instrument.is_spread() {
             None
         } else {
             self.handle_position_update(&instrument, fill, oms_type);
             let position_id = fill.position_id.unwrap();
-            self.cache.borrow().position(&position_id).cloned()
+            self.cache.borrow().position_owned(&position_id)
         };
 
         // Handle contingent orders for both spread and non-spread instruments
@@ -2415,7 +2490,7 @@ impl ExecutionEngine {
             return;
         };
 
-        let position_opt = self.cache.borrow().position(&position_id).cloned();
+        let position_opt = self.cache.borrow().position_owned(&position_id);
 
         match position_opt {
             None => {
@@ -2500,7 +2575,8 @@ impl ExecutionEngine {
                 );
             }
             // Snapshot closed position if reopening (NETTING mode)
-            self.cache.borrow_mut().snapshot_position(position)?;
+            let snapshot_ref = self.cache.borrow_mut().snapshot_position(position)?;
+            self.anchor_snapshot(snapshot_ref);
         } else {
             // HEDGING mode
             log::warn!(
@@ -2509,6 +2585,16 @@ impl ExecutionEngine {
             );
         }
         Ok(())
+    }
+
+    fn anchor_snapshot(&self, snapshot_ref: CacheSnapshotRef) {
+        let Some(anchorer) = &self.snapshot_anchorer else {
+            return;
+        };
+
+        if let Err(e) = anchorer(snapshot_ref) {
+            log::error!("Failed to record cache snapshot anchor: {e}");
+        }
     }
 
     fn update_position(&self, position: &mut Position, fill: OrderFilled) {
@@ -2610,10 +2696,11 @@ impl ExecutionEngine {
             self.update_position(position, fill_split1.unwrap());
 
             // Snapshot closed position before reusing ID (NETTING mode)
-            if oms_type == OmsType::Netting
-                && let Err(e) = self.cache.borrow_mut().snapshot_position(position)
-            {
-                log::error!("Failed to snapshot position during flip: {e:?}");
+            if oms_type == OmsType::Netting {
+                match self.cache.borrow_mut().snapshot_position(position) {
+                    Ok(snapshot_ref) => self.anchor_snapshot(snapshot_ref),
+                    Err(e) => log::error!("Failed to snapshot position during flip: {e:?}"),
+                }
             }
         }
 

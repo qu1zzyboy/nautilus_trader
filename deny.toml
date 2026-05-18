@@ -69,10 +69,7 @@ allow = [
   "Unicode-DFS-2016",
   "Unicode-3.0",
   "0BSD",
-  "LGPL-3.0",
-  "LGPL-3.0-only",
   "LGPL-3.0-or-later",
-  "OpenSSL",
   "Unlicense",
   "bzip2-1.0.6",
 ]
@@ -152,6 +149,10 @@ skip = [
   # syn 1 and strsim 0.10 - transitive via madsim -> darling 0.14 (dev-only simulator)
   { crate = "syn" },
   { crate = "strsim" },
+
+  # bincode 1.3.3 (transitive via madsim dev-dep and hypersync-client) vs
+  # 2.0.1 (event_store envelope codec)
+  { crate = "bincode" },
 
   # Enum derive macros - strum 0.27 (alloy, hypersync) vs 0.28 (nautilus)
   { crate = "strum" },

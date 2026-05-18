@@ -1154,7 +1154,7 @@ impl ExecutionClient for DydxExecutionClient {
     }
 
     fn get_account(&self) -> Option<AccountAny> {
-        self.core.cache().account(&self.core.account_id).cloned()
+        self.core.cache().account_owned(&self.core.account_id)
     }
 
     fn generate_account_state(
@@ -2185,14 +2185,11 @@ impl ExecutionClient for DydxExecutionClient {
 
         let order_data: Vec<CancelAllOrderData> = {
             let cache = self.core.cache();
+            let side_filter =
+                (order_side_filter != OrderSide::NoOrderSide).then_some(order_side_filter);
             cache
-                .orders_open(None, None, None, None, None)
+                .orders_open(None, Some(&instrument_id), None, None, side_filter)
                 .into_iter()
-                .filter(|order| order.instrument_id() == instrument_id)
-                .filter(|order| {
-                    order_side_filter == OrderSide::NoOrderSide
-                        || order.order_side() == order_side_filter
-                })
                 .map(|order| {
                     (
                         order.strategy_id(),
@@ -3181,7 +3178,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        common::enums::{DydxOrderStatus, DydxOrderType, DydxTimeInForce},
+        common::{
+            consts::DYDX_CLIENT_ID,
+            enums::{DydxOrderStatus, DydxOrderType, DydxTimeInForce},
+        },
         http::models::Order,
     };
 
@@ -3272,7 +3272,7 @@ mod tests {
         let cache = Rc::new(RefCell::new(Cache::default()));
         let core = ExecutionClientCore::new(
             TraderId::from("TRADER-001"),
-            ClientId::from("DYDX"),
+            *DYDX_CLIENT_ID,
             *DYDX_VENUE,
             OmsType::Netting,
             AccountId::from("DYDX-001"),
@@ -3305,7 +3305,7 @@ mod tests {
     fn cache_order(cache: &Rc<RefCell<Cache>>, order: OrderAny) {
         cache
             .borrow_mut()
-            .add_order(order, None, Some(ClientId::from("DYDX")), false)
+            .add_order(order, None, Some(*DYDX_CLIENT_ID), false)
             .unwrap();
     }
 
@@ -3340,7 +3340,7 @@ mod tests {
         let command = SubmitOrder::from_order(
             &order,
             order.trader_id(),
-            Some(ClientId::from("DYDX")),
+            Some(*DYDX_CLIENT_ID),
             None,
             UUID4::new(),
             UnixNanos::default(),
@@ -3382,7 +3382,7 @@ mod tests {
         let command = SubmitOrder::from_order(
             &order,
             order.trader_id(),
-            Some(ClientId::from("DYDX")),
+            Some(*DYDX_CLIENT_ID),
             None,
             UUID4::new(),
             UnixNanos::default(),
@@ -3434,7 +3434,7 @@ mod tests {
         let command = SubmitOrder::from_order(
             &order,
             order.trader_id(),
-            Some(ClientId::from("DYDX")),
+            Some(*DYDX_CLIENT_ID),
             None,
             UUID4::new(),
             UnixNanos::default(),
@@ -3484,7 +3484,7 @@ mod tests {
         let command = SubmitOrder::from_order(
             &order,
             order.trader_id(),
-            Some(ClientId::from("DYDX")),
+            Some(*DYDX_CLIENT_ID),
             None,
             UUID4::new(),
             UnixNanos::default(),
@@ -3551,7 +3551,7 @@ mod tests {
 
         let cmd = SubmitOrderList::new(
             order.trader_id(),
-            Some(ClientId::from("DYDX")),
+            Some(*DYDX_CLIENT_ID),
             order.strategy_id(),
             order_list,
             vec![init],

@@ -227,8 +227,9 @@ jobs:
       - name: Build wheel (v2)
         working-directory: ${{ env.PACKAGE_DIR }}
         run: |
-          pip install --upgrade maturin
-          maturin build --release --out ../dist
+          MATURIN_VERSION="$(bash ../scripts/tool-version.sh maturin)"
+          uv run --no-project --no-build --with "maturin==${MATURIN_VERSION}" -- \
+            maturin build --release --out ../dist
 
       - name: Run v2 Python tests
         working-directory: ${{ env.PACKAGE_DIR }}
@@ -296,12 +297,20 @@ jobs:
           allowed-endpoints: >-
             ${{ vars.COMMON_ALLOWED_ENDPOINTS }}
             ${{ vars.CI_ALLOWED_ENDPOINTS }}
+            # Sigstore TUF trust root (for gh attestation verify)
+            tuf-repo-cdn.sigstore.dev:443
             ${{ secrets.CLOUDFLARE_R2_ALLOWED_HOST }}:443
 
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+
+      - name: Block develop publish after failed security audit
+        if: github.ref_name == 'develop'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci/check-security-audit-result.sh
 
       - name: Download built wheels
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -314,7 +323,21 @@ jobs:
       - name: Attest wheel provenance
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
-          subject-path: 'dist/*.whl'
+          subject-path: "dist/*.whl"
+
+      - name: Verify wheel attestations
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IDENTITY: ${{ github.server_url }}/${{ github.workflow_ref }}
+          ISSUER: https://token.actions.githubusercontent.com
+        run: |
+          set -e
+          for whl in dist/*.whl; do
+            gh attestation verify "$whl" \
+              --repo "$GITHUB_REPOSITORY" \
+              --cert-identity "$IDENTITY" \
+              --cert-oidc-issuer "$ISSUER"
+          done
 
       - name: Publish wheels to Cloudflare R2 (v2 bucket)
         uses: ./.github/actions/publish-wheels
@@ -323,5 +346,5 @@ jobs:
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
+        run: |-
           bash ./scripts/ci/publish-wheels-delete-artifacts.sh

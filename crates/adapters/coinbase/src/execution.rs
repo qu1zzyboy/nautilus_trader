@@ -467,7 +467,7 @@ impl ExecutionClient for CoinbaseExecutionClient {
     }
 
     fn get_account(&self) -> Option<AccountAny> {
-        self.core.cache().account(&self.core.account_id).cloned()
+        self.core.cache().account_owned(&self.core.account_id)
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
@@ -1973,11 +1973,14 @@ mod tests {
 
     use super::*;
     use crate::{
-        common::enums::{
-            CoinbaseContractExpiryType, CoinbaseOrderSide as CbSide,
-            CoinbaseOrderStatus as CbStatus, CoinbaseOrderType as CbType,
-            CoinbaseProductType as CbProductType, CoinbaseRiskManagedBy,
-            CoinbaseTimeInForce as CbTif, CoinbaseTriggerStatus,
+        common::{
+            consts::COINBASE_VENUE,
+            enums::{
+                CoinbaseContractExpiryType, CoinbaseOrderSide as CbSide,
+                CoinbaseOrderStatus as CbStatus, CoinbaseOrderType as CbType,
+                CoinbaseProductType as CbProductType, CoinbaseRiskManagedBy,
+                CoinbaseTimeInForce as CbTif, CoinbaseTriggerStatus,
+            },
         },
         websocket::messages::WsOrderUpdate,
     };
@@ -2117,8 +2120,7 @@ mod tests {
     }
 
     fn test_instrument() -> InstrumentAny {
-        let instrument_id =
-            InstrumentId::new(Symbol::new("BTC-USD"), Venue::new(Ustr::from("COINBASE")));
+        let instrument_id = InstrumentId::new(Symbol::new("BTC-USD"), *COINBASE_VENUE);
         InstrumentAny::CurrencyPair(CurrencyPair::new(
             instrument_id,
             Symbol::new("BTC-USD"),

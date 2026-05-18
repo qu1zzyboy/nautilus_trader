@@ -36,7 +36,8 @@ use nautilus_model::{
         OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
         option_chain::{OptionChainSlice, OptionGreeks},
     },
-    events::{AccountState, OrderEventAny, PositionEvent},
+    events::{AccountState, OrderEventAny, PortfolioSnapshot, PositionEvent},
+    instruments::InstrumentAny,
     orderbook::OrderBook,
     orders::OrderAny,
     position::Position,
@@ -47,10 +48,11 @@ use ustr::Ustr;
 use super::{
     ACCOUNT_STATE_HANDLERS, ANY_HANDLERS, BAR_HANDLERS, BOOK_HANDLERS, DELTAS_HANDLERS,
     DEPTH10_HANDLERS, FUNDING_RATE_HANDLERS, GREEKS_HANDLERS, HANDLER_BUFFER_CAP,
-    INDEX_PRICE_HANDLERS, MARK_PRICE_HANDLERS, OPTION_CHAIN_HANDLERS, OPTION_GREEKS_HANDLERS,
-    ORDER_EVENT_HANDLERS, POSITION_EVENT_HANDLERS, QUOTE_HANDLERS, TRADE_HANDLERS,
+    INDEX_PRICE_HANDLERS, INSTRUMENT_HANDLERS, MARK_PRICE_HANDLERS, OPTION_CHAIN_HANDLERS,
+    OPTION_GREEKS_HANDLERS, ORDER_EVENT_HANDLERS, PORTFOLIO_SNAPSHOT_HANDLERS,
+    POSITION_EVENT_HANDLERS, QUOTE_HANDLERS, TRADE_HANDLERS,
     core::{MessageBus, Subscription},
-    get_message_bus,
+    dispatch_tap_publish, dispatch_tap_response, dispatch_tap_send, get_message_bus,
     matching::is_matching_backtracking,
     mstr::{Endpoint, MStr, Pattern, Topic},
     typed_handler::{ShareableMessageHandler, TypedHandler, TypedIntoHandler},
@@ -254,10 +256,14 @@ pub fn subscribe_any(
 /// Subscribes a handler to instrument messages matching a pattern.
 pub fn subscribe_instruments(
     pattern: MStr<Pattern>,
-    handler: ShareableMessageHandler,
+    handler: TypedHandler<InstrumentAny>,
     priority: Option<u32>,
 ) {
-    subscribe_any(pattern, handler, priority);
+    get_message_bus().borrow_mut().router_instruments.subscribe(
+        pattern,
+        handler,
+        priority.unwrap_or(0),
+    );
 }
 
 /// Subscribes a handler to instrument close messages matching a pattern.
@@ -435,6 +441,19 @@ pub fn subscribe_position_events(
         .subscribe(pattern, handler, priority.unwrap_or(0));
 }
 
+/// Subscribes a handler to positions matching a pattern.
+pub fn subscribe_positions(
+    pattern: MStr<Pattern>,
+    handler: TypedHandler<Position>,
+    priority: Option<u32>,
+) {
+    get_message_bus().borrow_mut().router_positions.subscribe(
+        pattern,
+        handler,
+        priority.unwrap_or(0),
+    );
+}
+
 /// Subscribes a handler to account state updates matching a pattern.
 pub fn subscribe_account_state(
     pattern: MStr<Pattern>,
@@ -447,13 +466,13 @@ pub fn subscribe_account_state(
         .subscribe(pattern, handler, priority.unwrap_or(0));
 }
 
-/// Subscribes a handler to positions matching a pattern.
-pub fn subscribe_positions(
+/// Subscribes a handler to portfolio snapshots matching a pattern.
+pub fn subscribe_portfolio_snapshot(
     pattern: MStr<Pattern>,
-    handler: TypedHandler<Position>,
+    handler: TypedHandler<PortfolioSnapshot>,
     priority: Option<u32>,
 ) {
-    get_message_bus().borrow_mut().router_positions.subscribe(
+    get_message_bus().borrow_mut().router_portfolio.subscribe(
         pattern,
         handler,
         priority.unwrap_or(0),
@@ -543,8 +562,11 @@ pub fn subscribe_defi_flash(
 }
 
 /// Unsubscribes a handler from instrument messages.
-pub fn unsubscribe_instruments(pattern: MStr<Pattern>, handler: &ShareableMessageHandler) {
-    unsubscribe_any(pattern, handler);
+pub fn unsubscribe_instruments(pattern: MStr<Pattern>, handler: &TypedHandler<InstrumentAny>) {
+    get_message_bus()
+        .borrow_mut()
+        .router_instruments
+        .unsubscribe(pattern, handler);
 }
 
 /// Unsubscribes a handler from instrument close messages.
@@ -632,6 +654,17 @@ pub fn unsubscribe_account_state(pattern: MStr<Pattern>, handler: &TypedHandler<
     get_message_bus()
         .borrow_mut()
         .router_account_state
+        .unsubscribe(pattern, handler);
+}
+
+/// Unsubscribes a handler from portfolio snapshots.
+pub fn unsubscribe_portfolio_snapshot(
+    pattern: MStr<Pattern>,
+    handler: &TypedHandler<PortfolioSnapshot>,
+) {
+    get_message_bus()
+        .borrow_mut()
+        .router_portfolio
         .unsubscribe(pattern, handler);
 }
 
@@ -826,6 +859,60 @@ pub fn subscriber_count_book_snapshots(topic: MStr<Topic>) -> usize {
         .subscriber_count(topic)
 }
 
+/// Returns the exact subscriber count for quotes on a topic,
+/// excluding wildcard pattern subscriptions.
+pub fn exact_subscriber_count_quotes(topic: MStr<Topic>) -> usize {
+    get_message_bus()
+        .borrow()
+        .router_quotes
+        .exact_subscriber_count(topic)
+}
+
+/// Returns the exact subscriber count for trades on a topic,
+/// excluding wildcard pattern subscriptions.
+pub fn exact_subscriber_count_trades(topic: MStr<Topic>) -> usize {
+    get_message_bus()
+        .borrow()
+        .router_trades
+        .exact_subscriber_count(topic)
+}
+
+/// Returns the exact subscriber count for mark prices on a topic,
+/// excluding wildcard pattern subscriptions.
+pub fn exact_subscriber_count_mark_prices(topic: MStr<Topic>) -> usize {
+    get_message_bus()
+        .borrow()
+        .router_mark_prices
+        .exact_subscriber_count(topic)
+}
+
+/// Returns the exact subscriber count for index prices on a topic,
+/// excluding wildcard pattern subscriptions.
+pub fn exact_subscriber_count_index_prices(topic: MStr<Topic>) -> usize {
+    get_message_bus()
+        .borrow()
+        .router_index_prices
+        .exact_subscriber_count(topic)
+}
+
+/// Returns the exact subscriber count for funding rates on a topic,
+/// excluding wildcard pattern subscriptions.
+pub fn exact_subscriber_count_funding_rates(topic: MStr<Topic>) -> usize {
+    get_message_bus()
+        .borrow()
+        .router_funding_rates
+        .exact_subscriber_count(topic)
+}
+
+/// Returns the exact subscriber count for option greeks on a topic,
+/// excluding wildcard pattern subscriptions.
+pub fn exact_subscriber_count_option_greeks(topic: MStr<Topic>) -> usize {
+    get_message_bus()
+        .borrow()
+        .router_option_greeks
+        .exact_subscriber_count(topic)
+}
+
 /// Returns the exact subscriber count for bars on a topic,
 /// excluding wildcard pattern subscriptions.
 pub fn exact_subscriber_count_bars(topic: MStr<Topic>) -> usize {
@@ -837,6 +924,8 @@ pub fn exact_subscriber_count_bars(topic: MStr<Topic>) -> usize {
 
 /// Publishes a message to the topic using runtime type dispatch (Any).
 pub fn publish_any(topic: MStr<Topic>, message: &dyn Any) {
+    dispatch_tap_publish(topic, message);
+
     // Take buffer (re-entrancy safe)
     let mut handlers = ANY_HANDLERS.with_borrow_mut(std::mem::take);
 
@@ -855,9 +944,20 @@ pub fn publish_any(topic: MStr<Topic>, message: &dyn Any) {
     ANY_HANDLERS.with_borrow_mut(|buf| *buf = handlers);
 }
 
+/// Publishes an instrument to subscribers on a topic.
+pub fn publish_instrument(topic: MStr<Topic>, instrument: &InstrumentAny) {
+    publish_typed(
+        topic,
+        &INSTRUMENT_HANDLERS,
+        |bus, h| bus.router_instruments.fill_matching_handlers(topic, h),
+        instrument,
+    );
+}
+
 /// Publishes order book deltas to subscribers on a topic.
 pub fn publish_deltas(topic: MStr<Topic>, deltas: &OrderBookDeltas) {
     publish_typed(
+        topic,
         &DELTAS_HANDLERS,
         |bus, h| bus.router_deltas.fill_matching_handlers(topic, h),
         deltas,
@@ -867,6 +967,7 @@ pub fn publish_deltas(topic: MStr<Topic>, deltas: &OrderBookDeltas) {
 /// Publishes order book depth10 to subscribers on a topic.
 pub fn publish_depth10(topic: MStr<Topic>, depth: &OrderBookDepth10) {
     publish_typed(
+        topic,
         &DEPTH10_HANDLERS,
         |bus, h| bus.router_depth10.fill_matching_handlers(topic, h),
         depth,
@@ -876,6 +977,7 @@ pub fn publish_depth10(topic: MStr<Topic>, depth: &OrderBookDepth10) {
 /// Publishes an order book snapshot to subscribers on a topic.
 pub fn publish_book(topic: MStr<Topic>, book: &OrderBook) {
     publish_typed(
+        topic,
         &BOOK_HANDLERS,
         |bus, h| bus.router_book_snapshots.fill_matching_handlers(topic, h),
         book,
@@ -885,6 +987,7 @@ pub fn publish_book(topic: MStr<Topic>, book: &OrderBook) {
 /// Publishes a quote tick to subscribers on a topic.
 pub fn publish_quote(topic: MStr<Topic>, quote: &QuoteTick) {
     publish_typed(
+        topic,
         &QUOTE_HANDLERS,
         |bus, h| bus.router_quotes.fill_matching_handlers(topic, h),
         quote,
@@ -894,6 +997,7 @@ pub fn publish_quote(topic: MStr<Topic>, quote: &QuoteTick) {
 /// Publishes a trade tick to subscribers on a topic.
 pub fn publish_trade(topic: MStr<Topic>, trade: &TradeTick) {
     publish_typed(
+        topic,
         &TRADE_HANDLERS,
         |bus, h| bus.router_trades.fill_matching_handlers(topic, h),
         trade,
@@ -903,6 +1007,7 @@ pub fn publish_trade(topic: MStr<Topic>, trade: &TradeTick) {
 /// Publishes a bar to subscribers on a topic.
 pub fn publish_bar(topic: MStr<Topic>, bar: &Bar) {
     publish_typed(
+        topic,
         &BAR_HANDLERS,
         |bus, h| bus.router_bars.fill_matching_handlers(topic, h),
         bar,
@@ -912,6 +1017,7 @@ pub fn publish_bar(topic: MStr<Topic>, bar: &Bar) {
 /// Publishes a mark price update to subscribers on a topic.
 pub fn publish_mark_price(topic: MStr<Topic>, mark_price: &MarkPriceUpdate) {
     publish_typed(
+        topic,
         &MARK_PRICE_HANDLERS,
         |bus, h| bus.router_mark_prices.fill_matching_handlers(topic, h),
         mark_price,
@@ -921,6 +1027,7 @@ pub fn publish_mark_price(topic: MStr<Topic>, mark_price: &MarkPriceUpdate) {
 /// Publishes an index price update to subscribers on a topic.
 pub fn publish_index_price(topic: MStr<Topic>, index_price: &IndexPriceUpdate) {
     publish_typed(
+        topic,
         &INDEX_PRICE_HANDLERS,
         |bus, h| bus.router_index_prices.fill_matching_handlers(topic, h),
         index_price,
@@ -930,6 +1037,7 @@ pub fn publish_index_price(topic: MStr<Topic>, index_price: &IndexPriceUpdate) {
 /// Publishes a funding rate update to subscribers on a topic.
 pub fn publish_funding_rate(topic: MStr<Topic>, funding_rate: &FundingRateUpdate) {
     publish_typed(
+        topic,
         &FUNDING_RATE_HANDLERS,
         |bus, h| bus.router_funding_rates.fill_matching_handlers(topic, h),
         funding_rate,
@@ -939,6 +1047,7 @@ pub fn publish_funding_rate(topic: MStr<Topic>, funding_rate: &FundingRateUpdate
 /// Publishes greeks data to subscribers on a topic.
 pub fn publish_greeks(topic: MStr<Topic>, greeks: &GreeksData) {
     publish_typed(
+        topic,
         &GREEKS_HANDLERS,
         |bus, h| bus.router_greeks.fill_matching_handlers(topic, h),
         greeks,
@@ -948,6 +1057,7 @@ pub fn publish_greeks(topic: MStr<Topic>, greeks: &GreeksData) {
 /// Publishes option greeks to subscribers on a topic.
 pub fn publish_option_greeks(topic: MStr<Topic>, option_greeks: &OptionGreeks) {
     publish_typed(
+        topic,
         &OPTION_GREEKS_HANDLERS,
         |bus, h| bus.router_option_greeks.fill_matching_handlers(topic, h),
         option_greeks,
@@ -957,6 +1067,7 @@ pub fn publish_option_greeks(topic: MStr<Topic>, option_greeks: &OptionGreeks) {
 /// Publishes an option chain slice to subscribers on a topic.
 pub fn publish_option_chain(topic: MStr<Topic>, slice: &OptionChainSlice) {
     publish_typed(
+        topic,
         &OPTION_CHAIN_HANDLERS,
         |bus, h| bus.router_option_chain.fill_matching_handlers(topic, h),
         slice,
@@ -966,15 +1077,29 @@ pub fn publish_option_chain(topic: MStr<Topic>, slice: &OptionChainSlice) {
 /// Publishes an account state to subscribers on a topic.
 pub fn publish_account_state(topic: MStr<Topic>, state: &AccountState) {
     publish_typed(
+        topic,
         &ACCOUNT_STATE_HANDLERS,
         |bus, h| bus.router_account_state.fill_matching_handlers(topic, h),
         state,
     );
 }
 
+/// Publishes a portfolio snapshot to subscribers on a topic.
+pub fn publish_portfolio_snapshot(topic: MStr<Topic>, snapshot: &PortfolioSnapshot) {
+    publish_typed(
+        topic,
+        &PORTFOLIO_SNAPSHOT_HANDLERS,
+        |bus, h| {
+            bus.router_portfolio.fill_matching_handlers(topic, h);
+        },
+        snapshot,
+    );
+}
+
 /// Publishes an order event to subscribers on a topic.
 pub fn publish_order_event(topic: MStr<Topic>, event: &OrderEventAny) {
     publish_typed(
+        topic,
         &ORDER_EVENT_HANDLERS,
         |bus, h| bus.router_order_events.fill_matching_handlers(topic, h),
         event,
@@ -984,6 +1109,7 @@ pub fn publish_order_event(topic: MStr<Topic>, event: &OrderEventAny) {
 /// Publishes a position event to subscribers on a topic.
 pub fn publish_position_event(topic: MStr<Topic>, event: &PositionEvent) {
     publish_typed(
+        topic,
         &POSITION_EVENT_HANDLERS,
         |bus, h| bus.router_position_events.fill_matching_handlers(topic, h),
         event,
@@ -994,6 +1120,7 @@ pub fn publish_position_event(topic: MStr<Topic>, event: &PositionEvent) {
 #[cfg(feature = "defi")]
 pub fn publish_defi_block(topic: MStr<Topic>, block: &Block) {
     publish_typed(
+        topic,
         &DEFI_BLOCK_HANDLERS,
         |bus, h| bus.router_defi_blocks.fill_matching_handlers(topic, h),
         block,
@@ -1004,6 +1131,7 @@ pub fn publish_defi_block(topic: MStr<Topic>, block: &Block) {
 #[cfg(feature = "defi")]
 pub fn publish_defi_pool(topic: MStr<Topic>, pool: &Pool) {
     publish_typed(
+        topic,
         &DEFI_POOL_HANDLERS,
         |bus, h| bus.router_defi_pools.fill_matching_handlers(topic, h),
         pool,
@@ -1014,6 +1142,7 @@ pub fn publish_defi_pool(topic: MStr<Topic>, pool: &Pool) {
 #[cfg(feature = "defi")]
 pub fn publish_defi_swap(topic: MStr<Topic>, swap: &PoolSwap) {
     publish_typed(
+        topic,
         &DEFI_SWAP_HANDLERS,
         |bus, h| bus.router_defi_swaps.fill_matching_handlers(topic, h),
         swap,
@@ -1024,6 +1153,7 @@ pub fn publish_defi_swap(topic: MStr<Topic>, swap: &PoolSwap) {
 #[cfg(feature = "defi")]
 pub fn publish_defi_liquidity(topic: MStr<Topic>, update: &PoolLiquidityUpdate) {
     publish_typed(
+        topic,
         &DEFI_LIQUIDITY_HANDLERS,
         |bus, h| bus.router_defi_liquidity.fill_matching_handlers(topic, h),
         update,
@@ -1034,6 +1164,7 @@ pub fn publish_defi_liquidity(topic: MStr<Topic>, update: &PoolLiquidityUpdate) 
 #[cfg(feature = "defi")]
 pub fn publish_defi_collect(topic: MStr<Topic>, collect: &PoolFeeCollect) {
     publish_typed(
+        topic,
         &DEFI_COLLECT_HANDLERS,
         |bus, h| bus.router_defi_collects.fill_matching_handlers(topic, h),
         collect,
@@ -1044,6 +1175,7 @@ pub fn publish_defi_collect(topic: MStr<Topic>, collect: &PoolFeeCollect) {
 #[cfg(feature = "defi")]
 pub fn publish_defi_flash(topic: MStr<Topic>, flash: &PoolFlash) {
     publish_typed(
+        topic,
         &DEFI_FLASH_HANDLERS,
         |bus, h| bus.router_defi_flash.fill_matching_handlers(topic, h),
         flash,
@@ -1055,16 +1187,23 @@ pub fn publish_defi_flash(topic: MStr<Topic>, flash: &PoolFlash) {
 /// The `fill_fn` receives a mutable reference to the `MessageBus`, avoiding
 /// redundant TLS access and Rc clone/drop overhead per publish.
 ///
+/// Before fanout the registered bus tap (if any) observes the message. Capture must
+/// precede subscriber dispatch so the durable record exists before any handler reacts
+/// to the message.
+///
 /// # Invariants
 ///
 /// - `fill_fn` must not call any publish path (would panic from `RefCell` double-borrow).
 /// - Handler panics drop the buffer, losing reuse optimization (acceptable as panics are fatal).
 #[inline]
 fn publish_typed<T: 'static>(
+    topic: MStr<Topic>,
     tls: &'static LocalKey<RefCell<SmallVec<[TypedHandler<T>; HANDLER_BUFFER_CAP]>>>,
     fill_fn: impl FnOnce(&mut MessageBus, &mut SmallVec<[TypedHandler<T>; HANDLER_BUFFER_CAP]>),
     message: &T,
 ) {
+    dispatch_tap_publish(topic, message);
+
     // Take buffer (re-entrancy safe)
     let mut handlers = tls.with_borrow_mut(std::mem::take);
 
@@ -1086,6 +1225,8 @@ fn publish_typed<T: 'static>(
 
 /// Sends a message to an endpoint handler using runtime type dispatch (Any).
 pub fn send_any(endpoint: MStr<Endpoint>, message: &dyn Any) {
+    dispatch_tap_send(endpoint, message);
+
     let handler = {
         let bus = get_message_bus();
         let mut bus = bus.borrow_mut();
@@ -1105,6 +1246,8 @@ pub fn send_any(endpoint: MStr<Endpoint>, message: &dyn Any) {
 
 /// Sends a message to an endpoint, converting to Any (convenience wrapper).
 pub fn send_any_value<T: 'static>(endpoint: MStr<Endpoint>, message: &T) {
+    dispatch_tap_send(endpoint, message);
+
     let handler = {
         let bus = get_message_bus();
         let mut bus = bus.borrow_mut();
@@ -1124,6 +1267,8 @@ pub fn send_any_value<T: 'static>(endpoint: MStr<Endpoint>, message: &T) {
 
 /// Sends the [`DataResponse`] to the registered correlation ID handler.
 pub fn send_response(correlation_id: &UUID4, message: &DataResponse) {
+    dispatch_tap_response(correlation_id, message);
+
     let handler = {
         let bus = get_message_bus();
         let mut bus = bus.borrow_mut();
@@ -1271,6 +1416,8 @@ fn send_endpoint_ref<T: 'static, F>(
 ) where
     F: FnOnce(&MessageBus) -> Option<&TypedHandler<T>>,
 {
+    dispatch_tap_send(endpoint, message);
+
     let handler = {
         let bus = get_message_bus();
         let mut bus = bus.borrow_mut();
@@ -1310,6 +1457,9 @@ fn send_endpoint_owned_counted<T: 'static, F>(
 ) where
     F: FnOnce(&MessageBus) -> Option<&TypedIntoHandler<T>>,
 {
+    // Capture before the dispatch consumes `message`
+    dispatch_tap_send(endpoint, &message);
+
     let handler = {
         let bus = get_message_bus();
         let mut bus = bus.borrow_mut();
@@ -1361,9 +1511,15 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::messages::{
-        data::{DataCommand, RequestCommand, RequestQuotes, SubscribeCommand, SubscribeQuotes},
-        execution::{CancelAllOrders, TradingCommand},
+    use crate::{
+        messages::{
+            data::{
+                DataCommand, DataResponse, QuotesResponse, RequestCommand, RequestQuotes,
+                SubscribeCommand, SubscribeQuotes,
+            },
+            execution::{CancelAllOrders, TradingCommand},
+        },
+        msgbus::{BusTap, clear_bus_tap, set_bus_tap},
     };
 
     #[rstest]
@@ -2064,5 +2220,255 @@ mod tests {
             *final_received.borrow(),
             "Final event handler should have received the event"
         );
+    }
+
+    /// Recording tap used by the bus-tap registration tests. Stores every dispatched
+    /// topic / endpoint plus a digest of the message so a test can assert the tap
+    /// observed the exact dispatches it expected.
+    #[derive(Default)]
+    struct RecordingTap {
+        publishes: RefCell<Vec<(String, std::any::TypeId)>>,
+        sends: RefCell<Vec<(String, std::any::TypeId)>>,
+        responses: RefCell<Vec<(UUID4, std::any::TypeId)>>,
+    }
+
+    impl RecordingTap {
+        fn publish_topics(&self) -> Vec<String> {
+            self.publishes
+                .borrow()
+                .iter()
+                .map(|(t, _)| t.clone())
+                .collect()
+        }
+
+        fn send_endpoints(&self) -> Vec<String> {
+            self.sends.borrow().iter().map(|(e, _)| e.clone()).collect()
+        }
+
+        fn response_correlation_ids(&self) -> Vec<UUID4> {
+            self.responses.borrow().iter().map(|(id, _)| *id).collect()
+        }
+    }
+
+    impl BusTap for RecordingTap {
+        fn on_publish(&self, topic: MStr<Topic>, message: &dyn std::any::Any) {
+            self.publishes
+                .borrow_mut()
+                .push((topic.to_string(), message.type_id()));
+        }
+
+        fn on_send(&self, endpoint: MStr<Endpoint>, message: &dyn std::any::Any) {
+            self.sends
+                .borrow_mut()
+                .push((endpoint.to_string(), message.type_id()));
+        }
+
+        fn on_response(&self, correlation_id: &UUID4, message: &dyn std::any::Any) {
+            self.responses
+                .borrow_mut()
+                .push((*correlation_id, message.type_id()));
+        }
+    }
+
+    #[rstest]
+    fn set_bus_tap_then_publish_typed_invokes_tap() {
+        let _msgbus = get_message_bus();
+        let tap = Rc::new(RecordingTap::default());
+        set_bus_tap(tap.clone());
+
+        let quote = QuoteTick::default();
+        publish_quote("data.quotes.tap.test".into(), &quote);
+
+        clear_bus_tap();
+
+        assert_eq!(tap.publish_topics(), vec!["data.quotes.tap.test"]);
+    }
+
+    #[rstest]
+    fn set_bus_tap_then_publish_any_invokes_tap() {
+        let _msgbus = get_message_bus();
+        let tap = Rc::new(RecordingTap::default());
+        set_bus_tap(tap.clone());
+
+        let payload: u32 = 42;
+        publish_any("data.any.tap.test".into(), &payload);
+
+        clear_bus_tap();
+
+        assert_eq!(tap.publish_topics(), vec!["data.any.tap.test"]);
+    }
+
+    #[rstest]
+    fn set_bus_tap_then_send_any_value_invokes_tap() {
+        let _msgbus = get_message_bus();
+        let tap = Rc::new(RecordingTap::default());
+        set_bus_tap(tap.clone());
+
+        let payload: u32 = 7;
+        send_any_value("endpoint.send.any.value.test".into(), &payload);
+
+        clear_bus_tap();
+
+        assert_eq!(tap.send_endpoints(), vec!["endpoint.send.any.value.test"],);
+    }
+
+    #[rstest]
+    fn set_bus_tap_then_send_endpoint_owned_invokes_tap() {
+        // send_trading_command (and the other owned send helpers) reach the tap
+        // through send_endpoint_owned_counted. Without this site instrumented, real
+        // production order commands would bypass the audit log.
+        let _msgbus = get_message_bus();
+        let tap = Rc::new(RecordingTap::default());
+        set_bus_tap(tap.clone());
+
+        let cancel_all = CancelAllOrders::new(
+            TraderId::from("TRADER-001"),
+            Some(ClientId::from("BINANCE")),
+            StrategyId::from("S-001"),
+            InstrumentId::from("ETHUSDT-PERP.BINANCE"),
+            OrderSide::Buy,
+            UUID4::new(),
+            nautilus_core::UnixNanos::from(1),
+            None,
+        );
+        send_trading_command(
+            "endpoint.send.trading.command.test".into(),
+            TradingCommand::CancelAllOrders(cancel_all),
+        );
+
+        clear_bus_tap();
+
+        assert_eq!(
+            tap.send_endpoints(),
+            vec!["endpoint.send.trading.command.test"],
+        );
+    }
+
+    #[rstest]
+    fn set_bus_tap_then_send_endpoint_ref_invokes_tap() {
+        // send_quote (and the other typed-ref send helpers) reach the tap through
+        // send_endpoint_ref. Mirrors the owned path coverage.
+        let _msgbus = get_message_bus();
+        let tap = Rc::new(RecordingTap::default());
+        set_bus_tap(tap.clone());
+
+        let quote = QuoteTick::default();
+        send_quote("endpoint.send.quote.test".into(), &quote);
+
+        clear_bus_tap();
+
+        assert_eq!(tap.send_endpoints(), vec!["endpoint.send.quote.test"]);
+    }
+
+    #[rstest]
+    fn set_bus_tap_then_send_response_invokes_tap() {
+        let _msgbus = get_message_bus();
+        let tap = Rc::new(RecordingTap::default());
+        set_bus_tap(tap.clone());
+
+        let correlation_id = UUID4::new();
+        let handler_called = Rc::new(RefCell::new(false));
+        let handler_called_clone = handler_called.clone();
+        register_response_handler(
+            &correlation_id,
+            ShareableMessageHandler::from_typed(move |_resp: &QuotesResponse| {
+                *handler_called_clone.borrow_mut() = true;
+            }),
+        );
+
+        let response = DataResponse::Quotes(QuotesResponse {
+            correlation_id,
+            client_id: ClientId::new("SIM"),
+            instrument_id: InstrumentId::from("TEST.VENUE"),
+            data: vec![],
+            start: None,
+            end: None,
+            ts_init: 0.into(),
+            params: None,
+        });
+        send_response(&correlation_id, &response);
+
+        clear_bus_tap();
+
+        assert!(*handler_called.borrow());
+        assert_eq!(tap.response_correlation_ids(), vec![correlation_id]);
+    }
+
+    #[rstest]
+    fn clear_bus_tap_prevents_subsequent_dispatches_from_invoking_tap() {
+        let _msgbus = get_message_bus();
+        let tap = Rc::new(RecordingTap::default());
+        set_bus_tap(tap.clone());
+        clear_bus_tap();
+
+        let quote = QuoteTick::default();
+        publish_quote("data.quotes.after.clear".into(), &quote);
+        send_quote("endpoint.send.after.clear".into(), &quote);
+
+        let correlation_id = UUID4::new();
+        register_response_handler(
+            &correlation_id,
+            ShareableMessageHandler::from_typed(|_resp: &QuotesResponse| {}),
+        );
+        let response = DataResponse::Quotes(QuotesResponse {
+            correlation_id,
+            client_id: ClientId::new("SIM"),
+            instrument_id: InstrumentId::from("TEST.VENUE"),
+            data: vec![],
+            start: None,
+            end: None,
+            ts_init: 0.into(),
+            params: None,
+        });
+        send_response(&correlation_id, &response);
+
+        assert!(tap.publish_topics().is_empty());
+        assert!(tap.send_endpoints().is_empty());
+        assert!(tap.response_correlation_ids().is_empty());
+    }
+
+    #[rstest]
+    fn dispatch_with_no_tap_installed_is_a_noop() {
+        // A fresh thread starts with BUS_TAP=None; dispatches must not panic and must
+        // not allocate any tap state. Sanity check that the Option::None branch in
+        // dispatch_tap_* is hit cleanly.
+        let _msgbus = get_message_bus();
+
+        let quote = QuoteTick::default();
+        publish_quote("data.quotes.no.tap".into(), &quote);
+        send_quote("endpoint.no.tap".into(), &quote);
+    }
+
+    struct ReinstallTap;
+
+    impl BusTap for ReinstallTap {
+        fn on_publish(&self, _topic: MStr<Topic>, _message: &dyn std::any::Any) {
+            // Replace ourselves mid-dispatch; must not deadlock the RefCell
+            set_bus_tap(Rc::new(NoopTap));
+        }
+
+        fn on_send(&self, _endpoint: MStr<Endpoint>, _message: &dyn std::any::Any) {}
+    }
+
+    struct NoopTap;
+
+    impl BusTap for NoopTap {
+        fn on_publish(&self, _topic: MStr<Topic>, _message: &dyn std::any::Any) {}
+        fn on_send(&self, _endpoint: MStr<Endpoint>, _message: &dyn std::any::Any) {}
+    }
+
+    #[rstest]
+    fn reentrant_set_bus_tap_during_dispatch_does_not_panic() {
+        // dispatch_tap_publish clones the Rc out of BUS_TAP before invoking on_publish,
+        // so a tap whose on_publish reinstalls a different tap must not panic on the
+        // cell. The replaced tap stays alive through the cloned Rc until the dispatch
+        // returns.
+        let _msgbus = get_message_bus();
+        set_bus_tap(Rc::new(ReinstallTap));
+
+        let quote = QuoteTick::default();
+        publish_quote("data.quotes.reentrant".into(), &quote);
+
+        clear_bus_tap();
     }
 }

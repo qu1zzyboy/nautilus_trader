@@ -47,6 +47,10 @@ inputs:
       auto (enabled on GitHub-hosted runners, disabled on self-hosted runners).
     required: false
     default: "auto"
+  capnp-cache-enabled:
+    description: Whether to restore/save the Cap'n Proto compiler cache
+    required: false
+    default: "true"
 
 runs:
   using: "composite"
@@ -131,6 +135,8 @@ runs:
 
     - name: Install Cap'n Proto
       uses: ./.github/actions/install-capnp
+      with:
+        cache-enabled: ${{ inputs.capnp-cache-enabled }}
 
     # > --------------------------------------------------
     # > Rust
@@ -232,8 +238,7 @@ runs:
       shell: bash
       run: |
         PREK_VERSION="$(bash scripts/tool-version.sh prek)"
-        curl --proto '=https' --tlsv1.2 -LsSf \
-          "https://github.com/j178/prek/releases/download/v${PREK_VERSION}/prek-installer.sh" | sh
+        bash scripts/ci/install-prek.sh "$PREK_VERSION"
 
     # > --------------------------------------------------
     # > UV
@@ -285,7 +290,7 @@ runs:
     - name: Report cache footprint
       if: runner.os != 'Windows'
       shell: bash
-      run: |
+      run: |-
         {
           echo "## Cache footprint"
           echo

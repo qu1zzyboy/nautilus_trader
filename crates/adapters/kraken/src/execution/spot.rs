@@ -148,6 +148,8 @@ impl KrakenSpotExecutionClient {
             base_url: config.base_url.clone(),
             ws_public_url: None,
             ws_private_url: Some(config.ws_url()),
+            ws_l3_url: None,
+            validate_l3_checksum: true,
             proxy_url: config.proxy_url.clone(),
             timeout_secs: config.timeout_secs,
             heartbeat_interval_secs: config.heartbeat_interval_secs,
@@ -722,7 +724,9 @@ impl KrakenSpotExecutionClient {
             KrakenSpotWsMessage::Ticker(_)
             | KrakenSpotWsMessage::Trade(_)
             | KrakenSpotWsMessage::Book { .. }
-            | KrakenSpotWsMessage::Ohlc(_) => {}
+            | KrakenSpotWsMessage::Ohlc(_)
+            | KrakenSpotWsMessage::L3Snapshot(_)
+            | KrakenSpotWsMessage::L3Update(_) => {}
         }
     }
 
@@ -1009,7 +1013,7 @@ impl ExecutionClient for KrakenSpotExecutionClient {
     }
 
     fn get_account(&self) -> Option<AccountAny> {
-        self.core.cache().account(&self.core.account_id).cloned()
+        self.core.cache().account_owned(&self.core.account_id)
     }
 
     fn generate_account_state(
