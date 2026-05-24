@@ -57,6 +57,9 @@ pub fn indicators(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Harmony
     m.add_class::<crate::harmony::pl2dist::Pl2Dist>()?;
     m.add_class::<crate::harmony::trend_strength::TrendStrength>()?;
+    m.add_class::<crate::harmony::net_taker_imbalance::NetTakerImbalance>()?;
+    m.add_class::<crate::harmony::net_imbalance::NetImbalance>()?;
+    m.add_class::<crate::harmony::ni_nor::NiNor>()?;
 
     // Book
         m.add_class::<crate::book::imbalance::BookImbalanceRatio>()?;
