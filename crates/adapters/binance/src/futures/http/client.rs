@@ -2334,8 +2334,6 @@ impl BinanceFuturesHttpClient {
         };
 
         let symbol = format_binance_symbol(&bar_type.instrument_id());
-        let price_precision = self.get_price_precision(&symbol)?;
-        let size_precision = self.get_size_precision(&symbol)?;
 
         let params = BinanceKlinesParams {
             symbol,
@@ -2350,15 +2348,50 @@ impl BinanceFuturesHttpClient {
 
         let mut result = Vec::with_capacity(klines.len());
         for kline in klines {
-            let open: f64 = kline.open.parse().unwrap_or(0.0);
-            let high: f64 = kline.high.parse().unwrap_or(0.0);
-            let low: f64 = kline.low.parse().unwrap_or(0.0);
-            let close: f64 = kline.close.parse().unwrap_or(0.0);
-            let volume: f64 = kline.volume.parse().unwrap_or(0.0);
-            let quote_volume: f64 = kline.quote_volume.parse().unwrap_or(0.0);
-            let taker_buy_volume: f64 = kline.taker_buy_base_volume.parse().unwrap_or(0.0);
-            let taker_buy_quote_volume: f64 =
-                kline.taker_buy_quote_volume.parse().unwrap_or(0.0);
+            let open = kline
+                .open
+                .parse::<Price>()
+                .map_err(|e| anyhow::anyhow!("failed to parse kline open '{}': {e}", kline.open))?;
+            let high = kline
+                .high
+                .parse::<Price>()
+                .map_err(|e| anyhow::anyhow!("failed to parse kline high '{}': {e}", kline.high))?;
+            let low = kline
+                .low
+                .parse::<Price>()
+                .map_err(|e| anyhow::anyhow!("failed to parse kline low '{}': {e}", kline.low))?;
+            let close = kline.close.parse::<Price>().map_err(|e| {
+                anyhow::anyhow!("failed to parse kline close '{}': {e}", kline.close)
+            })?;
+            let volume = kline.volume.parse::<Quantity>().map_err(|e| {
+                anyhow::anyhow!("failed to parse kline volume '{}': {e}", kline.volume)
+            })?;
+            let quote_volume = kline.quote_volume.parse::<Quantity>().map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to parse kline quote_volume '{}': {e}",
+                    kline.quote_volume
+                )
+            })?;
+            let taker_buy_volume =
+                kline
+                    .taker_buy_base_volume
+                    .parse::<Quantity>()
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "failed to parse kline taker_buy_base_volume '{}': {e}",
+                            kline.taker_buy_base_volume
+                        )
+                    })?;
+            let taker_buy_quote_volume =
+                kline
+                    .taker_buy_quote_volume
+                    .parse::<Quantity>()
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "failed to parse kline taker_buy_quote_volume '{}': {e}",
+                            kline.taker_buy_quote_volume
+                        )
+                    })?;
             let trades_count = u64::try_from(kline.num_trades).unwrap_or(0);
 
             // close_time is end of interval, add 1ms for next bar's open
@@ -2366,14 +2399,14 @@ impl BinanceFuturesHttpClient {
 
             let bar = BnBar::new(
                 bar_type,
-                Price::new(open, price_precision),
-                Price::new(high, price_precision),
-                Price::new(low, price_precision),
-                Price::new(close, price_precision),
-                Quantity::new(volume, size_precision),
-                Quantity::new(quote_volume, size_precision),
-                Quantity::new(taker_buy_volume, size_precision),
-                Quantity::new(taker_buy_quote_volume, size_precision),
+                open,
+                high,
+                low,
+                close,
+                volume,
+                quote_volume,
+                taker_buy_volume,
+                taker_buy_quote_volume,
                 trades_count,
                 0,
                 0,
