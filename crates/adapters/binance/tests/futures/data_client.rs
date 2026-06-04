@@ -15,11 +15,14 @@
 
 //! Integration tests for the Binance Futures data client.
 
-use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, num::NonZeroUsize, str::FromStr, time::Duration};
 
 use axum::{
     Router,
-    extract::ws::{Message, WebSocket},
+    extract::{
+        RawQuery,
+        ws::{Message, WebSocket},
+    },
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
@@ -30,6 +33,9 @@ use nautilus_binance::{
         enums::BinanceProductType,
     },
     config::BinanceDataClientConfig,
+    data_types::{
+        BinanceFuturesLiquidation, BinanceFuturesOpenInterest, BinanceFuturesOpenInterestHist,
+    },
     futures::BinanceFuturesDataClient,
 };
 use nautilus_common::{
@@ -38,19 +44,72 @@ use nautilus_common::{
     messages::{
         DataEvent,
         data::{
+            DataResponse, RequestCustomData,
             subscribe::{
-                SubscribeBookDeltas, SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades,
+                SubscribeBookDeltas, SubscribeCustomData, SubscribeMarkPrices, SubscribeQuotes,
+                SubscribeTrades,
             },
-            unsubscribe::{UnsubscribeQuotes, UnsubscribeTrades},
+            unsubscribe::{UnsubscribeCustomData, UnsubscribeQuotes, UnsubscribeTrades},
         },
     },
     testing::wait_until_async,
 };
-use nautilus_core::UnixNanos;
-use nautilus_model::{enums::BookType, identifiers::InstrumentId};
+use nautilus_core::{Params, UUID4, UnixNanos};
+use nautilus_model::{
+    data::{CustomData, Data, DataType},
+    enums::BookType,
+    identifiers::InstrumentId,
+};
 use nautilus_network::http::HttpClient;
 use rstest::rstest;
+use rust_decimal::Decimal;
 use serde_json::json;
+
+fn liquidation_data_type_for_instrument(instrument_id: InstrumentId) -> DataType {
+    let mut metadata = Params::new();
+    metadata.insert(
+        "instrument_id".to_string(),
+        serde_json::Value::String(instrument_id.to_string()),
+    );
+    DataType::new(
+        "BinanceFuturesLiquidation",
+        Some(metadata),
+        Some(instrument_id.to_string()),
+    )
+}
+
+fn open_interest_data_type_for_instrument(instrument_id: InstrumentId) -> DataType {
+    let mut metadata = Params::new();
+    metadata.insert(
+        "instrument_id".to_string(),
+        serde_json::Value::String(instrument_id.to_string()),
+    );
+    DataType::new(
+        "BinanceFuturesOpenInterest",
+        Some(metadata),
+        Some(instrument_id.to_string()),
+    )
+}
+
+fn open_interest_hist_data_type_for_instrument(
+    instrument_id: InstrumentId,
+    period: &str,
+) -> DataType {
+    let mut metadata = Params::new();
+    metadata.insert(
+        "instrument_id".to_string(),
+        serde_json::Value::String(instrument_id.to_string()),
+    );
+    metadata.insert(
+        "period".to_string(),
+        serde_json::Value::String(period.to_string()),
+    );
+    DataType::new(
+        "BinanceFuturesOpenInterestHist",
+        Some(metadata),
+        Some(instrument_id.to_string()),
+    )
+}
 
 fn json_response(body: &serde_json::Value) -> Response {
     (
@@ -142,6 +201,35 @@ async fn handle_ws_connection(mut socket: WebSocket) {
                                 let _result = socket
                                     .send(Message::Text(mark_price.to_string().into()))
                                     .await;
+                            } else if stream.contains("@forceOrder")
+                                || stream.contains("!forceOrder@arr")
+                            {
+                                let last_filled_qty = if stream.contains("!forceOrder@arr") {
+                                    "0.002"
+                                } else {
+                                    "0.001"
+                                };
+                                let liquidation = json!({
+                                    "e": "forceOrder",
+                                    "E": 1700000000000_i64,
+                                    "o": {
+                                        "s": "BTCUSDT",
+                                        "S": "SELL",
+                                        "o": "LIMIT",
+                                        "f": "IOC",
+                                        "q": "0.003",
+                                        "p": "50000.10",
+                                        "ap": "50000.20",
+                                        "X": "FILLED",
+                                        "l": last_filled_qty,
+                                        "z": "0.003",
+                                        "T": 1700000000000_i64
+                                    }
+                                });
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                let _result = socket
+                                    .send(Message::Text(liquidation.to_string().into()))
+                                    .await;
                             }
                         }
                     }
@@ -152,6 +240,81 @@ async fn handle_ws_connection(mut socket: WebSocket) {
             }
         }
     }
+}
+
+async fn handle_open_interest() -> Response {
+    json_response(&json!({
+        "symbol": "BTCUSDT",
+        "openInterest": "12345.678",
+        "time": 1700000000000_i64
+    }))
+}
+
+async fn handle_open_interest_coinm() -> Response {
+    json_response(&json!({
+        "symbol": "BTCUSD_PERP",
+        "openInterest": "987.654",
+        "time": 1700000005000_i64
+    }))
+}
+
+async fn handle_open_interest_hist(raw_query: RawQuery) -> Response {
+    let query = raw_query.0.unwrap_or_default();
+    let params: HashMap<String, String> = serde_urlencoded::from_str(&query).unwrap_or_default();
+
+    if params
+        .get("symbol")
+        .is_some_and(|symbol| symbol == "BTCUSDT")
+        && params.get("period").is_some_and(|period| period == "5m")
+    {
+        return json_response(&json!([
+            {
+                "symbol": "BTCUSDT",
+                "sumOpenInterest": "100.0",
+                "sumOpenInterestValue": "1000.0",
+                "timestamp": 1700000000000_i64,
+                "CMCCirculatingSupply": "123"
+            },
+            {
+                "symbol": "BTCUSDT",
+                "sumOpenInterest": "101.0",
+                "sumOpenInterestValue": "1005.0",
+                "timestamp": 1700000300000_i64,
+                "CMCCirculatingSupply": "123"
+            }
+        ]));
+    }
+
+    if params.get("pair").is_some_and(|pair| pair == "BTCUSD")
+        && params
+            .get("contractType")
+            .is_some_and(|contract_type| contract_type == "PERPETUAL")
+        && params.get("period").is_some_and(|period| period == "5m")
+    {
+        return json_response(&json!([
+            {
+                "pair": "BTCUSD",
+                "contractType": "PERPETUAL",
+                "sumOpenInterest": "200.0",
+                "sumOpenInterestValue": "1500.0",
+                "timestamp": 1700000600000_i64
+            },
+            {
+                "pair": "BTCUSD",
+                "contractType": "PERPETUAL",
+                "sumOpenInterest": "201.0",
+                "sumOpenInterestValue": "1510.0",
+                "timestamp": 1700000900000_i64
+            }
+        ]));
+    }
+
+    (
+        StatusCode::BAD_REQUEST,
+        [("content-type", "application/json")],
+        json!({"code": -1102, "msg": "Unexpected open interest history params"}).to_string(),
+    )
+        .into_response()
 }
 
 fn create_data_test_router() -> Router {
@@ -207,6 +370,9 @@ fn create_data_test_router() -> Router {
                 }))
             }),
         )
+        .route("/fapi/v1/openInterest", get(handle_open_interest))
+        .route("/dapi/v1/openInterest", get(handle_open_interest_coinm))
+        .route("/futures/data/openInterestHist", get(handle_open_interest_hist))
         .route("/ws", get(handle_ws))
 }
 
@@ -248,7 +414,7 @@ fn create_test_data_client(
     set_data_event_sender(tx);
 
     let config = BinanceDataClientConfig {
-        product_types: vec![BinanceProductType::UsdM],
+        product_type: BinanceProductType::UsdM,
         base_url_http: Some(base_url_http),
         base_url_ws: Some(base_url_ws),
         ..Default::default()
@@ -257,6 +423,29 @@ fn create_test_data_client(
     let client =
         BinanceFuturesDataClient::new(*BINANCE_CLIENT_ID, config, BinanceProductType::UsdM)
             .unwrap();
+
+    (client, rx)
+}
+
+fn create_test_data_client_for_product_type(
+    base_url_http: String,
+    base_url_ws: String,
+    product_type: BinanceProductType,
+) -> (
+    BinanceFuturesDataClient,
+    tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    set_data_event_sender(tx);
+
+    let config = BinanceDataClientConfig {
+        product_type,
+        base_url_http: Some(base_url_http),
+        base_url_ws: Some(base_url_ws),
+        ..Default::default()
+    };
+
+    let client = BinanceFuturesDataClient::new(*BINANCE_CLIENT_ID, config, product_type).unwrap();
 
     (client, rx)
 }
@@ -313,6 +502,279 @@ async fn test_disconnect_sets_state() {
 
     client.disconnect().await.unwrap();
     assert!(!client.is_connected());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_open_interest_usdm_emits_custom_data_response() {
+    let addr = start_data_test_server().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+
+    let (client, mut rx) = create_test_data_client(base_url_http, base_url_ws);
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    let data_type = open_interest_data_type_for_instrument(instrument_id);
+
+    client
+        .request_data(RequestCustomData::new(
+            *BINANCE_CLIENT_ID,
+            data_type.clone(),
+            None,
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        ))
+        .unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx.try_recv().is_ok_and(|event| {
+                let DataEvent::Response(DataResponse::Data(resp)) = event else {
+                    return false;
+                };
+                let Some(custom) = resp.data.as_ref().downcast_ref::<CustomData>() else {
+                    return false;
+                };
+
+                custom
+                    .data
+                    .as_any()
+                    .downcast_ref::<BinanceFuturesOpenInterest>()
+                    .is_some_and(|payload| {
+                        payload.instrument_id == instrument_id
+                            && payload.open_interest == Decimal::from_str("12345.678").unwrap()
+                            && payload.ts_event.as_u64()
+                                == UnixNanos::from_millis(1700000000000).as_u64()
+                            && custom.data_type == data_type
+                    })
+            });
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_open_interest_hist_usdm_emits_batch_custom_data_response() {
+    let addr = start_data_test_server().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+
+    let (client, mut rx) = create_test_data_client(base_url_http, base_url_ws);
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    let data_type = open_interest_hist_data_type_for_instrument(instrument_id, "5m");
+
+    client
+        .request_data(RequestCustomData::new(
+            *BINANCE_CLIENT_ID,
+            data_type.clone(),
+            None,
+            None,
+            Some(NonZeroUsize::new(2).unwrap()),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        ))
+        .unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx.try_recv().is_ok_and(|event| {
+                let DataEvent::Response(DataResponse::Data(resp)) = event else {
+                    return false;
+                };
+                let Some(custom) = resp.data.as_ref().downcast_ref::<CustomData>() else {
+                    return false;
+                };
+                let Some(payload) = custom
+                    .data
+                    .as_any()
+                    .downcast_ref::<BinanceFuturesOpenInterestHist>()
+                else {
+                    return false;
+                };
+
+                payload.instrument_id == instrument_id
+                    && payload.period == "5m"
+                    && payload.points.len() == 2
+                    && payload.points[0].sum_open_interest == Decimal::from_str("100.0").unwrap()
+                    && payload.points[1].sum_open_interest_value
+                        == Decimal::from_str("1005.0").unwrap()
+                    && payload.ts_event.as_u64() == UnixNanos::from_millis(1700000300000).as_u64()
+                    && custom.data_type == data_type
+            });
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_open_interest_coinm_uses_symbol_mapping() {
+    let addr = start_data_test_server().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+
+    let (client, mut rx) = create_test_data_client_for_product_type(
+        base_url_http,
+        base_url_ws,
+        BinanceProductType::CoinM,
+    );
+    let instrument_id = InstrumentId::from("BTCUSD_PERP.BINANCE");
+    let data_type = open_interest_data_type_for_instrument(instrument_id);
+
+    client
+        .request_data(RequestCustomData::new(
+            *BINANCE_CLIENT_ID,
+            data_type.clone(),
+            None,
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        ))
+        .unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx.try_recv().is_ok_and(|event| {
+                let DataEvent::Response(DataResponse::Data(resp)) = event else {
+                    return false;
+                };
+                let Some(custom) = resp.data.as_ref().downcast_ref::<CustomData>() else {
+                    return false;
+                };
+
+                custom
+                    .data
+                    .as_any()
+                    .downcast_ref::<BinanceFuturesOpenInterest>()
+                    .is_some_and(|payload| {
+                        payload.instrument_id == instrument_id
+                            && payload.open_interest == Decimal::from_str("987.654").unwrap()
+                            && custom.data_type == data_type
+                    })
+            });
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_open_interest_hist_coinm_uses_pair_and_contract_type_mapping() {
+    let addr = start_data_test_server().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+
+    let (client, mut rx) = create_test_data_client_for_product_type(
+        base_url_http,
+        base_url_ws,
+        BinanceProductType::CoinM,
+    );
+    let instrument_id = InstrumentId::from("BTCUSD_PERP.BINANCE");
+    let data_type = open_interest_hist_data_type_for_instrument(instrument_id, "5m");
+
+    client
+        .request_data(RequestCustomData::new(
+            *BINANCE_CLIENT_ID,
+            data_type.clone(),
+            None,
+            None,
+            Some(NonZeroUsize::new(2).unwrap()),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        ))
+        .unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx.try_recv().is_ok_and(|event| {
+                let DataEvent::Response(DataResponse::Data(resp)) = event else {
+                    return false;
+                };
+                let Some(custom) = resp.data.as_ref().downcast_ref::<CustomData>() else {
+                    return false;
+                };
+                let Some(payload) = custom
+                    .data
+                    .as_any()
+                    .downcast_ref::<BinanceFuturesOpenInterestHist>()
+                else {
+                    return false;
+                };
+
+                payload.instrument_id == instrument_id
+                    && payload.period == "5m"
+                    && payload.points.len() == 2
+                    && payload.points[0].sum_open_interest == Decimal::from_str("200.0").unwrap()
+                    && payload.points[1].sum_open_interest_value
+                        == Decimal::from_str("1510.0").unwrap()
+                    && custom.data_type == data_type
+            });
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_open_interest_requires_instrument_id_metadata() {
+    let addr = start_data_test_server().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+
+    let (client, _rx) = create_test_data_client(base_url_http, base_url_ws);
+    let data_type = DataType::new("BinanceFuturesOpenInterest", None, None);
+
+    let result = client.request_data(RequestCustomData::new(
+        *BINANCE_CLIENT_ID,
+        data_type,
+        None,
+        None,
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    ));
+
+    assert!(result.is_err());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_unsupported_custom_data_returns_ok() {
+    let addr = start_data_test_server().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+
+    let (client, _rx) = create_test_data_client(base_url_http, base_url_ws);
+    let data_type = DataType::new("UnsupportedBinanceCustomData", None, None);
+
+    let result = client.request_data(RequestCustomData::new(
+        *BINANCE_CLIENT_ID,
+        data_type,
+        None,
+        None,
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    ));
+
+    assert!(result.is_ok());
 }
 
 #[rstest]
@@ -512,6 +974,462 @@ async fn test_subscribe_mark_prices() {
 
 #[rstest]
 #[tokio::test]
+async fn test_subscribe_custom_liquidations_for_instrument() {
+    let addr = start_data_test_server().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+
+    let (mut client, mut rx) = create_test_data_client(base_url_http, base_url_ws);
+    client.connect().await.unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx
+                .try_recv()
+                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    while rx.try_recv().is_ok() {}
+
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    let data_type = liquidation_data_type_for_instrument(instrument_id);
+    let cmd = SubscribeCustomData::new(
+        Some(*BINANCE_CLIENT_ID),
+        None,
+        data_type.clone(),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    );
+    client.subscribe(cmd).unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx.try_recv().is_ok_and(|event| {
+                let DataEvent::Data(Data::Custom(custom)) = event else {
+                    return false;
+                };
+
+                custom
+                    .data
+                    .as_any()
+                    .downcast_ref::<BinanceFuturesLiquidation>()
+                    .is_some_and(|liq| {
+                        liq.instrument_id == instrument_id
+                            && custom.data_type == data_type
+                            && liq.last_filled_qty.to_string() == "0.001"
+                            && liq.accumulated_qty.to_string() == "0.003"
+                    })
+            });
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_subscribe_custom_liquidations_all_market() {
+    let addr = start_data_test_server().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+
+    let (mut client, mut rx) = create_test_data_client(base_url_http, base_url_ws);
+    client.connect().await.unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx
+                .try_recv()
+                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    while rx.try_recv().is_ok() {}
+
+    let data_type = DataType::new("BinanceFuturesLiquidation", None, None);
+    let cmd = SubscribeCustomData::new(
+        Some(*BINANCE_CLIENT_ID),
+        None,
+        data_type.clone(),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    );
+    client.subscribe(cmd).unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx.try_recv().is_ok_and(|event| {
+                let DataEvent::Data(Data::Custom(custom)) = event else {
+                    return false;
+                };
+
+                custom
+                    .data
+                    .as_any()
+                    .downcast_ref::<BinanceFuturesLiquidation>()
+                    .is_some_and(|liq| {
+                        liq.instrument_id == InstrumentId::from("BTCUSDT-PERP.BINANCE")
+                            && custom.data_type == data_type
+                    })
+            });
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_subscribe_custom_liquidations_overlap_routes_single_event() {
+    let addr = start_data_test_server().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+
+    let (mut client, mut rx) = create_test_data_client(base_url_http, base_url_ws);
+    client.connect().await.unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx
+                .try_recv()
+                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    while rx.try_recv().is_ok() {}
+
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    let specific_data_type = liquidation_data_type_for_instrument(instrument_id);
+    let all_market_data_type = DataType::new("BinanceFuturesLiquidation", None, None);
+
+    client
+        .subscribe(SubscribeCustomData::new(
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            specific_data_type.clone(),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx.try_recv().is_ok_and(|event| {
+                let DataEvent::Data(Data::Custom(custom)) = event else {
+                    return false;
+                };
+                custom.data_type == specific_data_type
+            });
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    while rx.try_recv().is_ok() {}
+
+    client
+        .subscribe(SubscribeCustomData::new(
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            all_market_data_type.clone(),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx.try_recv().is_ok_and(|event| {
+                let DataEvent::Data(Data::Custom(custom)) = event else {
+                    return false;
+                };
+                custom.data_type == all_market_data_type
+            });
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let mut queued_custom_count = 0_u32;
+
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, DataEvent::Data(Data::Custom(_))) {
+            queued_custom_count += 1;
+        }
+    }
+
+    assert_eq!(
+        queued_custom_count, 0,
+        "expected overlap subscription to route a single liquidation event",
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_unsubscribe_all_market_restores_specific_liquidation_streams() {
+    let addr = start_data_test_server().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+
+    let (mut client, mut rx) = create_test_data_client(base_url_http, base_url_ws);
+    client.connect().await.unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx
+                .try_recv()
+                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    while rx.try_recv().is_ok() {}
+
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    let specific_data_type = liquidation_data_type_for_instrument(instrument_id);
+    let all_market_data_type = DataType::new("BinanceFuturesLiquidation", None, None);
+
+    client
+        .subscribe(SubscribeCustomData::new(
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            specific_data_type.clone(),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx.try_recv().is_ok_and(|event| {
+                let DataEvent::Data(Data::Custom(custom)) = event else {
+                    return false;
+                };
+                custom.data_type == specific_data_type
+            });
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    while rx.try_recv().is_ok() {}
+
+    client
+        .subscribe(SubscribeCustomData::new(
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            all_market_data_type.clone(),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx.try_recv().is_ok_and(|event| {
+                let DataEvent::Data(Data::Custom(custom)) = event else {
+                    return false;
+                };
+                custom.data_type == all_market_data_type
+            });
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    while rx.try_recv().is_ok() {}
+
+    client
+        .unsubscribe(&UnsubscribeCustomData::new(
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            all_market_data_type,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx.try_recv().is_ok_and(|event| {
+                let DataEvent::Data(Data::Custom(custom)) = event else {
+                    return false;
+                };
+                custom.data_type == specific_data_type
+            });
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_rapid_all_market_unsubscribe_does_not_route_all_market_as_specific() {
+    let addr = start_data_test_server().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+
+    let (mut client, mut rx) = create_test_data_client(base_url_http, base_url_ws);
+    client.connect().await.unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx
+                .try_recv()
+                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    while rx.try_recv().is_ok() {}
+
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    let specific_data_type = liquidation_data_type_for_instrument(instrument_id);
+    let all_market_data_type = DataType::new("BinanceFuturesLiquidation", None, None);
+
+    client
+        .subscribe(SubscribeCustomData::new(
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            specific_data_type.clone(),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx.try_recv().is_ok_and(|event| {
+                let DataEvent::Data(Data::Custom(custom)) = event else {
+                    return false;
+                };
+                custom.data_type == specific_data_type
+            });
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    while rx.try_recv().is_ok() {}
+
+    client
+        .subscribe(SubscribeCustomData::new(
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            all_market_data_type.clone(),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx.try_recv().is_ok_and(|event| {
+                let DataEvent::Data(Data::Custom(custom)) = event else {
+                    return false;
+                };
+
+                custom
+                    .data
+                    .as_any()
+                    .downcast_ref::<BinanceFuturesLiquidation>()
+                    .is_some_and(|liq| {
+                        custom.data_type == all_market_data_type
+                            && liq.last_filled_qty.to_string() == "0.002"
+                    })
+            });
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    while rx.try_recv().is_ok() {}
+
+    client
+        .unsubscribe(&UnsubscribeCustomData::new(
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            all_market_data_type,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut routed_all_market_as_specific = false;
+
+    while let Ok(event) = rx.try_recv() {
+        let DataEvent::Data(Data::Custom(custom)) = event else {
+            continue;
+        };
+        let Some(liq) = custom
+            .data
+            .as_any()
+            .downcast_ref::<BinanceFuturesLiquidation>()
+        else {
+            continue;
+        };
+
+        if custom.data_type == specific_data_type && liq.last_filled_qty.to_string() == "0.002" {
+            routed_all_market_as_specific = true;
+        }
+    }
+
+    assert!(
+        !routed_all_market_as_specific,
+        "expected transient all-market frames to keep the all-market data type",
+    );
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_unsubscribe_trades() {
     let addr = start_data_test_server().await;
     let base_url_http = format!("http://{addr}");
@@ -632,6 +1550,127 @@ async fn test_unsubscribe_quotes() {
     );
     let result = client.unsubscribe_quotes(&unsub_cmd);
     result.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_unsubscribe_custom_liquidations_for_instrument() {
+    let addr = start_data_test_server().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+
+    let (mut client, mut rx) = create_test_data_client(base_url_http, base_url_ws);
+    client.connect().await.unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx
+                .try_recv()
+                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    while rx.try_recv().is_ok() {}
+
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    let data_type = liquidation_data_type_for_instrument(instrument_id);
+    let sub_cmd = SubscribeCustomData::new(
+        Some(*BINANCE_CLIENT_ID),
+        None,
+        data_type.clone(),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    );
+    client.subscribe(sub_cmd).unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx
+                .try_recv()
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Custom(_))));
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    while rx.try_recv().is_ok() {}
+
+    let unsub_cmd = UnsubscribeCustomData::new(
+        Some(*BINANCE_CLIENT_ID),
+        None,
+        data_type,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    );
+    client.unsubscribe(&unsub_cmd).unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_unsubscribe_custom_liquidations_all_market() {
+    let addr = start_data_test_server().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+
+    let (mut client, mut rx) = create_test_data_client(base_url_http, base_url_ws);
+    client.connect().await.unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx
+                .try_recv()
+                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    while rx.try_recv().is_ok() {}
+
+    let data_type = DataType::new("BinanceFuturesLiquidation", None, None);
+    let sub_cmd = SubscribeCustomData::new(
+        Some(*BINANCE_CLIENT_ID),
+        None,
+        data_type.clone(),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    );
+    client.subscribe(sub_cmd).unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx
+                .try_recv()
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Custom(_))));
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    while rx.try_recv().is_ok() {}
+
+    let unsub_cmd = UnsubscribeCustomData::new(
+        Some(*BINANCE_CLIENT_ID),
+        None,
+        data_type,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    );
+    client.unsubscribe(&unsub_cmd).unwrap();
 }
 
 #[rstest]

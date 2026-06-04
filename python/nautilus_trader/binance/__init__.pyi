@@ -13,9 +13,14 @@ __all__ = [
     "BinanceEnvironment",
     "BinanceExecClientConfig",
     "BinanceExecutionClientFactory",
+    "BinanceFuturesLiquidation",
+    "BinanceFuturesOpenInterest",
+    "BinanceFuturesOpenInterestHist",
+    "BinanceFuturesOpenInterestHistPoint",
     "BinanceMarginType",
     "BinancePositionSide",
     "BinanceProductType",
+    "BinanceSpotMarketDataMode",
     "get_binance_arrow_schema_map",
 ]
 
@@ -54,12 +59,13 @@ class BinanceBar:
 class BinanceDataClientConfig:
     def __init__(
         self,
-        product_types: typing.Sequence[BinanceProductType] | None = None,
+        product_type: BinanceProductType | None = None,
         environment: BinanceEnvironment | None = None,
         base_url_http: str | None = None,
         base_url_ws: str | None = None,
         api_key: str | None = None,
         api_secret: str | None = None,
+        spot_market_data_mode: BinanceSpotMarketDataMode | None = None,
         instrument_status_poll_secs: int | None = None,
     ) -> None: ...
 
@@ -74,7 +80,7 @@ class BinanceExecClientConfig:
         self,
         trader_id: model.TraderId,
         account_id: model.AccountId,
-        product_types: typing.Sequence[BinanceProductType] | None = None,
+        product_type: BinanceProductType | None = None,
         environment: BinanceEnvironment | None = None,
         base_url_http: str | None = None,
         base_url_ws: str | None = None,
@@ -94,6 +100,58 @@ class BinanceExecClientConfig:
 class BinanceExecutionClientFactory:
     def __init__(self) -> None: ...
     def name(self) -> str: ...
+
+@typing.final
+class BinanceFuturesLiquidation:
+    @property
+    def instrument_id(self) -> model.InstrumentId: ...
+    @property
+    def side(self) -> model.OrderSide: ...
+    @property
+    def price(self) -> model.Price: ...
+    @property
+    def average_price(self) -> model.Price: ...
+    @property
+    def last_filled_qty(self) -> model.Quantity: ...
+    @property
+    def accumulated_qty(self) -> model.Quantity: ...
+    @property
+    def ts_event(self) -> int: ...
+    @property
+    def ts_init(self) -> int: ...
+
+@typing.final
+class BinanceFuturesOpenInterest:
+    @property
+    def instrument_id(self) -> model.InstrumentId: ...
+    @property
+    def open_interest(self) -> decimal.Decimal: ...
+    @property
+    def ts_event(self) -> int: ...
+    @property
+    def ts_init(self) -> int: ...
+
+@typing.final
+class BinanceFuturesOpenInterestHist:
+    @property
+    def instrument_id(self) -> model.InstrumentId: ...
+    @property
+    def period(self) -> str: ...
+    @property
+    def points(self) -> list: ...
+    @property
+    def ts_event(self) -> int: ...
+    @property
+    def ts_init(self) -> int: ...
+
+@typing.final
+class BinanceFuturesOpenInterestHistPoint:
+    @property
+    def sum_open_interest(self) -> decimal.Decimal: ...
+    @property
+    def sum_open_interest_value(self) -> decimal.Decimal: ...
+    @property
+    def ts_event(self) -> int: ...
 
 @typing.final
 class BinanceEnvironment(enum.Enum):
@@ -121,5 +179,10 @@ class BinanceProductType(enum.Enum):
     USD_M = ...
     COIN_M = ...
     OPTIONS = ...
+
+@typing.final
+class BinanceSpotMarketDataMode(enum.Enum):
+    Sbe = ...
+    Json = ...
 
 def get_binance_arrow_schema_map(cls: type) -> typing.Any: ...

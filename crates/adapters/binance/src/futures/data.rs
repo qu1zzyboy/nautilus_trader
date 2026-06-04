@@ -15,9 +15,12 @@
 
 //! Live market data client implementation for the Binance Futures adapter.
 
-use std::sync::{
-    Arc, RwLock,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    str::FromStr,
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    },
 };
 
 use ahash::AHashMap;
@@ -29,29 +32,34 @@ use nautilus_common::{
     messages::{
         DataEvent,
         data::{
-            BarsResponse, DataResponse, InstrumentResponse, InstrumentsResponse, RequestBars,
-            RequestInstrument, RequestInstruments, RequestTrades, SubscribeBars,
-            SubscribeBookDeltas, SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
+            BarsResponse, CustomDataResponse, DataResponse, InstrumentResponse,
+            InstrumentsResponse, RequestBars, RequestCustomData, RequestInstrument,
+            RequestInstruments, RequestTrades, SubscribeBars, SubscribeBookDeltas,
+            SubscribeCustomData, SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
             SubscribeInstruments, SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades,
-            TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeFundingRates,
-            UnsubscribeIndexPrices, UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
-            subscribe::SubscribeInstrumentStatus, unsubscribe::UnsubscribeInstrumentStatus,
+            TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeCustomData,
+            UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeMarkPrices,
+            UnsubscribeQuotes, UnsubscribeTrades, subscribe::SubscribeInstrumentStatus,
+            unsubscribe::UnsubscribeInstrumentStatus,
         },
     },
 };
 use nautilus_core::{
-    AtomicMap, MUTEX_POISONED,
+    AtomicMap, MUTEX_POISONED, Params,
     datetime::{NANOSECONDS_IN_MILLISECOND, datetime_to_unix_nanos},
     nanos::UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::{
-    data::{BookOrder, Data, OrderBookDelta, OrderBookDeltas, OrderBookDeltas_API},
+    data::{
+        BookOrder, CustomData, Data, DataType, OrderBookDelta, OrderBookDeltas, OrderBookDeltas_API,
+    },
     enums::{BookAction, BookType, MarketStatusAction, OrderSide, RecordFlag},
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
     types::{Price, Quantity},
 };
+use rust_decimal::Decimal;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
@@ -60,15 +68,24 @@ use crate::{
     common::{
         consts::{BINANCE_BOOK_DEPTHS, BINANCE_VENUE},
         enums::{BinanceEnvironment, BinanceProductType},
-        parse::bar_spec_to_binance_interval,
+        parse::{
+            bar_spec_to_binance_interval, parse_price_at_precision, parse_quantity_at_precision,
+            parse_required_price_at_precision, parse_required_quantity_at_precision,
+        },
         status::diff_and_emit_statuses,
-        symbol::format_binance_stream_symbol,
+        symbol::{format_binance_stream_symbol, format_binance_symbol},
         urls::{get_usdm_ws_route_base_url, get_ws_public_base_url},
     },
     config::BinanceDataClientConfig,
+    data_types::{
+        BinanceFuturesLiquidation, BinanceFuturesOpenInterest, BinanceFuturesOpenInterestHist,
+        BinanceFuturesOpenInterestHistPoint, register_binance_custom_data,
+    },
     futures::{
         http::{
-            client::BinanceFuturesHttpClient, models::BinanceOrderBook, query::BinanceDepthParams,
+            client::BinanceFuturesHttpClient,
+            models::BinanceOrderBook,
+            query::{BinanceDepthParams, BinanceOpenInterestHistParams, BinanceOpenInterestParams},
         },
         websocket::streams::{
             client::BinanceFuturesWebSocketClient,
@@ -123,6 +140,10 @@ pub struct BinanceFuturesDataClient {
     book_buffers: Arc<AtomicMap<InstrumentId, BookBuffer>>,
     book_subscriptions: Arc<AtomicMap<InstrumentId, u32>>,
     mark_price_refs: Arc<AtomicMap<InstrumentId, u32>>,
+    force_order_refs: Arc<AtomicMap<InstrumentId, u32>>,
+    force_order_all_market_refs: Arc<AtomicU32>,
+    force_order_all_market_stream_active: Arc<AtomicBool>,
+    force_order_ws_lock: Arc<tokio::sync::Mutex<()>>,
     book_epoch: Arc<RwLock<u64>>,
 }
 
@@ -222,6 +243,10 @@ impl BinanceFuturesDataClient {
             book_buffers: Arc::new(AtomicMap::new()),
             book_subscriptions: Arc::new(AtomicMap::new()),
             mark_price_refs: Arc::new(AtomicMap::new()),
+            force_order_refs: Arc::new(AtomicMap::new()),
+            force_order_all_market_refs: Arc::new(AtomicU32::new(0)),
+            force_order_all_market_stream_active: Arc::new(AtomicBool::new(false)),
+            force_order_ws_lock: Arc::new(tokio::sync::Mutex::new(())),
             book_epoch: Arc::new(RwLock::new(0)),
         })
     }
@@ -247,6 +272,185 @@ impl BinanceFuturesDataClient {
         });
     }
 
+    fn custom_liquidation_instrument_id(
+        data_type: &DataType,
+    ) -> anyhow::Result<Option<InstrumentId>> {
+        let Some(raw_instrument_id) = data_type
+            .metadata()
+            .as_ref()
+            .and_then(|m| m.get("instrument_id"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+
+        let instrument_id = InstrumentId::from_str(raw_instrument_id)
+            .with_context(|| format!("invalid instrument_id metadata `{raw_instrument_id}`"))?;
+
+        Ok(Some(instrument_id))
+    }
+
+    fn required_instrument_id_metadata(data_type: &DataType) -> anyhow::Result<InstrumentId> {
+        let Some(raw_instrument_id) = data_type
+            .metadata()
+            .as_ref()
+            .and_then(|m| m.get("instrument_id"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            anyhow::bail!("custom data request requires `instrument_id` metadata");
+        };
+
+        InstrumentId::from_str(raw_instrument_id)
+            .with_context(|| format!("invalid instrument_id metadata `{raw_instrument_id}`"))
+    }
+
+    fn required_period_metadata(data_type: &DataType) -> anyhow::Result<String> {
+        let Some(period) = data_type
+            .metadata()
+            .as_ref()
+            .and_then(|m| m.get("period"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            anyhow::bail!("historical open interest request requires `period` metadata");
+        };
+
+        Ok(period.to_string())
+    }
+
+    /// Returns COIN-M historical OI request parameters for the current
+    /// perpetual-only Binance futures instrument surface.
+    fn coinm_open_interest_hist_params(
+        instrument_id: &InstrumentId,
+    ) -> anyhow::Result<(String, String)> {
+        let symbol = format_binance_symbol(instrument_id);
+        let Some(pair) = symbol.strip_suffix("_PERP") else {
+            anyhow::bail!(
+                "COIN-M open interest history requires a perpetual instrument, received {instrument_id}"
+            );
+        };
+
+        Ok((pair.to_string(), "PERPETUAL".to_string()))
+    }
+
+    fn parse_open_interest_decimal(field: &str, value: &str) -> anyhow::Result<Decimal> {
+        Decimal::from_str_exact(value)
+            .with_context(|| format!("invalid Binance open interest `{field}` value `{value}`"))
+    }
+
+    fn unix_nanos_from_millis_i64(field: &str, value: i64) -> anyhow::Result<UnixNanos> {
+        let millis = u64::try_from(value)
+            .with_context(|| format!("invalid Binance open interest `{field}` value `{value}`"))?;
+        Ok(UnixNanos::from_millis(millis))
+    }
+
+    fn liquidation_data_type(instrument_id: InstrumentId) -> DataType {
+        let mut metadata = Params::new();
+        metadata.insert(
+            "instrument_id".to_string(),
+            serde_json::Value::String(instrument_id.to_string()),
+        );
+        DataType::new(
+            "BinanceFuturesLiquidation",
+            Some(metadata),
+            Some(instrument_id.to_string()),
+        )
+    }
+
+    fn liquidation_stream(instrument_id: &InstrumentId) -> String {
+        format!("{}@forceOrder", format_binance_stream_symbol(instrument_id))
+    }
+
+    fn spawn_liquidation_stream_reconcile(&self, context: &'static str) {
+        let ws = self.ws_client.clone();
+        let refs = self.force_order_refs.clone();
+        let all_market_refs = self.force_order_all_market_refs.clone();
+        let all_market_stream_active = self.force_order_all_market_stream_active.clone();
+        let ws_lock = self.force_order_ws_lock.clone();
+
+        self.spawn_ws(
+            async move {
+                let _guard = ws_lock.lock().await;
+                let wants_all_market = all_market_refs.load(Ordering::Relaxed) > 0;
+                let all_market_active = all_market_stream_active.load(Ordering::Acquire);
+
+                if wants_all_market {
+                    if all_market_active {
+                        return Ok(());
+                    }
+
+                    let specific_streams = refs
+                        .load()
+                        .keys()
+                        .map(Self::liquidation_stream)
+                        .collect::<Vec<_>>();
+
+                    if !specific_streams.is_empty() {
+                        ws.unsubscribe(specific_streams).await.context(
+                            "specific forceOrder unsubscribe while enabling all-market",
+                        )?;
+                    }
+
+                    if all_market_refs.load(Ordering::Relaxed) == 0 {
+                        let restored_streams = refs
+                            .load()
+                            .keys()
+                            .map(Self::liquidation_stream)
+                            .collect::<Vec<_>>();
+
+                        if !restored_streams.is_empty() {
+                            ws.subscribe(restored_streams).await.context(
+                                "specific forceOrder restore after canceled all-market subscription",
+                            )?;
+                        }
+                        all_market_stream_active.store(false, Ordering::Release);
+                        return Ok(());
+                    }
+
+                    all_market_stream_active.store(true, Ordering::Release);
+
+                    if let Err(e) = ws
+                        .subscribe(vec!["!forceOrder@arr".to_string()])
+                        .await
+                        .context("all-market forceOrder subscription")
+                    {
+                        all_market_stream_active.store(false, Ordering::Release);
+                        return Err(e);
+                    }
+                } else {
+                    if !all_market_active {
+                        return Ok(());
+                    }
+
+                    ws.unsubscribe(vec!["!forceOrder@arr".to_string()])
+                        .await
+                        .context("all-market forceOrder unsubscribe")?;
+
+                    let specific_streams = refs
+                        .load()
+                        .keys()
+                        .map(Self::liquidation_stream)
+                        .collect::<Vec<_>>();
+
+                    if !specific_streams.is_empty() {
+                        ws.subscribe(specific_streams).await.context(
+                            "specific forceOrder resubscribe after all-market unsubscribe",
+                        )?;
+                    }
+                    all_market_stream_active.store(false, Ordering::Release);
+                }
+
+                Ok(())
+            },
+            context,
+        );
+    }
+
     #[expect(clippy::too_many_arguments)]
     fn handle_ws_message(
         msg: BinanceFuturesWsStreamsMessage,
@@ -255,6 +459,9 @@ impl BinanceFuturesDataClient {
         ws_instruments: &Arc<AtomicMap<Ustr, InstrumentAny>>,
         book_buffers: &Arc<AtomicMap<InstrumentId, BookBuffer>>,
         book_subscriptions: &Arc<AtomicMap<InstrumentId, u32>>,
+        force_order_refs: &Arc<AtomicMap<InstrumentId, u32>>,
+        force_order_all_market_refs: &Arc<AtomicU32>,
+        force_order_all_market_stream_active: &Arc<AtomicBool>,
         book_epoch: &Arc<RwLock<u64>>,
         http_client: &BinanceFuturesHttpClient,
         clock: &'static AtomicTime,
@@ -351,14 +558,86 @@ impl BinanceFuturesDataClient {
                 }
             }
             BinanceFuturesWsStreamsMessage::ForceOrder(ref liq_msg) => {
-                log::info!(
-                    "Liquidation: {} {:?} {:?} qty={} at price={}",
-                    liq_msg.order.symbol,
-                    liq_msg.order.side,
-                    liq_msg.order.status,
-                    liq_msg.order.original_qty,
-                    liq_msg.order.average_price,
-                );
+                if let Some(instrument) = cache.get(&liq_msg.order.symbol) {
+                    let parse_price = |value: &str, field: &str| -> anyhow::Result<Price> {
+                        parse_required_price_at_precision(
+                            value,
+                            instrument.price_precision(),
+                            field,
+                        )
+                    };
+
+                    let parse_quantity = |value: &str, field: &str| -> anyhow::Result<Quantity> {
+                        parse_required_quantity_at_precision(
+                            value,
+                            instrument.size_precision(),
+                            field,
+                        )
+                    };
+
+                    match (
+                        parse_price(&liq_msg.order.price, "price"),
+                        parse_price(&liq_msg.order.average_price, "average_price"),
+                        parse_quantity(&liq_msg.order.last_filled_qty, "last_filled_qty"),
+                        parse_quantity(&liq_msg.order.accumulated_qty, "accumulated_qty"),
+                    ) {
+                        (
+                            Ok(price),
+                            Ok(average_price),
+                            Ok(last_filled_qty),
+                            Ok(accumulated_qty),
+                        ) => {
+                            let liquidation = Arc::new(BinanceFuturesLiquidation::new(
+                                instrument.id(),
+                                OrderSide::from(liq_msg.order.side),
+                                price,
+                                average_price,
+                                last_filled_qty,
+                                accumulated_qty,
+                                UnixNanos::from_millis(liq_msg.event_time as u64),
+                                ts_init,
+                            ));
+
+                            let has_all_market_subscription =
+                                force_order_all_market_refs.load(Ordering::Relaxed) > 0;
+                            let has_all_market_stream =
+                                force_order_all_market_stream_active.load(Ordering::Acquire);
+                            let has_specific_subscription =
+                                force_order_refs.load().contains_key(&instrument.id());
+
+                            if has_all_market_subscription || has_all_market_stream {
+                                let data_type =
+                                    DataType::new("BinanceFuturesLiquidation", None, None);
+                                Self::send_data(
+                                    data_sender,
+                                    Data::Custom(CustomData::new(liquidation, data_type)),
+                                );
+                            } else if has_specific_subscription {
+                                let data_type = Self::liquidation_data_type(instrument.id());
+                                Self::send_data(
+                                    data_sender,
+                                    Data::Custom(CustomData::new(liquidation, data_type)),
+                                );
+                            }
+                        }
+                        (p, ap, lq, aq) => {
+                            log::warn!(
+                                "Failed to parse Binance liquidation {}: price={:?} avg={:?} \
+                                last_qty={:?} accumulated_qty={:?}",
+                                liq_msg.order.symbol,
+                                p.err(),
+                                ap.err(),
+                                lq.err(),
+                                aq.err(),
+                            );
+                        }
+                    }
+                } else {
+                    log::warn!(
+                        "Received Binance liquidation for uncached symbol {}",
+                        liq_msg.order.symbol
+                    );
+                }
             }
             BinanceFuturesWsStreamsMessage::Ticker(ref ticker_msg) => {
                 log::debug!(
@@ -800,54 +1079,66 @@ fn parse_order_book_snapshot(
         ts_init,
     ));
 
-    for (i, (price_str, qty_str)) in order_book.bids.iter().enumerate() {
-        let price: f64 = price_str.parse().unwrap_or(0.0);
-        let size: f64 = qty_str.parse().unwrap_or(0.0);
+    for (price_str, qty_str) in &order_book.bids {
+        let Some(price) = parse_price_at_precision(price_str, price_precision) else {
+            log::warn!(
+                "Skipping Futures order book bid level for {instrument_id}: invalid or \
+                non-positive price='{price_str}'"
+            );
+            continue;
+        };
+        let Some(size) = parse_quantity_at_precision(qty_str, size_precision) else {
+            log::warn!(
+                "Skipping Futures order book bid level for {instrument_id}: invalid or \
+                non-positive quantity='{qty_str}'"
+            );
+            continue;
+        };
 
-        let is_last = i == order_book.bids.len() - 1 && order_book.asks.is_empty();
-        let flags = if is_last { RecordFlag::F_LAST as u8 } else { 0 };
-
-        let order = BookOrder::new(
-            OrderSide::Buy,
-            Price::new(price, price_precision),
-            Quantity::new(size, size_precision),
-            0,
-        );
+        let order = BookOrder::new(OrderSide::Buy, price, size, 0);
 
         deltas.push(OrderBookDelta::new(
             instrument_id,
             BookAction::Add,
             order,
-            flags,
+            0,
             sequence,
             ts_event,
             ts_init,
         ));
     }
 
-    for (i, (price_str, qty_str)) in order_book.asks.iter().enumerate() {
-        let price: f64 = price_str.parse().unwrap_or(0.0);
-        let size: f64 = qty_str.parse().unwrap_or(0.0);
+    for (price_str, qty_str) in &order_book.asks {
+        let Some(price) = parse_price_at_precision(price_str, price_precision) else {
+            log::warn!(
+                "Skipping Futures order book ask level for {instrument_id}: invalid or \
+                non-positive price='{price_str}'"
+            );
+            continue;
+        };
+        let Some(size) = parse_quantity_at_precision(qty_str, size_precision) else {
+            log::warn!(
+                "Skipping Futures order book ask level for {instrument_id}: invalid or \
+                non-positive quantity='{qty_str}'"
+            );
+            continue;
+        };
 
-        let is_last = i == order_book.asks.len() - 1;
-        let flags = if is_last { RecordFlag::F_LAST as u8 } else { 0 };
-
-        let order = BookOrder::new(
-            OrderSide::Sell,
-            Price::new(price, price_precision),
-            Quantity::new(size, size_precision),
-            0,
-        );
+        let order = BookOrder::new(OrderSide::Sell, price, size, 0);
 
         deltas.push(OrderBookDelta::new(
             instrument_id,
             BookAction::Add,
             order,
-            flags,
+            0,
             sequence,
             ts_event,
             ts_init,
         ));
+    }
+
+    if let Some(delta) = deltas.last_mut() {
+        delta.flags |= RecordFlag::F_LAST as u8;
     }
 
     OrderBookDeltas::new(instrument_id, deltas)
@@ -896,6 +1187,10 @@ impl DataClient for BinanceFuturesDataClient {
 
         // Clear subscription state so resubscribes issue fresh WS subscribes
         self.mark_price_refs.store(AHashMap::new());
+        self.force_order_refs.store(AHashMap::new());
+        self.force_order_all_market_refs.store(0, Ordering::Relaxed);
+        self.force_order_all_market_stream_active
+            .store(false, Ordering::Release);
         self.book_subscriptions.store(AHashMap::new());
         self.book_buffers.store(AHashMap::new());
 
@@ -913,6 +1208,8 @@ impl DataClient for BinanceFuturesDataClient {
         if self.is_connected() {
             return Ok(());
         }
+
+        register_binance_custom_data();
 
         // Reinitialize token in case of reconnection after disconnect
         self.cancellation_token = CancellationToken::new();
@@ -986,6 +1283,10 @@ impl DataClient for BinanceFuturesDataClient {
         let ws_insts = self.ws_client.instruments_cache();
         let buffers = self.book_buffers.clone();
         let book_subs = self.book_subscriptions.clone();
+        let force_order_refs = self.force_order_refs.clone();
+        let force_order_all_market_refs = self.force_order_all_market_refs.clone();
+        let force_order_all_market_stream_active =
+            self.force_order_all_market_stream_active.clone();
         let book_epoch = self.book_epoch.clone();
         let http = self.http_client.clone();
         let clock = self.clock;
@@ -1004,6 +1305,9 @@ impl DataClient for BinanceFuturesDataClient {
                             &ws_insts,
                             &buffers,
                             &book_subs,
+                            &force_order_refs,
+                            &force_order_all_market_refs,
+                            &force_order_all_market_stream_active,
                             &book_epoch,
                             &http,
                             clock,
@@ -1025,6 +1329,10 @@ impl DataClient for BinanceFuturesDataClient {
         let pub_ws_insts = self.ws_public_client.instruments_cache();
         let pub_buffers = self.book_buffers.clone();
         let pub_book_subs = self.book_subscriptions.clone();
+        let pub_force_order_refs = self.force_order_refs.clone();
+        let pub_force_order_all_market_refs = self.force_order_all_market_refs.clone();
+        let pub_force_order_all_market_stream_active =
+            self.force_order_all_market_stream_active.clone();
         let pub_book_epoch = self.book_epoch.clone();
         let pub_http = self.http_client.clone();
         let pub_cancel = self.cancellation_token.clone();
@@ -1042,6 +1350,9 @@ impl DataClient for BinanceFuturesDataClient {
                             &pub_ws_insts,
                             &pub_buffers,
                             &pub_book_subs,
+                            &pub_force_order_refs,
+                            &pub_force_order_all_market_refs,
+                            &pub_force_order_all_market_stream_active,
                             &pub_book_epoch,
                             &pub_http,
                             clock,
@@ -1140,6 +1451,10 @@ impl DataClient for BinanceFuturesDataClient {
 
         // Clear subscription state so resubscribes issue fresh WS subscribes
         self.mark_price_refs.store(AHashMap::new());
+        self.force_order_refs.store(AHashMap::new());
+        self.force_order_all_market_refs.store(0, Ordering::Relaxed);
+        self.force_order_all_market_stream_active
+            .store(false, Ordering::Release);
         self.book_subscriptions.store(AHashMap::new());
         self.book_buffers.store(AHashMap::new());
 
@@ -1154,6 +1469,71 @@ impl DataClient for BinanceFuturesDataClient {
 
     fn is_disconnected(&self) -> bool {
         !self.is_connected()
+    }
+
+    fn subscribe(&mut self, cmd: SubscribeCustomData) -> anyhow::Result<()> {
+        let data_type = cmd.data_type.type_name();
+        if data_type != "BinanceFuturesLiquidation" {
+            log::warn!("Unsupported custom data subscription: {data_type}");
+            return Ok(());
+        }
+
+        let instrument_id = Self::custom_liquidation_instrument_id(&cmd.data_type)?;
+        if let Some(instrument_id) = instrument_id {
+            if instrument_id.venue != self.venue() {
+                anyhow::bail!(
+                    "Binance liquidation custom data requires BINANCE venue instrument, received {instrument_id}"
+                );
+            }
+
+            let should_subscribe = {
+                let prev = self
+                    .force_order_refs
+                    .load()
+                    .get(&instrument_id)
+                    .copied()
+                    .unwrap_or(0);
+                self.force_order_refs.rcu(|m| {
+                    let count = m.entry(instrument_id).or_insert(0);
+                    *count += 1;
+                });
+                prev == 0
+            };
+
+            let has_all_market_subscription =
+                self.force_order_all_market_refs.load(Ordering::Relaxed) > 0;
+            let has_all_market_stream = self
+                .force_order_all_market_stream_active
+                .load(Ordering::Acquire);
+
+            if should_subscribe && !has_all_market_subscription && !has_all_market_stream {
+                let ws = self.ws_client.clone();
+                let stream = Self::liquidation_stream(&instrument_id);
+                self.spawn_ws(
+                    async move {
+                        ws.subscribe(vec![stream])
+                            .await
+                            .context("forceOrder subscription")
+                    },
+                    "forceOrder subscription",
+                );
+            } else if should_subscribe && !has_all_market_subscription {
+                self.spawn_liquidation_stream_reconcile("forceOrder subscription restore");
+            }
+
+            return Ok(());
+        }
+
+        let should_subscribe = self
+            .force_order_all_market_refs
+            .fetch_add(1, Ordering::Relaxed)
+            == 0;
+
+        if should_subscribe {
+            self.spawn_liquidation_stream_reconcile("all-market forceOrder subscription");
+        }
+
+        Ok(())
     }
 
     fn subscribe_instruments(&mut self, _cmd: SubscribeInstruments) -> anyhow::Result<()> {
@@ -1487,6 +1867,85 @@ impl DataClient for BinanceFuturesDataClient {
         Ok(())
     }
 
+    fn unsubscribe(&mut self, cmd: &UnsubscribeCustomData) -> anyhow::Result<()> {
+        let data_type = cmd.data_type.type_name();
+        if data_type != "BinanceFuturesLiquidation" {
+            log::warn!("Unsupported custom data unsubscription: {data_type}");
+            return Ok(());
+        }
+
+        let instrument_id = Self::custom_liquidation_instrument_id(&cmd.data_type)?;
+        if let Some(instrument_id) = instrument_id {
+            if instrument_id.venue != self.venue() {
+                anyhow::bail!(
+                    "Binance liquidation custom data requires BINANCE venue instrument, received {instrument_id}"
+                );
+            }
+
+            let should_unsubscribe = {
+                let prev = self.force_order_refs.load().get(&instrument_id).copied();
+                match prev {
+                    Some(1) => {
+                        self.force_order_refs.remove(&instrument_id);
+                        true
+                    }
+                    Some(count) if count > 1 => {
+                        self.force_order_refs.rcu(|m| {
+                            if let Some(existing) = m.get_mut(&instrument_id) {
+                                *existing -= 1;
+                            }
+                        });
+                        false
+                    }
+                    _ => false,
+                }
+            };
+
+            let has_all_market_subscription =
+                self.force_order_all_market_refs.load(Ordering::Relaxed) > 0;
+            let has_all_market_stream = self
+                .force_order_all_market_stream_active
+                .load(Ordering::Acquire);
+
+            if should_unsubscribe && !has_all_market_subscription {
+                let ws = self.ws_client.clone();
+                let stream = Self::liquidation_stream(&instrument_id);
+                let ws_lock = self.force_order_ws_lock.clone();
+                self.spawn_ws(
+                    async move {
+                        let _guard = if has_all_market_stream {
+                            Some(ws_lock.lock().await)
+                        } else {
+                            None
+                        };
+                        ws.unsubscribe(vec![stream])
+                            .await
+                            .context("forceOrder unsubscribe")
+                    },
+                    "forceOrder unsubscribe",
+                );
+            }
+
+            return Ok(());
+        }
+
+        let should_unsubscribe = self
+            .force_order_all_market_refs
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                if current == 0 {
+                    None
+                } else {
+                    Some(current - 1)
+                }
+            })
+            .is_ok_and(|prev| prev == 1);
+        if should_unsubscribe {
+            self.spawn_liquidation_stream_reconcile("all-market forceOrder unsubscribe");
+        }
+
+        Ok(())
+    }
+
     fn unsubscribe_bars(&mut self, cmd: &UnsubscribeBars) -> anyhow::Result<()> {
         let bar_type = cmd.bar_type;
         let ws = self.ws_client.clone();
@@ -1745,6 +2204,227 @@ impl DataClient for BinanceFuturesDataClient {
         Ok(())
     }
 
+    /// Requests Binance futures custom data.
+    ///
+    /// Spawned fetch failures are logged and no response is emitted, matching
+    /// the existing request-path behavior for other Binance adapter requests.
+    fn request_data(&self, request: RequestCustomData) -> anyhow::Result<()> {
+        let data_type = request.data_type.clone();
+        let data_type_name = data_type.type_name().to_string();
+
+        if data_type_name != "BinanceFuturesOpenInterest"
+            && data_type_name != "BinanceFuturesOpenInterestHist"
+        {
+            log::warn!("Unsupported custom data request: {data_type_name}");
+            return Ok(());
+        }
+
+        let instrument_id = Self::required_instrument_id_metadata(&data_type)?;
+
+        if instrument_id.venue != self.venue() {
+            anyhow::bail!(
+                "Binance Futures custom data requires BINANCE venue instrument, received {instrument_id}"
+            );
+        }
+
+        let period = if data_type_name == "BinanceFuturesOpenInterestHist" {
+            Some(Self::required_period_metadata(&data_type)?)
+        } else {
+            None
+        };
+
+        let http = self.http_client.clone();
+        let sender = self.data_sender.clone();
+        let request_id = request.request_id;
+        let client_id = request.client_id;
+        let params = request.params;
+        let clock = self.clock;
+        let venue = self.venue();
+        let limit = request.limit.map(|n| n.get() as u32);
+        let start_nanos = datetime_to_unix_nanos(request.start);
+        let end_nanos = datetime_to_unix_nanos(request.end);
+        let start_ms = request.start.map(|dt| dt.timestamp_millis());
+        let end_ms = request.end.map(|dt| dt.timestamp_millis());
+
+        get_runtime().spawn(async move {
+            let response = if data_type_name == "BinanceFuturesOpenInterest" {
+                let response_data_type = data_type.clone();
+                let query = BinanceOpenInterestParams {
+                    symbol: format_binance_symbol(&instrument_id),
+                };
+
+                match http
+                    .open_interest(&query)
+                    .await
+                    .context("failed to request current open interest from Binance Futures")
+                {
+                    Ok(open_interest) => {
+                        let ts_init = clock.get_time_ns();
+                        let open_interest_value = match Self::parse_open_interest_decimal(
+                            "open_interest",
+                            &open_interest.open_interest,
+                        ) {
+                            Ok(value) => value,
+                            Err(e) => {
+                                log::error!(
+                                    "Current open interest request failed for {instrument_id}: {e:?}"
+                                );
+                                return;
+                            }
+                        };
+                        let ts_event =
+                            match Self::unix_nanos_from_millis_i64("time", open_interest.time) {
+                                Ok(value) => value,
+                                Err(e) => {
+                                    log::error!(
+                                        "Current open interest request failed for {instrument_id}: {e:?}"
+                                    );
+                                    return;
+                                }
+                            };
+                        let payload = Arc::new(BinanceFuturesOpenInterest::new(
+                            instrument_id,
+                            open_interest_value,
+                            ts_event,
+                            ts_init,
+                        ));
+                        let custom = CustomData::new(payload, response_data_type.clone());
+
+                        Some(DataResponse::Data(CustomDataResponse::new(
+                            request_id,
+                            client_id,
+                            Some(venue),
+                            response_data_type,
+                            custom,
+                            start_nanos,
+                            end_nanos,
+                            ts_init,
+                            params,
+                        )))
+                    }
+                    Err(e) => {
+                        log::error!("Current open interest request failed for {instrument_id}: {e:?}");
+                        None
+                    }
+                }
+            } else {
+                let response_data_type = data_type.clone();
+                let period = period.expect("period required for historical open interest");
+                let query = match http.product_type() {
+                    BinanceProductType::UsdM => BinanceOpenInterestHistParams {
+                        symbol: Some(format_binance_symbol(&instrument_id)),
+                        pair: None,
+                        contract_type: None,
+                        period: period.clone(),
+                        start_time: start_ms,
+                        end_time: end_ms,
+                        limit,
+                    },
+                    BinanceProductType::CoinM => {
+                        let (pair, contract_type) =
+                            match Self::coinm_open_interest_hist_params(&instrument_id) {
+                                Ok(values) => values,
+                                Err(e) => {
+                                    log::error!(
+                                        "Historical open interest request failed for {instrument_id}: {e:?}"
+                                    );
+                                    return;
+                                }
+                            };
+                        BinanceOpenInterestHistParams {
+                            symbol: None,
+                            pair: Some(pair),
+                            contract_type: Some(contract_type),
+                            period: period.clone(),
+                            start_time: start_ms,
+                            end_time: end_ms,
+                            limit,
+                        }
+                    }
+                    product_type => {
+                        log::error!(
+                            "Historical open interest request failed for {instrument_id}: unsupported product type {product_type:?}"
+                        );
+                        return;
+                    }
+                };
+
+                match http
+                    .open_interest_hist(&query)
+                    .await
+                    .context("failed to request historical open interest from Binance Futures")
+                {
+                    Ok(history) => {
+                        let ts_init = clock.get_time_ns();
+                        let points: Vec<BinanceFuturesOpenInterestHistPoint> = match history
+                            .into_iter()
+                            .map(|point| -> anyhow::Result<_> {
+                                Ok(BinanceFuturesOpenInterestHistPoint::new(
+                                    Self::parse_open_interest_decimal(
+                                        "sum_open_interest",
+                                        &point.sum_open_interest,
+                                    )?,
+                                    Self::parse_open_interest_decimal(
+                                        "sum_open_interest_value",
+                                        &point.sum_open_interest_value,
+                                    )?,
+                                    Self::unix_nanos_from_millis_i64(
+                                        "timestamp",
+                                        point.timestamp,
+                                    )?,
+                                ))
+                            })
+                            .collect()
+                        {
+                            Ok(points) => points,
+                            Err(e) => {
+                                log::error!(
+                                    "Historical open interest request failed for {instrument_id}: {e:?}"
+                                );
+                                return;
+                            }
+                        };
+                        let ts_event = points.last().map_or(ts_init, |point| point.ts_event);
+                        let payload = Arc::new(BinanceFuturesOpenInterestHist::new(
+                            instrument_id,
+                            period,
+                            points,
+                            ts_event,
+                            ts_init,
+                        ));
+                        let custom = CustomData::new(payload, response_data_type.clone());
+
+                        Some(DataResponse::Data(CustomDataResponse::new(
+                            request_id,
+                            client_id,
+                            Some(venue),
+                            response_data_type,
+                            custom,
+                            start_nanos,
+                            end_nanos,
+                            ts_init,
+                            params,
+                        )))
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Historical open interest request failed for {instrument_id}: {e:?}"
+                        );
+                        None
+                    }
+                }
+            };
+
+            if let Some(response) = response
+                && let Err(e) = sender.send(DataEvent::Response(response))
+            {
+                log::error!("Failed to send custom data response: {e}");
+            }
+        });
+
+        Ok(())
+    }
+
     fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
@@ -1827,5 +2507,65 @@ impl DataClient for BinanceFuturesDataClient {
         });
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+    use rust_decimal_macros::dec;
+
+    use super::*;
+
+    #[rstest]
+    fn test_parse_order_book_snapshot_skips_invalid_levels() {
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let order_book = BinanceOrderBook {
+            last_update_id: 10,
+            bids: vec![
+                ("not-a-price".to_string(), "1.0".to_string()),
+                ("100.00".to_string(), "0.5".to_string()),
+            ],
+            asks: vec![
+                ("101.00".to_string(), "not-a-quantity".to_string()),
+                ("102.00".to_string(), "0.7".to_string()),
+            ],
+            event_time: None,
+            transaction_time: None,
+        };
+
+        let deltas =
+            parse_order_book_snapshot(&order_book, instrument_id, 2, 3, UnixNanos::from(1));
+
+        assert_eq!(deltas.deltas.len(), 3);
+        assert_eq!(deltas.deltas[1].order.side, OrderSide::Buy);
+        assert_eq!(deltas.deltas[1].order.price.as_decimal(), dec!(100.00));
+        assert_eq!(deltas.deltas[1].order.size.as_decimal(), dec!(0.500));
+        assert_eq!(deltas.deltas[2].order.side, OrderSide::Sell);
+        assert_eq!(deltas.deltas[2].order.price.as_decimal(), dec!(102.00));
+        assert_eq!(deltas.deltas[2].order.size.as_decimal(), dec!(0.700));
+        assert_eq!(deltas.deltas[2].flags, RecordFlag::F_LAST as u8);
+    }
+
+    #[rstest]
+    fn test_parse_order_book_snapshot_all_invalid_levels_marks_clear_last() {
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let order_book = BinanceOrderBook {
+            last_update_id: 10,
+            bids: vec![("not-a-price".to_string(), "1.0".to_string())],
+            asks: vec![("101.00".to_string(), "not-a-quantity".to_string())],
+            event_time: None,
+            transaction_time: None,
+        };
+
+        let deltas =
+            parse_order_book_snapshot(&order_book, instrument_id, 2, 3, UnixNanos::from(1));
+
+        assert_eq!(deltas.deltas.len(), 1);
+        assert_eq!(deltas.deltas[0].action, BookAction::Clear);
+        assert_eq!(
+            deltas.deltas[0].flags,
+            RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8
+        );
     }
 }

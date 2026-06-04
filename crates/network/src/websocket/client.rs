@@ -962,8 +962,16 @@ impl WebSocketClientInner {
                         log::trace!("Received pong");
                         // Do not reset last_data_time: pongs are keep-alive replies (not data)
                     }
-                    Ok(Some(Ok(Message::Close(_)))) => {
-                        log::debug!("Received close message - terminating");
+                    Ok(Some(Ok(Message::Close(Some(frame))))) => {
+                        log::warn!(
+                            "Received close frame, terminating: code={}, reason='{}'",
+                            frame.code,
+                            frame.reason
+                        );
+                        break;
+                    }
+                    Ok(Some(Ok(Message::Close(None)))) => {
+                        log::warn!("Received close frame with no code or reason, terminating");
                         break;
                     }
                     Ok(Some(Err(e))) => {
@@ -971,7 +979,7 @@ impl WebSocketClientInner {
                         break;
                     }
                     Ok(None) => {
-                        log::debug!("No message received - terminating");
+                        log::warn!("Connection closed by peer (no close frame), terminating");
                         break;
                     }
                     Err(_) => {
@@ -2056,7 +2064,7 @@ mod tests {
 
                     task::spawn(async move {
                         // Inner if consumes `msg`, cannot hoist into a match guard
-                        #[expect(clippy::collapsible_match)]
+                        #[allow(clippy::collapsible_match)]
                         while let Some(Ok(msg)) = websocket.next().await {
                             match msg {
                                 WsMessage::Text(txt) if txt == "close-now" => {
@@ -4145,7 +4153,7 @@ mod rust_tests {
             {
                 while let Some(Ok(msg)) = ws.next().await {
                     // Inner if consumes `msg`, cannot hoist into a match guard
-                    #[expect(clippy::collapsible_match)]
+                    #[allow(clippy::collapsible_match)]
                     match msg {
                         WsMessage::Text(_) | WsMessage::Binary(_) => {
                             if ws.send(msg).await.is_err() {

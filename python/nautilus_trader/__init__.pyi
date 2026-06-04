@@ -5,6 +5,7 @@ from . import _libnautilus
 from . import analysis
 from . import architect_ax
 from . import backtest
+from . import betfair
 from . import binance
 from . import bitmex
 from . import blockchain
@@ -16,12 +17,14 @@ from . import cryptography
 from . import data
 from . import databento
 from . import deribit
+from . import derive
 from . import dydx
 from . import execution
 from . import hyperliquid
 from . import indicators
 from . import infrastructure
 from . import kraken
+from . import lighter
 from . import live
 from . import model
 from . import network
@@ -40,6 +43,7 @@ __all__ = [
     "analysis",
     "architect_ax",
     "backtest",
+    "betfair",
     "binance",
     "bitmex",
     "blockchain",
@@ -51,12 +55,14 @@ __all__ = [
     "data",
     "databento",
     "deribit",
+    "derive",
     "dydx",
     "execution",
     "hyperliquid",
     "indicators",
     "infrastructure",
     "kraken",
+    "lighter",
     "live",
     "model",
     "network",

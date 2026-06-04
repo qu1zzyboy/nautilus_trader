@@ -176,11 +176,9 @@ pub enum OKXOrderType {
 pub enum OKXOrderStatus {
     Canceled,
     Live,
-    Effective,
     PartiallyFilled,
     Filled,
     MmpCanceled,
-    OrderPlaced,
 }
 
 impl TryFrom<OrderStatus> for OKXOrderStatus {
@@ -287,6 +285,55 @@ pub enum OKXInstrumentType {
     Events,
 }
 
+/// Represents an OKX instrument category code (the `instCategory` field).
+///
+/// OKX also returns a deprecated `category` field that is effectively always
+/// `"1"`; `instCategory` is the meaningful value that drives asset-class
+/// mapping. Unknown or future codes fall back to
+/// [`OKXInstrumentCategory::Unknown`] rather than failing to parse.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+pub enum OKXInstrumentCategory {
+    /// Cryptocurrency (`"1"`).
+    #[serde(rename = "1")]
+    #[strum(serialize = "1")]
+    Crypto,
+    /// Equity-linked (`"3"`).
+    #[serde(rename = "3")]
+    #[strum(serialize = "3")]
+    Equity,
+    /// Commodity-linked (`"4"`).
+    #[serde(rename = "4")]
+    #[strum(serialize = "4")]
+    Commodity,
+    /// FX-linked (`"5"`).
+    #[serde(rename = "5")]
+    #[strum(serialize = "5")]
+    Fx,
+    /// Debt-linked (`"6"`).
+    #[serde(rename = "6")]
+    #[strum(serialize = "6")]
+    Debt,
+    /// Unknown or future category code.
+    #[default]
+    #[serde(other)]
+    #[strum(serialize = "")]
+    Unknown,
+}
+
 /// Represents an instrument status on OKX.
 #[derive(
     Copy,
@@ -311,6 +358,56 @@ pub enum OKXInstrumentStatus {
     PostOnly,
     Rebase,
     Settling,
+    /// Unknown or future status.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Represents a spread type on OKX.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum OKXSpreadType {
+    Linear,
+    Inverse,
+    Hybrid,
+    /// Unknown or future spread type.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Represents a spread status on OKX.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum OKXSpreadState {
+    Live,
+    Suspend,
+    Expired,
     /// Unknown or future status.
     #[serde(other)]
     Unknown,
@@ -1021,11 +1118,23 @@ impl From<OKXOrderStatus> for OrderStatus {
     fn from(status: OKXOrderStatus) -> Self {
         match status {
             OKXOrderStatus::Live => Self::Accepted,
-            OKXOrderStatus::Effective => Self::Triggered,
             OKXOrderStatus::PartiallyFilled => Self::PartiallyFilled,
             OKXOrderStatus::Filled => Self::Filled,
             OKXOrderStatus::Canceled | OKXOrderStatus::MmpCanceled => Self::Canceled,
-            OKXOrderStatus::OrderPlaced => Self::Triggered,
+        }
+    }
+}
+
+impl From<OKXAlgoOrderStatus> for OrderStatus {
+    fn from(status: OKXAlgoOrderStatus) -> Self {
+        match status {
+            OKXAlgoOrderStatus::Live | OKXAlgoOrderStatus::Pause => Self::Accepted,
+            OKXAlgoOrderStatus::Effective
+            | OKXAlgoOrderStatus::OrderPlaced
+            | OKXAlgoOrderStatus::PartiallyEffective => Self::Triggered,
+            OKXAlgoOrderStatus::Filled => Self::Filled,
+            OKXAlgoOrderStatus::Canceled => Self::Canceled,
+            OKXAlgoOrderStatus::OrderFailed | OKXAlgoOrderStatus::PartiallyFailed => Self::Rejected,
         }
     }
 }
@@ -1126,6 +1235,7 @@ pub fn conditional_order_to_algo_type(order_type: OrderType) -> anyhow::Result<O
     }
 }
 
+/// Represents the state of an algo (trigger/OCO/conditional) order on OKX.
 #[derive(
     Copy,
     Clone,
@@ -1144,100 +1254,13 @@ pub fn conditional_order_to_algo_type(order_type: OrderType) -> anyhow::Result<O
 pub enum OKXAlgoOrderStatus {
     Live,
     Pause,
-    PartiallyEffective,
     Effective,
+    OrderPlaced,
+    PartiallyEffective,
     Canceled,
+    Filled,
     OrderFailed,
     PartiallyFailed,
-}
-
-#[derive(
-    Copy,
-    Clone,
-    Debug,
-    Display,
-    PartialEq,
-    Eq,
-    Hash,
-    AsRefStr,
-    EnumIter,
-    EnumString,
-    Serialize,
-    Deserialize,
-)]
-pub enum OKXTransactionType {
-    #[serde(rename = "1")]
-    Buy,
-    #[serde(rename = "2")]
-    Sell,
-    #[serde(rename = "3")]
-    OpenLong,
-    #[serde(rename = "4")]
-    OpenShort,
-    #[serde(rename = "5")]
-    CloseLong,
-    #[serde(rename = "6")]
-    CloseShort,
-    #[serde(rename = "100")]
-    PartialLiquidationCloseLong,
-    #[serde(rename = "101")]
-    PartialLiquidationCloseShort,
-    #[serde(rename = "102")]
-    PartialLiquidationBuy,
-    #[serde(rename = "103")]
-    PartialLiquidationSell,
-    #[serde(rename = "104")]
-    LiquidationLong,
-    #[serde(rename = "105")]
-    LiquidationShort,
-    #[serde(rename = "106")]
-    LiquidationBuy,
-    #[serde(rename = "107")]
-    LiquidationSell,
-    #[serde(rename = "110")]
-    LiquidationTransferIn,
-    #[serde(rename = "111")]
-    LiquidationTransferOut,
-    #[serde(rename = "118")]
-    SystemTokenConversionTransferIn,
-    #[serde(rename = "119")]
-    SystemTokenConversionTransferOut,
-    #[serde(rename = "125")]
-    AdlCloseLong,
-    #[serde(rename = "126")]
-    AdlCloseShort,
-    #[serde(rename = "127")]
-    AdlBuy,
-    #[serde(rename = "128")]
-    AdlSell,
-    #[serde(rename = "212")]
-    AutoBorrowOfQuickMargin,
-    #[serde(rename = "213")]
-    AutoRepayOfQuickMargin,
-    #[serde(rename = "204")]
-    BlockTradeBuy,
-    #[serde(rename = "205")]
-    BlockTradeSell,
-    #[serde(rename = "206")]
-    BlockTradeOpenLong,
-    #[serde(rename = "207")]
-    BlockTradeOpenShort,
-    #[serde(rename = "208")]
-    BlockTradeCloseOpen,
-    #[serde(rename = "209")]
-    BlockTradeCloseShort,
-    #[serde(rename = "270")]
-    SpreadTradingBuy,
-    #[serde(rename = "271")]
-    SpreadTradingSell,
-    #[serde(rename = "272")]
-    SpreadTradingOpenLong,
-    #[serde(rename = "273")]
-    SpreadTradingOpenShort,
-    #[serde(rename = "274")]
-    SpreadTradingCloseLong,
-    #[serde(rename = "275")]
-    SpreadTradingCloseShort,
 }
 
 /// Represents the category of an order on OKX.

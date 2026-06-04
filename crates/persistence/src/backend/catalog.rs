@@ -89,7 +89,7 @@ use nautilus_core::{
 use nautilus_model::{
     data::{
         Bar, CustomData, Data, FundingRateUpdate, HasTsInit, IndexPriceUpdate, InstrumentStatus,
-        MarkPriceUpdate, OrderBookDelta, OrderBookDepth10, QuoteTick, TradeTick,
+        MarkPriceUpdate, OptionGreeks, OrderBookDelta, OrderBookDepth10, QuoteTick, TradeTick,
         close::InstrumentClose, is_monotonically_increasing_by_init, to_variant,
     },
     events::{
@@ -384,7 +384,9 @@ impl ParquetDataCatalog {
         let mut bars: Vec<Bar> = Vec::new();
         let mut mark_prices: Vec<MarkPriceUpdate> = Vec::new();
         let mut index_prices: Vec<IndexPriceUpdate> = Vec::new();
+        let mut funding_rates: Vec<FundingRateUpdate> = Vec::new();
         let mut statuses: Vec<InstrumentStatus> = Vec::new();
+        let mut option_greeks: Vec<OptionGreeks> = Vec::new();
         let mut closes: Vec<InstrumentClose> = Vec::new();
         // Group custom data by full DataType identity (type_name + identifier + metadata)
         // so each batch is written to the correct path with consistent schema/metadata.
@@ -422,8 +424,14 @@ impl ParquetDataCatalog {
                 Data::IndexPriceUpdate(p) => {
                     index_prices.push(p);
                 }
+                Data::FundingRateUpdate(p) => {
+                    funding_rates.push(p);
+                }
                 Data::InstrumentStatus(s) => {
                     statuses.push(s);
+                }
+                Data::OptionGreeks(g) => {
+                    option_greeks.push(g);
                 }
                 Data::InstrumentClose(c) => {
                     closes.push(c);
@@ -431,6 +439,8 @@ impl ParquetDataCatalog {
                 Data::Custom(c) => {
                     custom_data.entry(custom_data_key(&c)).or_default().push(c);
                 }
+                #[allow(unreachable_patterns)]
+                _ => anyhow::bail!("Unsupported Data variant for catalog writes"),
             }
         }
 
@@ -443,7 +453,9 @@ impl ParquetDataCatalog {
         self.write_to_parquet(bars, start, end, skip_disjoint_check)?;
         self.write_to_parquet(mark_prices, start, end, skip_disjoint_check)?;
         self.write_to_parquet(index_prices, start, end, skip_disjoint_check)?;
+        self.write_to_parquet(funding_rates, start, end, skip_disjoint_check)?;
         self.write_to_parquet(statuses, start, end, skip_disjoint_check)?;
+        self.write_to_parquet(option_greeks, start, end, skip_disjoint_check)?;
         self.write_to_parquet(closes, start, end, skip_disjoint_check)?;
 
         for (_, items) in custom_data {
@@ -1060,7 +1072,9 @@ impl ParquetDataCatalog {
             InstrumentAny::Cfd(_) => "Cfd",
             InstrumentAny::Commodity(_) => "Commodity",
             InstrumentAny::CryptoFuture(_) => "CryptoFuture",
+            InstrumentAny::CryptoFuturesSpread(_) => "CryptoFuturesSpread",
             InstrumentAny::CryptoOption(_) => "CryptoOption",
+            InstrumentAny::CryptoOptionSpread(_) => "CryptoOptionSpread",
             InstrumentAny::CryptoPerpetual(_) => "CryptoPerpetual",
             InstrumentAny::CurrencyPair(_) => "CurrencyPair",
             InstrumentAny::Equity(_) => "Equity",
@@ -2119,6 +2133,16 @@ impl ParquetDataCatalog {
         self.query_typed_data::<OrderBookDepth10>(instrument_ids, start, end, None, None, true)
     }
 
+    /// Queries funding rate updates for the specified instrument(s) and time range.
+    pub fn funding_rates(
+        &mut self,
+        instrument_ids: Option<Vec<String>>,
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
+    ) -> anyhow::Result<Vec<FundingRateUpdate>> {
+        self.query_typed::<FundingRateUpdate>(instrument_ids, start, end, None, None, true)
+    }
+
     /// Queries instrument close data for the specified instrument(s) and time range.
     pub fn instrument_closes(
         &mut self,
@@ -2129,14 +2153,24 @@ impl ParquetDataCatalog {
         self.query_typed_data::<InstrumentClose>(instrument_ids, start, end, None, None, true)
     }
 
+    /// Queries option greeks data for the specified instrument(s) and time range.
+    pub fn option_greeks(
+        &mut self,
+        instrument_ids: Option<Vec<String>>,
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
+    ) -> anyhow::Result<Vec<OptionGreeks>> {
+        self.query_typed_data::<OptionGreeks>(instrument_ids, start, end, None, None, true)
+    }
+
     /// Queries any instrument data for the specified instrument(s) and time range.
     pub fn instruments(
         &self,
         instrument_ids: Option<&[String]>,
-        _start: Option<UnixNanos>,
-        _end: Option<UnixNanos>,
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
     ) -> anyhow::Result<Vec<InstrumentAny>> {
-        self.query_instruments(instrument_ids)
+        self.query_instruments_filtered(instrument_ids, start, end)
     }
 
     /// Retrieves a list of file paths for a given data type.
@@ -3387,6 +3421,16 @@ impl ParquetDataCatalog {
                             self.convert_record_batches_to_data(batches, false)?;
                         prices.into_iter().map(Data::from).collect()
                     }
+                    "funding_rate_update" => {
+                        let funding_rates: Vec<FundingRateUpdate> =
+                            self.convert_record_batches_to_data(batches, false)?;
+                        funding_rates.into_iter().map(Data::from).collect()
+                    }
+                    "option_greeks" => {
+                        let greeks: Vec<OptionGreeks> =
+                            self.convert_record_batches_to_data(batches, false)?;
+                        greeks.into_iter().map(Data::from).collect()
+                    }
                     "instrument_status" => {
                         let statuses: Vec<InstrumentStatus> =
                             self.convert_record_batches_to_data(batches, false)?;
@@ -4022,6 +4066,7 @@ impl ParquetDataCatalog {
                     | "bars"
                     | "index_prices"
                     | "mark_prices"
+                    | "option_greeks"
                     | "instrument_status"
                     | "instrument_closes"
                     | "funding_rate_update"
@@ -4113,6 +4158,7 @@ impl_catalog_path_prefix!(IndexPriceUpdate, "index_prices");
 impl_catalog_path_prefix!(MarkPriceUpdate, "mark_prices");
 impl_catalog_path_prefix!(FundingRateUpdate, "funding_rate_update");
 impl_catalog_path_prefix!(InstrumentStatus, "instrument_status");
+impl_catalog_path_prefix!(OptionGreeks, "option_greeks");
 impl_catalog_path_prefix!(InstrumentClose, "instrument_closes");
 impl_catalog_path_prefix!(InstrumentAny, "instruments");
 impl_catalog_path_prefix!(AccountState, "account_state");
