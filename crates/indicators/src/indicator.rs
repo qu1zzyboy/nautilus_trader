@@ -18,7 +18,7 @@
 use std::fmt::Debug;
 
 use nautilus_model::{
-    data::{Bar, OrderBookDelta, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick},
+    data::{Bar, BnBar, OrderBookDelta, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick},
     orderbook::OrderBook,
 };
 
@@ -58,6 +58,10 @@ pub trait Indicator {
 
     fn handle_bar(&mut self, bar: &Bar) {
         panic!("`handle_bar` {IMPL_ERR} `{}`", self.name());
+    }
+
+    fn handle_bn_bar(&mut self, bar: &BnBar) {
+        panic!("`handle_bn_bar` {IMPL_ERR} `{}`", self.name());
     }
 
     fn reset(&mut self);

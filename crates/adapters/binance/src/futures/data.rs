@@ -551,7 +551,10 @@ impl BinanceFuturesDataClient {
             BinanceFuturesWsStreamsMessage::Kline(ref kline_msg) => {
                 if let Some(instrument) = cache.get(&kline_msg.symbol) {
                     match parse_kline(kline_msg, instrument, ts_init) {
-                        Ok(Some(bar)) => Self::send_data(data_sender, Data::Bar(bar)),
+                        Ok(Some(bn_bar)) => {
+                            Self::send_data(data_sender, Data::Bar(bn_bar.as_bar()));
+                            Self::send_data(data_sender, Data::from(bn_bar));
+                        }
                         Ok(None) => {} // Kline not closed yet
                         Err(e) => log::warn!("Failed to parse kline: {e}"),
                     }
@@ -2460,6 +2463,68 @@ impl DataClient for BinanceFuturesDataClient {
                     }
                 }
                 Err(e) => log::error!("Trade request failed: {e:?}"),
+            }
+        });
+
+        Ok(())
+    }
+
+    fn request_data(&self, request: RequestCustomData) -> anyhow::Result<()> {
+        if request.data_type.type_name() != "BnBar" {
+            anyhow::bail!(
+                "Binance Futures data client only supports custom data requests for BnBar, was {}",
+                request.data_type.type_name()
+            );
+        }
+
+        let http = self.http_client.clone();
+        let sender = self.data_sender.clone();
+        let data_type = request.data_type;
+        let instrument_id = data_type
+            .identifier()
+            .map(InstrumentId::from)
+            .ok_or_else(|| anyhow::anyhow!("BnBar custom data request requires an identifier"))?;
+        let bar_type = data_type
+            .metadata()
+            .and_then(|metadata| metadata.get_str("bar_type"))
+            .map(BarType::from)
+            .ok_or_else(|| {
+                anyhow::anyhow!("BnBar custom data request requires metadata.bar_type")
+            })?;
+        let start = request.start;
+        let end = request.end;
+        let limit = request.limit.map(|n| n.get() as u32);
+        let request_id = request.request_id;
+        let client_id = request.client_id;
+        let params = request.params;
+        let clock = self.clock;
+        let start_nanos = datetime_to_unix_nanos(start);
+        let end_nanos = datetime_to_unix_nanos(end);
+
+        get_runtime().spawn(async move {
+            match http
+                .request_bn_bars(bar_type, start, end, limit)
+                .await
+                .context("failed to request BnBar data from Binance Futures")
+            {
+                Ok(bn_bars) => {
+                    let response = DataResponse::Data(CustomDataResponse::new(
+                        request_id,
+                        client_id,
+                        Some(instrument_id.venue),
+                        data_type,
+                        bn_bars,
+                        start_nanos,
+                        end_nanos,
+                        clock.get_time_ns(),
+                        params,
+                    ));
+
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send BnBar response: {e}");
+                    }
+                }
+                Err(e) => log::error!("BnBar request failed: {e:?}"),
             }
         });
 

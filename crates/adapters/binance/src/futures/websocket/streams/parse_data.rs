@@ -18,7 +18,7 @@
 use nautilus_core::nanos::UnixNanos;
 use nautilus_model::{
     data::{
-        Bar, BarSpecification, BarType, BookOrder, FundingRateUpdate, IndexPriceUpdate,
+        BarSpecification, BarType, BnBar, BookOrder, FundingRateUpdate, IndexPriceUpdate,
         MarkPriceUpdate, OrderBookDelta, OrderBookDeltas, QuoteTick, TradeTick,
     },
     enums::{
@@ -35,8 +35,8 @@ use ustr::Ustr;
 use super::{
     error::{BinanceWsError, BinanceWsResult},
     messages::{
-        BinanceFuturesAggTradeMsg, BinanceFuturesBookTickerMsg, BinanceFuturesDepthUpdateMsg, BinanceFuturesKlineMsg, BinanceFuturesMarkPriceMsg,
-        BinanceFuturesTradeMsg,
+        BinanceFuturesAggTradeMsg, BinanceFuturesBookTickerMsg, BinanceFuturesDepthUpdateMsg,
+        BinanceFuturesKlineMsg, BinanceFuturesMarkPriceMsg, BinanceFuturesTradeMsg,
     },
 };
 use crate::common::enums::{BinanceKlineInterval, BinanceWsEventType};
@@ -377,7 +377,7 @@ fn interval_to_bar_spec(interval: BinanceKlineInterval) -> BarSpecification {
     }
 }
 
-/// Parses a kline message into a `Bar`.
+/// Parses a kline message into a Binance kline bar.
 ///
 /// Returns `None` if the kline is not closed yet.
 ///
@@ -388,15 +388,13 @@ pub fn parse_kline(
     msg: &BinanceFuturesKlineMsg,
     instrument: &InstrumentAny,
     ts_init: UnixNanos,
-) -> BinanceWsResult<Option<Bar>> {
+) -> BinanceWsResult<Option<BnBar>> {
     // Only emit bars when the kline is closed
     if !msg.kline.is_closed {
         return Ok(None);
     }
 
     let instrument_id = instrument.id();
-    let price_precision = instrument.price_precision();
-    let size_precision = instrument.size_precision();
 
     let spec = interval_to_bar_spec(msg.kline.interval);
     let bar_type = BarType::new(instrument_id, spec, AggregationSource::External);
@@ -404,44 +402,67 @@ pub fn parse_kline(
     let open = msg
         .kline
         .open
-        .parse::<f64>()
-        .map_err(|e| BinanceWsError::ParseError(e.to_string()))?;
+        .parse::<Price>()
+        .map_err(BinanceWsError::ParseError)?;
     let high = msg
         .kline
         .high
-        .parse::<f64>()
-        .map_err(|e| BinanceWsError::ParseError(e.to_string()))?;
+        .parse::<Price>()
+        .map_err(BinanceWsError::ParseError)?;
     let low = msg
         .kline
         .low
-        .parse::<f64>()
-        .map_err(|e| BinanceWsError::ParseError(e.to_string()))?;
+        .parse::<Price>()
+        .map_err(BinanceWsError::ParseError)?;
     let close = msg
         .kline
         .close
-        .parse::<f64>()
-        .map_err(|e| BinanceWsError::ParseError(e.to_string()))?;
+        .parse::<Price>()
+        .map_err(BinanceWsError::ParseError)?;
     let volume = msg
         .kline
         .volume
-        .parse::<f64>()
+        .parse::<Quantity>()
+        .map_err(BinanceWsError::ParseError)?;
+    let quote_volume = msg
+        .kline
+        .quote_volume
+        .parse::<Quantity>()
+        .map_err(BinanceWsError::ParseError)?;
+    let taker_buy_volume = msg
+        .kline
+        .taker_buy_volume
+        .parse::<Quantity>()
+        .map_err(BinanceWsError::ParseError)?;
+    let taker_buy_quote_volume = msg
+        .kline
+        .taker_buy_quote_volume
+        .parse::<Quantity>()
+        .map_err(BinanceWsError::ParseError)?;
+    let trades_count = u64::try_from(msg.kline.num_trades)
         .map_err(|e| BinanceWsError::ParseError(e.to_string()))?;
 
     // Use the kline close time as the event timestamp
     let ts_event = UnixNanos::from_millis(msg.kline.close_time as u64);
 
-    let bar = Bar::new(
+    let bn_bar = BnBar::new(
         bar_type,
-        Price::new(open, price_precision),
-        Price::new(high, price_precision),
-        Price::new(low, price_precision),
-        Price::new(close, price_precision),
-        Quantity::new(volume, size_precision),
+        open,
+        high,
+        low,
+        close,
+        volume,
+        quote_volume,
+        taker_buy_volume,
+        taker_buy_quote_volume,
+        trades_count,
+        msg.kline.first_trade_id,
+        msg.kline.last_trade_id,
         ts_event,
         ts_init,
     );
 
-    Ok(Some(bar))
+    Ok(Some(bn_bar))
 }
 
 /// Extracts the symbol from a raw JSON message.
@@ -651,16 +672,30 @@ mod tests {
         let msg: BinanceFuturesKlineMsg = load_market_fixture("kline_stream_closed.json");
         let ts_init = UnixNanos::from(1_700_000_001_000_000_000u64);
 
-        let bar = parse_kline(&msg, &instrument, ts_init).unwrap().unwrap();
+        let bn_bar = parse_kline(&msg, &instrument, ts_init).unwrap().unwrap();
 
-        assert_eq!(bar.bar_type.instrument_id(), instrument.id());
-        assert_eq!(bar.open, Price::new(0.001, PRICE_PRECISION));
-        assert_eq!(bar.high, Price::new(0.0025, PRICE_PRECISION));
-        assert_eq!(bar.low, Price::new(0.001, PRICE_PRECISION));
-        assert_eq!(bar.close, Price::new(0.002, PRICE_PRECISION));
-        assert_eq!(bar.volume, Quantity::new(1000.0, SIZE_PRECISION));
-        assert_eq!(bar.ts_event, UnixNanos::from(1_638_747_719_999_000_000u64));
-        assert_eq!(bar.ts_init, ts_init);
+        assert_eq!(bn_bar.bar_type.instrument_id(), instrument.id());
+        assert_eq!(bn_bar.open, Price::from("0.00100123"));
+        assert_eq!(bn_bar.high, Price::from("0.00250789"));
+        assert_eq!(bn_bar.low, Price::from("0.00100012"));
+        assert_eq!(bn_bar.close, Price::from("0.00200456"));
+        assert_eq!(bn_bar.volume, Quantity::from("1000.12345678"));
+        assert_eq!(bn_bar.quote_volume, Quantity::from("1.00001234"));
+        assert_eq!(bn_bar.taker_buy_volume, Quantity::from("500.12345678"));
+        assert_eq!(bn_bar.taker_buy_quote_volume, Quantity::from("0.50001234"));
+        assert_eq!(bn_bar.trades_count, 100);
+        assert_eq!(bn_bar.first_trade_id, 100);
+        assert_eq!(bn_bar.last_trade_id, 200);
+        assert_eq!(
+            bn_bar.ts_event,
+            UnixNanos::from(1_638_747_719_999_000_000u64)
+        );
+        assert_eq!(bn_bar.ts_init, ts_init);
+
+        let bar = bn_bar.as_bar();
+        assert_eq!(bar.bar_type, bn_bar.bar_type);
+        assert_eq!(bar.close, bn_bar.close);
+        assert_eq!(bar.volume, bn_bar.volume);
     }
 
     #[rstest]

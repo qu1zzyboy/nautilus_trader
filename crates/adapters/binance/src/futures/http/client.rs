@@ -24,7 +24,7 @@ use nautilus_core::{
     consts::NAUTILUS_USER_AGENT, datetime::SECONDS_IN_DAY, nanos::UnixNanos, time::AtomicTime,
 };
 use nautilus_model::{
-    data::{Bar, BarType, TradeTick},
+    data::{Bar, BarType, BnBar, TradeTick},
     enums::{
         AggregationSource, AggressorSide, BarAggregation, MarketStatusAction, OrderSide, OrderType,
         TimeInForce,
@@ -2421,13 +2421,13 @@ impl BinanceFuturesHttpClient {
     ///
     /// Returns an error if the bar type is not supported, instrument is not cached,
     /// or the request fails.
-    pub async fn request_bars(
+    pub async fn request_bn_bars(
         &self,
         bar_type: BarType,
         start: Option<DateTime<Utc>>,
         end: Option<DateTime<Utc>>,
         limit: Option<u32>,
-    ) -> anyhow::Result<Vec<Bar>> {
+    ) -> anyhow::Result<Vec<BnBar>> {
         anyhow::ensure!(
             bar_type.aggregation_source() == AggregationSource::External,
             "Only EXTERNAL aggregation is supported"
@@ -2464,17 +2464,38 @@ impl BinanceFuturesHttpClient {
 
         let mut result = Vec::with_capacity(klines.len());
         for kline in klines {
-            let bar = parse_futures_kline_bar(
+            let bn_bar = parse_futures_kline_bn_bar(
                 &kline,
                 bar_type,
                 price_precision,
                 size_precision,
                 ts_init,
             )?;
-            result.push(bar);
+            result.push(bn_bar);
         }
 
         Ok(result)
+    }
+
+    /// Requests standard bar data for an instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bar type is not supported, instrument is not cached,
+    /// or the request fails.
+    pub async fn request_bars(
+        &self,
+        bar_type: BarType,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<u32>,
+    ) -> anyhow::Result<Vec<Bar>> {
+        Ok(self
+            .request_bn_bars(bar_type, start, end, limit)
+            .await?
+            .iter()
+            .map(BnBar::as_bar)
+            .collect())
     }
 }
 
@@ -2530,6 +2551,52 @@ fn parse_futures_kline_bar(
 
     Ok(Bar::new(
         bar_type, open, high, low, close, volume, ts_event, ts_init,
+    ))
+}
+
+fn parse_futures_kline_bn_bar(
+    kline: &BinanceFuturesKline,
+    bar_type: BarType,
+    price_precision: u8,
+    size_precision: u8,
+    ts_init: UnixNanos,
+) -> anyhow::Result<BnBar> {
+    let bar = parse_futures_kline_bar(kline, bar_type, price_precision, size_precision, ts_init)?;
+    let quote_volume = kline.quote_volume.parse::<Quantity>().map_err(|e| {
+        anyhow::anyhow!(
+            "failed to parse kline quote_volume '{}': {e}",
+            kline.quote_volume
+        )
+    })?;
+    let taker_buy_volume = kline
+        .taker_buy_base_volume
+        .parse::<Quantity>()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to parse kline taker_buy_base_volume '{}': {e}",
+                kline.taker_buy_base_volume
+            )
+        })?;
+    let taker_buy_quote_volume = kline
+        .taker_buy_quote_volume
+        .parse::<Quantity>()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to parse kline taker_buy_quote_volume '{}': {e}",
+                kline.taker_buy_quote_volume
+            )
+        })?;
+    let trades_count = u64::try_from(kline.num_trades)
+        .map_err(|e| anyhow::anyhow!("invalid Futures kline {}: {e}", kline.open_time))?;
+
+    Ok(BnBar::from_bar(
+        bar,
+        quote_volume,
+        taker_buy_volume,
+        taker_buy_quote_volume,
+        trades_count,
+        0,
+        0,
     ))
 }
 
