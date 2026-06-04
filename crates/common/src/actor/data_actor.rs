@@ -35,8 +35,8 @@ use nautilus_model::defi::{
 use nautilus_model::{
     data::{
         Bar, BarType, BnBar, CustomData, DataType, FundingRateUpdate, IndexPriceUpdate,
-        InstrumentStatus, MarkPriceUpdate, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
-        close::InstrumentClose,
+        InstrumentStatus, MarkPriceUpdate, OrderBookDelta, OrderBookDeltas, OrderBookDepth10,
+        QuoteTick, TradeTick, close::InstrumentClose,
         option_chain::{OptionChainSlice, OptionGreeks, StrikeRange},
     },
     enums::BookType,
