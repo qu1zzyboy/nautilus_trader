@@ -52,7 +52,8 @@ use nautilus_core::{
 };
 use nautilus_model::{
     data::{
-        BookOrder, CustomData, Data, DataType, OrderBookDelta, OrderBookDeltas, OrderBookDeltas_API,
+        BarType, BookOrder, CustomData, Data, DataType, OrderBookDelta, OrderBookDeltas,
+        OrderBookDeltas_API,
     },
     enums::{BookAction, BookType, MarketStatusAction, OrderSide, RecordFlag},
     identifiers::{ClientId, InstrumentId, Venue},
